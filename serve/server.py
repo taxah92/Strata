@@ -1148,6 +1148,55 @@ def replica_queue_view(rows: list[dict]) -> dict:
     return out
 
 
+def parent_parking_prometheus(snapshot: dict) -> list[tuple]:
+    """The parent parking store's gauges and counters for /metrics/prometheus (plan §14.2): the store's own global
+    figures, never summed from the replicas, and no owner or entry-id labels (they would be high cardinality)."""
+    return [
+        ("strata:conversation_parent_capacity_bytes", "gauge", "The parent parking store's RAM budget",
+         snapshot["capacity_bytes"]),
+        ("strata:conversation_parent_charged_bytes", "gauge",
+         "RAM the store charges: parked conversations, publishes in flight, leases and restore reservations",
+         snapshot["charged_bytes"]),
+        ("strata:conversation_parent_entries", "gauge", "Parked conversations in the store", snapshot["entries"]),
+        ("strata:conversation_parent_entry_bytes", "gauge", "Bytes of the parked conversations",
+         snapshot["entry_bytes"]),
+        ("strata:conversation_parent_pending", "gauge", "Publishes in flight", snapshot["pending"]),
+        ("strata:conversation_parent_pending_bytes", "gauge", "Bytes of the publishes in flight",
+         snapshot["pending_bytes"]),
+        ("strata:conversation_parent_leases", "gauge", "Restores holding a lease", snapshot["leases"]),
+        ("strata:conversation_parent_restore_reserved_bytes", "gauge", "RAM reserved for restores in flight",
+         snapshot["restore_reserved_bytes"]),
+        ("strata:conversation_parent_retired_lease_bytes", "gauge", "Evicted entries a reader still holds",
+         snapshot["retired_lease_bytes"]),
+        ("strata:conversation_parent_published_total", "counter", "Conversations published to the store",
+         snapshot["published"]),
+        ("strata:conversation_parent_published_bytes_total", "counter", "Bytes published to the store",
+         snapshot["published_bytes"]),
+        ("strata:conversation_parent_deduplicated_total", "counter", "Publishes the store already held",
+         snapshot["deduplicated"]),
+        ("strata:conversation_parent_reads_total", "counter", "Restores from the store", snapshot["reads"]),
+        ("strata:conversation_parent_peer_reads_total", "counter", "Restores of another replica's conversation",
+         snapshot["peer_reads"]),
+        ("strata:conversation_parent_evictions_total", "counter", "Evictions from the store",
+         snapshot["evictions"]),
+        ("strata:conversation_parent_eviction_skipped_leased_total", "counter",
+         "Evictions skipped because a reader held the entry", snapshot["eviction_skipped_leased"]),
+        ("strata:conversation_parent_superseded_total", "counter", "Entries a newer publish replaced",
+         snapshot["superseded"]),
+        ("strata:conversation_parent_clears_total", "counter", "Global clears of the store", snapshot["clears"]),
+        ("strata:conversation_parent_damaged_total", "counter", "Entries quarantined as damaged",
+         snapshot["damaged"]),
+        ("strata:conversation_parent_capacity_refusals_total", "counter", "Publishes refused for lack of RAM",
+         snapshot["capacity_refusals"]),
+        ("strata:conversation_parent_budget_violations", "gauge",
+         "1 if the charged bytes exceeded the budget (must stay 0)", snapshot["budget_violations"]),
+        ("strata:conversation_parent_store_epoch", "gauge", "The store's epoch (a clear bumps it)",
+         snapshot["store_epoch"]),
+        ("strata:conversation_parent_longest_tokens", "gauge",
+         "The deepest resume point any parked conversation holds", snapshot["longest_tokens"]),
+    ]
+
+
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
 
 
@@ -1330,10 +1379,18 @@ class StrataEngine:
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
-                 retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None):
+                 retry_args: list[str] | None = None, retry_vram_args: list[str] | None = None,
+                 parent_parking=None, parent_owner: str | None = None):
         # retry_args: the arguments to start again with, once, when this start ends before the engine is ready (an Auto start that picked DFlash2: mtp_retry_args)
         # retry_vram_args: the same start with no drafter (nodraft_retry_args), used instead when the engine ended because a card ran out of memory: swapping DFlash2 for
         # the MTP takes MORE memory from a card that is already short, so that direction is never taken then
+        # parent_parking: the server's one ParentParkingStore (serve/parent_parking.py, plan §12.2); parent_owner: this
+        # replica's name in it ("r0".."rN").  Both are kept in __dict__ so every retry and restart path keeps them: a
+        # restart() calls __init__(*self.spawn), which passes neither.
+        if parent_parking is not None:
+            self.parent_parking = parent_parking
+        if parent_owner is not None:
+            self.parent_owner = parent_owner
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
         # the all-cards split engine (sFNX, strata-split-N[-arch]): its GEN parser accepts fewer keys than Strata's engine (tests/split/test_split_gen_keys.py pins them)
         self.split_engine = os.path.basename(str(exe)).startswith("strata-split")
@@ -1395,15 +1452,31 @@ class StrataEngine:
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
+        parking = self.__dict__.get("parent_parking")
+        child_fd = None
+        start_args = args
+        if parking is not None:                          # plan §12.2: a new channel for EVERY start, a restart too
+            owner = self.__dict__.get("parent_owner")
+            child_fd, _channel = parking.open_channel(owner)
+            # a LOCAL copy: self.spawn[1] stays the command a restart starts again (the fd is this start's only)
+            start_args = list(args) + ["--conversation-parent-parking-fd", str(child_fd),
+                                       "--conversation-parent-parking-owner", owner]
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+            self.proc = popen("the Strata engine", [exe, "--serve", *start_args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace",
-                              bufsize=1, env=env, **pin)    # (#5044: a byte that is not UTF-8 killed the reader thread)
+                              bufsize=1, env=env, pass_fds=(child_fd,) if child_fd is not None else (),
+                              **pin)    # (#5044: a byte that is not UTF-8 killed the reader thread)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log:
                 self.log.close()
             raise
+        finally:
+            if child_fd is not None:                     # the process has it now; the broker's end stays
+                try:
+                    os.close(child_fd)
+                except OSError:
+                    pass
         proc = self.proc                                 # THIS start's process: a close() from another thread may set self.proc to None meanwhile (#4792)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
@@ -1411,6 +1484,7 @@ class StrataEngine:
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
         timed_out = False
+        parent_err = None
         while True:
             left = None if ready_deadline is None else ready_deadline - time.monotonic()
             if left is not None and left <= 0:
@@ -1426,6 +1500,8 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if parking is not None and line.startswith("ERR"):
+                parent_err = line.strip()               # the engine's own words when it refused the store
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -1448,6 +1524,11 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            if parent_err is not None:
+                # plan §12.2: an initial HELLO/protocol/identity failure is a start error, never a silent fallback to
+                # the local heap cache; the retries below cannot fix an identity mismatch
+                raise EngineDied(f"the engine refused the server's parent parking store: {parent_err}" +
+                                 (f" (see {log})" if log else ""))
             if not timed_out and _attempt < START_RETRIES and \
                     transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
@@ -6058,11 +6139,15 @@ class Service:
                 if pull.get("enabled"):
                     live["replica_pull"] = pull
                     live["replica_pending"] = int(pull.get("pending") or 0)
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": cache,
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
-                "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+        out = {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+               "conversation_cache": cache,
+               "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+               "hardware_static":
+               tel["static"], "history": tel["history"], "time": now}
+        parking = getattr(self.engine, "parent_parking", None)
+        if parking is not None:                            # stage 5: the server's one RAM store, when it is on
+            out["conversation_parent_parking"] = parking.snapshot()
+        return out
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -6112,6 +6197,9 @@ class Service:
                           pull.get("assigned") or 0),
                          ("strata:replica_pull_starved_total", "counter", "Requests that went first after starving",
                           pull.get("starved") or 0)]
+        parking = getattr(self.engine, "parent_parking", None)
+        if parking is not None:                          # stage 5: the server's one RAM store, when it is on
+            rows += parent_parking_prometheus(parking.snapshot())
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
@@ -6171,6 +6259,9 @@ class Service:
                 out["concurrency"].update(replica_pull=bool(pull.get("enabled")),
                                           replica_pending=int(pull.get("pending") or 0),
                                           replica_pending_oldest_s=pull.get("oldest_pending_s"))
+        parking = getattr(self.engine, "parent_parking", None)
+        if parking is not None:                            # stage 5: the server's one RAM store, when it is on
+            out["conversation_parent_parking"] = parking.snapshot()
         return out
 
     def render_prompt(self, messages, tools, kwargs) -> str:
@@ -9955,8 +10046,8 @@ def _flag_value(args: list[str], flag: str) -> str | None:
     return "" if flag in args else None
 
 
-def _handoff_batch_problem(cfg: dict, n: int) -> str | None:
-    """Why batch slots are on (the handoff's MVP runs one request per replica), or None."""
+def _batch_slots_problem(cfg: dict, n: int) -> str | None:
+    """Why batch slots are on (the handoff and parent parking run one request per replica), or None."""
     parallel = cfg.get("parallel")
     if isinstance(parallel, int) and not isinstance(parallel, bool) and parallel > 1:
         return f'"parallel": {parallel}'
@@ -9984,7 +10075,7 @@ def replica_handoff_plan(cfg: dict, groups: list[list[int]], *, posix: bool | No
     if not (os.name == "posix" if posix is None else posix):
         raise ReplicaHandoffConfigError("replica_handoff is POSIX only (the snapshots are leased with flock): Windows "
                                         "has no peer mode, turn the block off there")
-    batch = _handoff_batch_problem(cfg, n)
+    batch = _batch_slots_problem(cfg, n)
     if batch:
         raise ReplicaHandoffConfigError(f"replica_handoff does not run with batch slots ({batch}); a replica takes one "
                                         "request at a time in this prototype, remove --parallel/--batch/--slots")
@@ -10070,8 +10161,130 @@ def replica_handoff_note(plan: dict) -> str:
             f"replica{spill}; a parked conversation is written to its own directory and a neighbour can restore it")
 
 
+# ------------------------------------------------------- stage 5: the run config's replica_parent_parking (one RAM store)
+# One block in the run config, off by default (no block: nothing changes).  The server owns ONE ParentParkingStore
+# (serve/parent_parking.py) for every replica; each engine inherits one end of its own socketpair at every start and
+# parks its conversations in the server's RAM instead of its own heap.  The block's keys are plan §13.1; a block that
+# cannot be used is a start error, never a silent fallback to the local heap cache.
+PARENT_PARKING_ENGINE_FLAGS = ("--conversation-parent-parking-fd", "--conversation-parent-parking-owner",
+                               "--conversation-parent-parking-min-tokens", "--conversation-parent-parking-min-gain",
+                               "--conversation-parent-parking-max-snapshot-mib",
+                               "--conversation-parent-parking-timeout-ms")
+PARENT_PARKING_REFUSED_FLAGS = ("--conversation-cache-dir", "--conversation-cache-peer-dir",
+                                *PARENT_PARKING_ENGINE_FLAGS)
+PARENT_PARKING_MEANINGLESS_FLAGS = ("--conversation-cache-mib", "--conversation-cache-slots", "--prompt-cache")
+
+
+class ParentParkingConfigError(ValueError):
+    """The run config's "replica_parent_parking" block cannot be used as written: the start says why (never a silent
+    fallback to no parent parking).  The store's own checks (serve/parent_parking.py) are re-raised as this class, so
+    the server's start validation has one error type on every platform (the store's module needs fcntl)."""
+
+
+def _parent_parking_platform_problem() -> str | None:
+    """Why this computer cannot host the store (plan §13.3), or None: Linux, memfd_create, seals and SCM_RIGHTS."""
+    if not sys.platform.startswith("linux"):
+        return (f"parent parking is Linux only (this is {sys.platform}): the snapshots are memfds passed over "
+                "SCM_RIGHTS")
+    try:
+        import fcntl
+    except ImportError:                                  # pragma: no cover - Linux always has fcntl
+        return "parent parking needs fcntl (the memfd seals)"
+    missing = [name for name, present in (("memfd_create", hasattr(os, "memfd_create")),
+                                          ("F_ADD_SEALS", hasattr(fcntl, "F_ADD_SEALS")),
+                                          ("SOCK_SEQPACKET", hasattr(socket, "SOCK_SEQPACKET")),
+                                          ("send_fds", hasattr(socket, "send_fds"))) if not present]
+    if missing:
+        return "parent parking needs " + ", ".join(missing) + " (memfd snapshots and SCM_RIGHTS)"
+    return None
+
+
+def parent_parking_plan(cfg: dict, groups: list[list[int]], *, posix: bool | None = None,
+                        handoff: dict | None = None, pull=None) -> "ParentParkingConfig | None":
+    """The validated parent parking config of this start (None: the block is off, nothing changes), or a
+    ParentParkingConfigError that names what to fix.
+
+    Plan §13.1/§13.3: the block is read through serve/parent_parking.py's read_parent_parking (its defaults and its own
+    refusals), and the server adds the refusals only the server can see: two or more replicas, "replica_pull" on, one
+    request per replica, no split serving, Linux with memfd/seals/SCM_RIGHTS, no "replica_handoff" at the same time,
+    no hand-written --conversation-cache-dir/--conversation-cache-peer-dir or parent flags in the engine args, and no
+    explicit --conversation-cache-mib 0/--conversation-cache-slots 0/--prompt-cache 0 that would make parking
+    meaningless.  The replicas' model/config/layout fingerprints are not known before the engines start: the store
+    fixes them at the first HELLO, and a replica with other values is refused by the store and fails its start (the
+    engine's own start error, plan §12.2)."""
+    block = cfg.get("replica_parent_parking")
+    if block is None:
+        return None
+    if isinstance(block, dict) and block.get("enabled", False) is False:
+        return None                                     # off: the rest of the block is not read
+    if not (os.name == "posix" if posix is None else posix):
+        raise ParentParkingConfigError("replica_parent_parking is POSIX only (memfd snapshots and SCM_RIGHTS): turn "
+                                       "the block off on Windows")
+    problem = _parent_parking_platform_problem()
+    if problem:
+        raise ParentParkingConfigError("replica_parent_parking: " + problem)
+    from serve import parent_parking as pp             # Linux only (fcntl): imported after the platform check
+    try:
+        config = pp.read_parent_parking(cfg, replicas=len(groups))
+    except pp.ParentParkingConfigError as e:
+        raise ParentParkingConfigError(str(e)) from None
+    if config is None:
+        return None
+    n = len(groups)
+    if n < 2:
+        raise ParentParkingConfigError(f'replica_parent_parking needs "replicas" 2 or more: one RAM store is shared by '
+                                       f'every replica; this start has {n}')
+    if cfg.get("split_serve") not in (None, False):
+        raise ParentParkingConfigError('replica_parent_parking is for "replicas"; split serving has its own hand-over, '
+                                       "turn one of them off")
+    if handoff is None:
+        handoff = read_replica_handoff(cfg)
+    if handoff is not None:
+        raise ParentParkingConfigError('replica_parent_parking and "replica_handoff" cannot be on at the same time: '
+                                       "the server's RAM store replaces the disk handoff, turn one of them off")
+    if pull is None:
+        from serve import replicas as rp
+        pull = rp.pull_config(cfg)
+    if not pull.enabled:
+        raise ParentParkingConfigError('replica_parent_parking needs "replica_pull": true (a request must reach the '
+                                       "replica that holds its conversation)")
+    batch = _batch_slots_problem(cfg, n)
+    if batch:
+        raise ParentParkingConfigError(f"replica_parent_parking does not run with batch slots ({batch}): a replica "
+                                       "takes one request at a time, remove --parallel/--batch/--slots")
+    for i in range(n):
+        args = replica_engine_args(cfg, i)
+        for flag in PARENT_PARKING_REFUSED_FLAGS:
+            value = _flag_value(args, flag)
+            if value is not None:
+                raise ParentParkingConfigError(f'replica_parent_parking: replica {i} already has {flag} in the engine '
+                                               f'args; the server writes the channel and the thresholds itself, '
+                                               f'remove it from "args"/"user_args"')
+        for flag in PARENT_PARKING_MEANINGLESS_FLAGS:
+            value = _flag_value(args, flag)
+            if value is not None and value.strip() == "0":
+                raise ParentParkingConfigError(f'replica_parent_parking: replica {i} has {flag} 0 in the engine args, '
+                                               f'which turns the parking it needs off; remove it or set it above 0')
+    return config
+
+
+def parent_parking_args(config) -> list[str]:
+    """The parent parking options every replica is started with: the thresholds the engine decides with.  The fd and
+    the owner are added per spawn by StrataEngine, because the fd changes with every start."""
+    return ["--conversation-parent-parking-min-tokens", str(config.min_tokens),
+            "--conversation-parent-parking-min-gain", str(config.min_gain),
+            "--conversation-parent-parking-max-snapshot-mib", str(config.max_snapshot_mib),
+            "--conversation-parent-parking-timeout-ms", str(config.ipc_timeout_ms)]
+
+
+def parent_parking_note(config, n: int) -> str:
+    """The one start-up line of an enabled parent parking (plan §13.3): no fd, path or token data in it."""
+    return (f"replica parent parking: one RAM store for {n} replicas, {config.ram_gib} GiB, {config.max_entries} "
+            f"entries, publish on park, snapshots survive replica restart but not server restart")
+
+
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
-                   *, offline: bool = False, handoff: dict | None = None, pull=None):
+                   *, offline: bool = False, handoff: dict | None = None, pull=None, parking=None):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests.
 
@@ -10083,14 +10296,25 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     With "replica_pull": true (serve/replicas.py's pull scheduler) the ReplicaEngine is built with its validated
     PullSettings (`pull`, from rp.pull_config): a request then waits in one shared queue for a free replica instead of
     being pinned to one on arrival.  The engines' real batch slots are checked once they are up (the MVP pulls one
-    request into one engine): batch slots close them with a start error rather than silently not pulling."""
+    request into one engine): batch slots close them with a start error rather than silently not pulling.
+
+    With the run config's "replica_parent_parking" block (stage 5) the server makes ONE ParentParkingStore for every
+    replica, prints its start line, and passes it to every StrataEngine (which opens a channel per spawn) and to the
+    ReplicaEngine (which owns its lifecycle).  `parking` is the already validated parent_parking_plan; None means
+    "work it out here" (and None back means the block is off)."""
     from serve import replicas as rp
     n = len(groups)
     plan = handoff if handoff is not None else replica_handoff_plan(cfg, groups)
     pull = rp.pull_config(cfg) if pull is None else pull
+    parking = parking if parking is not None else parent_parking_plan(cfg, groups, handoff=plan, pull=pull)
     if plan is not None:
         ensure_replica_handoff_dirs(plan)
         print(f"[strata] {replica_handoff_note(plan)}", flush=True)
+    parking_store = None
+    if parking is not None:                             # stage 5: one store for the whole server, before any engine
+        from serve import parent_parking as pp
+        parking_store = pp.ParentParkingStore(parking)
+        print(f"[strata] {parent_parking_note(parking, n)}", flush=True)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
@@ -10105,12 +10329,16 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         if plan is not None:                         # stage 3: this replica's writer dir, its peers, its budgets
             rc["args"] = list(rc["args"]) + replica_handoff_args(plan, i, n)
+        if parking is not None:                      # stage 5: the thresholds; the fd and the owner go in per spawn
+            rc["args"] = list(rc["args"]) + parent_parking_args(parking)
         if arena:
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
             engines[i] = StrataEngine(exe, engine_args(rc, exe) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=child_env(rc, offline=offline), lazy=lazy, cpus=cpus[i] if cpus else None,
-                                      retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end))
+                                      retry_args=mtp_retry_args(rc, exe, effort_end), retry_vram_args=nodraft_retry_args(rc, exe, effort_end),
+                                      parent_parking=parking_store,
+                                      parent_owner=f"r{i}" if parking_store is not None else None)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -10142,12 +10370,14 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
         rp.remove_arena(arena)
+        if parking_store is not None:    # the store's broker and its memfds go with the start that failed
+            parking_store.close()
         i, e = errors[0]
         if arena:       # a shared arena that could not be made (no room in /dev/shm, a file of another pack): as before
             print(f"[strata] replica {i} did not start with the shared expert arena ({e}); starting every replica with "
                   "its own copy of the experts instead", flush=True)
             return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline,
-                                  handoff=plan, pull=pull)
+                                  handoff=plan, pull=pull, parking=parking)
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     if pull is not None and pull.enabled:
         # the authoritative check: the engines may have been started with --batch in their own args, whatever the
@@ -10161,6 +10391,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
             rp.remove_arena(arena)
+            if parking_store is not None:
+                parking_store.close()
             k, n = busy[0]
             raise SystemExit(f'[strata] config "replica_pull" does not support batch slots (replica {k} reports {n}): '
                              'run the replicas one request at a time ("parallel": 1, no --batch/--slots)')
@@ -10172,9 +10404,10 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     if pull is not None and pull.enabled:
         eng = rp.ReplicaEngine(engines, load_tokens=load, pull=True, starve_s=pull.starve_s,
-                               queue_timeout_s=pull.queue_timeout_s, max_queue=pull.max_queue)
+                               queue_timeout_s=pull.queue_timeout_s, max_queue=pull.max_queue,
+                               parent_parking=parking_store)
     else:
-        eng = rp.ReplicaEngine(engines, load_tokens=load)
+        eng = rp.ReplicaEngine(engines, load_tokens=load, parent_parking=parking_store)
     if arena:
         eng.__dict__["arena_file"] = arena
         import atexit
@@ -10823,9 +11056,13 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             pull = rp.pull_config(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        try:                                            # stage 5: one RAM store for every replica, said before the start
+            parking = parent_parking_plan(cfg, groups, handoff=handoff, pull=pull)
+        except ParentParkingConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline, handoff=handoff,
-                                    pull=pull)
+                                    pull=pull, parking=parking)
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:

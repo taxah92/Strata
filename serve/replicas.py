@@ -455,7 +455,7 @@ class ReplicaEngine:
 
     def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS, *, pull: bool = False,
                  starve_s: float = PULL_STARVE_S, poll_s: float = PULL_POLL_S, beat_s: float = PULL_BEAT_S,
-                 queue_timeout_s: float | None = None, max_queue: int | None = None):
+                 queue_timeout_s: float | None = None, max_queue: int | None = None, parent_parking=None):
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
         if not isinstance(pull, bool):
@@ -506,6 +506,9 @@ class ReplicaEngine:
         d["heal_at"] = [0.0] * len(engines)
         d["routed"] = [0] * len(engines)
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
+        # the server's one parent parking store (serve/parent_parking.py, plan §12.3): in __dict__, never through
+        # __getattr__, so the store is this object's own and not one engine's.  None when the mode is off.
+        d["parent_parking"] = parent_parking
 
     # ---- attribute plumbing
     @property
@@ -627,9 +630,14 @@ class ReplicaEngine:
     def replica_view(self) -> list[dict]:
         """For /metrics: each replica's state, requests running, and requests routed to it so far.  With the pull
         scheduler on, each row also carries the one shared queue (depth, the oldest request's age, the replica and the
-        reason of the last assignment): the server's /metrics needs no new field to show it."""
+        reason of the last assignment): the server's /metrics needs no new field to show it.  With the server's parent
+        parking store on, each row also carries its channel's state (connected, degraded or closed)."""
         rows = [{"replica": k, "alive": e.alive(), "running": self.inflight[k], "routed": self.routed[k],
                  "batch": int(getattr(e, "batch", 0) or 0)} for k, e in enumerate(self.engines)]
+        store = self.__dict__.get("parent_parking")
+        if store is not None:
+            for row in rows:
+                row["parent_parking"] = store.replica_state(f"r{row['replica']}")
         if self.pull_enabled:
             queue = self.pull_view()
             for row in rows:
@@ -676,10 +684,15 @@ class ReplicaEngine:
             print(f"[strata] replica {k} did not start ({e}); the others serve", flush=True)
 
     def unload(self):
-        for e in self.engines:
-            e.unload()
-        for k in range(len(self.engines)):
-            self.router.forget(k)
+        try:
+            for e in self.engines:
+                e.unload()
+            for k in range(len(self.engines)):
+                self.router.forget(k)
+        finally:
+            store = self.__dict__.get("parent_parking")
+            if store is not None:                   # plan §12.3: the engines are down, so the store's RAM goes too
+                store.clear("unload")               # (even when an engine would not unload: the RAM is the point)
 
     def close(self):
         err = None
@@ -689,6 +702,12 @@ class ReplicaEngine:
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         remove_arena(self.__dict__.get("arena_file"))   # (an engine that still maps it keeps its pages)
+        store = self.__dict__.get("parent_parking")
+        if store is not None:                       # plan §12.3: the engines first, then the broker and its memfds
+            try:
+                store.close()
+            except BaseException as x:           # noqa: BLE001
+                err = err or x
         if err:
             raise err
 
