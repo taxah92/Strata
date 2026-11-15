@@ -44,6 +44,7 @@
 #include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_disk.hpp"
+#include "strata/core/conversation_parent.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/park_pool_policy.hpp"
@@ -1102,6 +1103,24 @@ struct Options {
     /// park itself, so a peer can pick it up the moment this engine switches to another conversation.  The eviction
     /// and idle writers keep working; an image the disk already holds is not written again.
     bool conversation_cache_spill_on_park = false;
+    /// --conversation-parent-parking-fd N (--serve, set by the server): the inherited SOCK_SEQPACKET socketpair to the
+    /// server's shared parking store (serve/parent_parking.py, conversation_parent.hpp).  The store owns the index, the
+    /// LRU and the memfd snapshots for EVERY replica, so this engine keeps no parked image at all: it writes each
+    /// stage's session file straight into a memfd the store hands it.  -1 = off, the local heap cache parks as before.
+    int conversation_parent_parking_fd = -1;
+    /// --conversation-parent-parking-owner rN: this replica's name in the store's counters and in the logs.
+    std::string conversation_parent_parking_owner;
+    /// --conversation-parent-parking-min-tokens N: park only conversations of at least N tokens.  Independent of
+    /// --conversation-cache-min-tokens, which the store never sees (it has no slots to spend).
+    int64_t conversation_parent_parking_min_tokens = 0;
+    /// --conversation-parent-parking-min-gain N: restore from the store only for at least N more reused tokens than
+    /// the live session or a batch slot already offers (reading a whole conversation back costs a materialization).
+    int64_t conversation_parent_parking_min_gain = 4096;
+    /// --conversation-parent-parking-max-snapshot-mib N: the largest conversation this engine writes or reads.
+    int64_t conversation_parent_parking_max_snapshot_mib = 8192;
+    /// --conversation-parent-parking-timeout-ms N: the bound on every control exchange with the store (not on the K/V
+    /// transfer through the memfds, which is a plain write).
+    int64_t conversation_parent_parking_timeout_ms = 2000;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1307,6 +1326,14 @@ void usage() {
                  "  --conversation-cache-allow-unsafe-fs  --serve: start on a network or FUSE folder anyway (the store\n"
                  "                       relies on flock and atomic rename: experiments only)\n"
                  "  --conversation-cache-spill-on-park  --serve: write every parked conversation to the disk at the park\n"
+                 "  --conversation-parent-parking-fd N  --serve (set by the server): the inherited socketpair to the\n"
+                 "                       server's shared parking store; the engine then keeps no parked image at all\n"
+                 "  --conversation-parent-parking-owner rN  --serve: this replica's name in the store's counters\n"
+                 "  --conversation-parent-parking-min-tokens N  --serve: park only conversations of at least N tokens\n"
+                 "  --conversation-parent-parking-min-gain N  --serve: restore from the store only for N more reused\n"
+                 "                       tokens than the live session or a batch slot offers (default 4096)\n"
+                 "  --conversation-parent-parking-max-snapshot-mib N  --serve: the largest conversation written or read\n"
+                 "  --conversation-parent-parking-timeout-ms N  --serve: the bound on every control exchange (default 2000)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3937,6 +3964,26 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-owner") o.conversation_cache_owner = next("--conversation-cache-owner");
         else if (a == "--conversation-cache-allow-unsafe-fs") o.conversation_cache_allow_unsafe_fs = true;
         else if (a == "--conversation-cache-spill-on-park") o.conversation_cache_spill_on_park = true;
+        else if (a == "--conversation-parent-parking-owner")
+            o.conversation_parent_parking_owner = next("--conversation-parent-parking-owner");
+        else if (a == "--conversation-parent-parking-fd" || a == "--conversation-parent-parking-min-tokens" ||
+                 a == "--conversation-parent-parking-min-gain" || a == "--conversation-parent-parking-max-snapshot-mib" ||
+                 a == "--conversation-parent-parking-timeout-ms") {
+            const std::string value = next(a.c_str());
+            int64_t number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            const int64_t limit = a == "--conversation-parent-parking-fd" ? INT32_MAX : INT64_MAX / (1024 * 1024);
+            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
+                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+                return 2;
+            }
+            if (a == "--conversation-parent-parking-fd") o.conversation_parent_parking_fd = (int) number;
+            else if (a == "--conversation-parent-parking-min-tokens") o.conversation_parent_parking_min_tokens = number;
+            else if (a == "--conversation-parent-parking-min-gain") o.conversation_parent_parking_min_gain = number;
+            else if (a == "--conversation-parent-parking-max-snapshot-mib")
+                o.conversation_parent_parking_max_snapshot_mib = number;
+            else o.conversation_parent_parking_timeout_ms = number;
+        }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" || a == "--conversation-cache-disk-gib" ||
@@ -4527,6 +4574,39 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
+    // --conversation-parent-parking-fd: the server's shared store REPLACES the local heap cache (the plan's §20.1), and
+    // the disk tier is a different mechanism for the same job (the plan keeps them apart).  A combination that cannot
+    // work is a start error, never a silent fallback to another mode.
+    if (o.conversation_parent_parking_fd >= 0) {
+        if (!o.serve) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-fd needs --serve (the server owns the store)\n");
+            return 2;
+        }
+        if (!o.conversation_cache_dir.empty() || !o.conversation_cache_peer_dirs.empty()) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-fd cannot be combined with "
+                                 "--conversation-cache-dir/--conversation-cache-peer-dir: the server's store replaces the "
+                                 "disk handoff\n");
+            return 2;
+        }
+        if (o.prompt_cache == 0) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-fd needs --prompt-cache above 0 (a parked "
+                                 "conversation is restored into the session's checkpoints)\n");
+            return 2;
+        }
+        if (o.conversation_parent_parking_owner.empty()) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-fd needs --conversation-parent-parking-owner "
+                                 "(the replica's name in the store)\n");
+            return 2;
+        }
+        if (o.conversation_parent_parking_max_snapshot_mib <= 0) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-max-snapshot-mib must be above 0\n");
+            return 2;
+        }
+        if (o.conversation_parent_parking_timeout_ms <= 0) {
+            std::fprintf(stderr, "strata generate: --conversation-parent-parking-timeout-ms must be above 0\n");
+            return 2;
+        }
+    }
     // STRATA_PRIMARY_DEVICE: which VISIBLE device the engine's own session runs on.  The Windows HIP runtime
     // enumerates the cards in a fixed order no HIP_VISIBLE_DEVICES list can change (it only filters), so with a
     // slower card first a run could only put the model on it (RX 6600 before RX 6800).  0 (unset) is upstream's
@@ -4573,9 +4653,11 @@ int main(int argc, char** argv) {
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
-        if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
+        if (split_same && ((o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) ||
+                           o.conversation_parent_parking_fd >= 0)) {
             std::fprintf(stderr, "strata serve: conversation parking does not support a layer split on one GPU "
-                                 "(--split-device 0); disable parking with --conversation-cache-mib 0\n");
+                                 "(--split-device 0); disable parking with --conversation-cache-mib 0%s\n",
+                         o.conversation_parent_parking_fd >= 0 ? " or turn the server's store off" : "");
             return 2;
         }
         // THE LAYER SPLIT'S SPILL WALK, STEP 6: FEWER CARDS.  Under `auto`, a later card with too little free memory to hold even a trimmed share (a card another program fills) is left out
@@ -12998,7 +13080,11 @@ int main(int argc, char** argv) {
         // #3493: no --conversation-cache-mib given: size the cache for agent use from the RAM that is free now that the model is
         // loaded (an agent Harness alternates a long main conversation with shorter ones; with the cache off every request read
         // its whole prompt again, Reused 0 on 12 of 12).  An explicit value, 0 included, is never touched.
-        if (o.conversation_cache_mib < 0) {
+        // --conversation-parent-parking-fd: the server's store holds every parked conversation, so this engine's heap
+        // cache is off (its budget is 0 below) and the automatic sizing has nothing to size.  The flag the server
+        // passes is documented as the default mode's setting and is not rewritten here.
+        const bool parent_mode = o.conversation_parent_parking_fd >= 0;
+        if (o.conversation_cache_mib < 0 && !parent_mode) {
             if (o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0) {
                 auto cache_room = strata::core::available_host_bytes();
                 // #4518: the residency policy locked the PLE table before it knew what the rest of the load would take; if the lock is what
@@ -13028,7 +13114,7 @@ int main(int argc, char** argv) {
             }
         }
         strata::core::ConversationCache conversations(
-            o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+            parent_mode ? 0 : (o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0),
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
         //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
@@ -13180,6 +13266,61 @@ int main(int argc, char** argv) {
             id.config = *config_fp;
             return true;
         };
+        // ---- the server's shared parking store (serve/parent_parking.py, conversation_parent.hpp): ONE RAM copy of
+        // every parked conversation for all replicas, in the server's process.  The engine keeps no parked image at
+        // all - it writes each stage's session file straight into a memfd the store hands it - so the local heap cache
+        // above is created with a zero budget and is never used in this mode (the plan's §20.1: the store REPLACES it).
+        strata::core::ConversationParentClient conv_parent;
+        if (parent_mode) {
+            strata::core::ParentIdentity pid;
+            pid.owner = o.conversation_parent_parking_owner;
+            strata::core::SessionFileIdentity sid;
+            std::string e;
+            if (!session_identity(sid, e, {})) {
+                std::printf("ERR the parking store's identity cannot be computed: %s\n", e.c_str());
+                return 1;
+            }
+            pid.model = sid.model;
+            pid.config = sid.config;
+            strata::core::ConversationDiskLayout layout;
+            layout.stages.emplace_back(ss.layer_lo, ss.layer_hi);
+            for (const auto& st : stages) layout.stages.emplace_back(st->ss.layer_lo, st->ss.layer_hi);
+            pid.layout_key = layout.key();
+            pid.stages = layout.stages;
+            if (!conv_parent.connect(o.conversation_parent_parking_fd, pid,
+                                     (int) o.conversation_parent_parking_timeout_ms, e)) {
+                std::printf("ERR the server's parking store refused this engine: %s\n", e.c_str());
+                return 1;
+            }
+            strata::core::ParentStats pst;
+            std::string se;
+            const bool have_stats = conv_parent.stats(pst, se);
+            std::fprintf(stderr, "strata serve: conversation parent: connected owner=%s; entries=%zu bytes=%llu epoch=%llu\n",
+                         pid.owner.c_str(), have_stats ? pst.entries : 0,
+                         (unsigned long long) (have_stats ? pst.entry_bytes : 0),
+                         (unsigned long long) conv_parent.epoch());
+            // the store's memfds are written synchronously: the async park switches have nothing to do here (the plan
+            // asks for this to be said once, before READY, rather than silently ignored)
+            const char* vram_env = std::getenv("STRATA_PARK_VRAM_MIB");
+            if (park_async_env() || (vram_env != nullptr && vram_env[0] != '\0' && std::atoi(vram_env) > 0))
+                std::fprintf(stderr, "strata serve: conversation parent: STRATA_PARK_ASYNC and STRATA_PARK_VRAM_MIB do not "
+                                     "apply (the store's memfds are written synchronously)\n");
+        }
+        // The one question every park and restore asks: is parking on, and is this conversation worth it?  In parent
+        // mode the store's own budget and thresholds answer; the local cache's are not consulted (its budget is 0).
+        bool parent_degraded_logged = false;
+        auto parent_note_degraded = [&](const std::string& why) {
+            if (!parent_mode || parent_degraded_logged || !conv_parent.degraded()) return;
+            parent_degraded_logged = true;
+            std::fprintf(stderr, "strata serve: conversation parent: degraded: %s; prompt fallback until this replica "
+                                 "restarts\n", why.c_str());
+        };
+        auto parking_enabled = [&] { return parent_mode ? conv_parent.enabled() : conversations.enabled(); };
+        auto parking_wants = [&](int64_t tokens) {
+            return parent_mode ? (o.conversation_parent_parking_min_tokens <= 0 ||
+                                  tokens >= o.conversation_parent_parking_min_tokens)
+                               : conversations.wants(tokens);
+        };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -13249,7 +13390,135 @@ int main(int argc, char** argv) {
             });
         };
         pool_topup();   // the first request's checkpoints find the pool full
+        // ---- the server's shared store: the park path (the plan's §7).  No heap image is built at all: each stage's
+        // session file is measured and then written straight into a memfd the store handed over, and the store
+        // publishes it on COMMIT.  The local cache is not involved (its budget is 0 in this mode), so there is no
+        // second K/V copy and no retained K/V: the K/V always comes from the active session, streamed.
+        auto parent_park_source = [&](const ParkSource& src, size_t held) -> bool {
+            (void) held;   // the store's budget is the only one: nothing is held out of a local cache
+            if (!conv_parent.enabled()) return true;
+            const size_t n_tokens = src.ids.size();
+            auto skip = [&](const std::string& why, const char* kind) {
+                std::fprintf(stderr, "strata serve: conversation parent: not published (on-park, %zu tokens%s): %s [%s]\n",
+                             n_tokens, src.what.c_str(), why.c_str(), kind);
+                return true;
+            };
+            if (!parking_wants((int64_t) n_tokens))
+                return skip("below the " + std::to_string((long long) o.conversation_parent_parking_min_tokens) +
+                            " token minimum", "minimum");
+            strata::core::SessionFileIdentity sid;
+            std::string e;
+            if (!session_identity(sid, e, {})) return skip(e, "identity");
+            // the resume points the store matches: the live end first, then every checkpoint in the chain's order
+            std::vector<strata::core::ParentPoint> points;
+            points.reserve(1 + src.checks.size());
+            auto add_point = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, bool live, bool pinned) {
+                strata::core::ParentPoint p;
+                p.tokens = (int64_t) ids.size();
+                p.hash = strata::core::parent_ids_hash(ids.data(), ids.size());
+                p.imgs.assign(imgs.begin(), imgs.end());
+                p.live = live;
+                p.pinned = pinned;
+                points.push_back(std::move(p));
+            };
+            add_point(src.ids, src.imgs, true, false);
+            for (const auto& c : src.checks) add_point(c.ids, c.imgs, false, c.pinned);
+            strata::core::ParentAdvice advice;
+            if (!conv_parent.advice(points, src.cvec, advice, e)) {
+                parent_note_degraded(e);
+                return skip(e, "advice");
+            }
+            if (advice.holding_id != 0) return skip("the store already holds this snapshot", "dedup");
+            if (o.conversation_parent_parking_min_gain > 0 && advice.parked_prefix_tokens > 0 &&
+                (int64_t) n_tokens < advice.parked_prefix_tokens + o.conversation_parent_parking_min_gain)
+                return skip("the store's copy at " + std::to_string((long long) advice.parked_prefix_tokens) +
+                            " tokens is too close behind", "gain");
+            // a layer split parks one image per stage, exactly as the heap path does: the checkpoints are MOVED apart
+            // into their stage parts for the capture and put back together whichever way this ends
+            const size_t n_st = stages.size();
+            std::vector<ConvCheckpoint>& checks = src.checks;
+            strata::core::ConversationCheckpointSplit cs;
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+            struct MergeBack {
+                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
+                ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
+            } merge_back{cs, checks, n_st > 0};
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* {
+                return k + 1 == n_st ? src.draft_last : nullptr;
+            };
+            // measure every stage before the store creates a single memfd: the sizes it reserves are these
+            std::vector<strata::core::SavedConversation> metas(n_st + 1);
+            std::vector<std::vector<strata::core::SessionKvSource>> sources(n_st + 1);
+            std::vector<uint64_t> stage_bytes(n_st + 1);
+            {
+                const strata::core::ConversationView view{src.ids, src.imgs, n_st > 0 ? cs.stage0 : checks, src.cvec};
+                if (!strata::core::conversation_snapshot_sources(metas[0], sources[0], view, src.session, g, src.draft0, e))
+                    return skip(e, "capture");
+                if (!strata::core::session_file_measure(metas[0], sources[0], stage_bytes[0], e))
+                    return skip(e, "measure");
+            }
+            for (size_t k = 0; k < n_st; ++k) {
+                auto& st = stages[k];
+                const strata::core::OnDevice on(st->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) return skip("stage sync failed", "capture");
+                const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
+                if (!strata::core::conversation_snapshot_sources(metas[k + 1], sources[k + 1], view_k,
+                                                                 *src.stage_sessions[k], g, draft_of(k), e))
+                    return skip(e, "capture");
+                if (!strata::core::session_file_measure(metas[k + 1], sources[k + 1], stage_bytes[k + 1], e))
+                    return skip(e, "measure");
+            }
+            uint64_t total = 0;
+            for (uint64_t b : stage_bytes) total += b;
+            if (o.conversation_parent_parking_max_snapshot_mib > 0 &&
+                total > ((uint64_t) o.conversation_parent_parking_max_snapshot_mib << 20))
+                return skip("larger than --conversation-parent-parking-max-snapshot-mib", "size");
+            const auto t0 = Clock::now();
+            const std::string publish_id = strata::core::parent_publish_id();
+            strata::core::ParentPending pending;
+            bool dedup = false;
+            if (!conv_parent.begin(publish_id, points, src.cvec, stage_bytes, pending, dedup, e)) {
+                parent_note_degraded(e);
+                return skip(e, conv_parent.degraded() ? "degraded" : "capacity");
+            }
+            if (dedup) return skip("the store already holds this snapshot", "dedup");
+            // write each stage straight into the store's memfd: no temporary file, no rename, no flush
+            strata::core::SessionWriteOptions wo;
+            wo.durable = false;
+            wo.min_free_bytes = 0;
+            for (size_t k = 0; k < stage_bytes.size(); ++k) {
+                size_t written = 0;
+                strata::core::SessionStatus st;
+                if (!strata::core::session_file_write_fd(pending.fd(k), metas[k], sources[k], sid, written, e, wo, &st)) {
+                    (void) conv_parent.abort(publish_id, pending.id(), e);
+                    return skip(e, strata::core::session_error_name(st.error));
+                }
+                if (written != stage_bytes[k]) {
+                    (void) conv_parent.abort(publish_id, pending.id(), e);
+                    return skip("the written size differs from the measured one", "size");
+                }
+            }
+            pending.close_fds();   // the store seals them on COMMIT
+            uint64_t id = 0, generation = 0;
+            if (!conv_parent.commit(publish_id, pending, id, generation, e)) {
+                parent_note_degraded(e);
+                (void) conv_parent.abort(publish_id, pending.id(), e);
+                return skip(e, "commit");
+            }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            strata::core::ParentStats pst;
+            std::string se;
+            const bool have_stats = conv_parent.stats(pst, se);
+            std::fprintf(stderr, "strata serve: conversation parent: published %zu tokens%s (on-park) in %.1f ms, "
+                                 "%.2f GB/s; entries=%zu bytes=%llu dedup=%zu\n",
+                         n_tokens, src.what.c_str(), ms, ms > 0 ? (double) total / ms / 1e6 : 0.0,
+                         have_stats ? pst.entries : 0, (unsigned long long) (have_stats ? pst.entry_bytes : 0),
+                         have_stats ? pst.deduplicated : 0);
+            return true;
+        };
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
+            // the server's store replaces the heap cache: the legacy capture/put below never runs in this mode
+            if (parent_mode) return parent_park_source(src, held);
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -13499,7 +13768,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!parking_enabled() || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -17346,9 +17615,22 @@ int main(int argc, char** argv) {
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
+                        // the server's store is shared: a poisoned state may have migrated between replicas, so every
+                        // entry of every owner goes (the plan's §9.2), not only this replica's
+                        size_t n_parent = 0;
+                        if (parent_mode) {
+                            std::string ce;
+                            if (conv_parent.clear("nonfinite", n_parent, ce))
+                                std::fprintf(stderr, "strata serve: conversation parent: cleared %zu entries "
+                                                     "(nonfinite); epoch=%llu\n", n_parent,
+                                             (unsigned long long) conv_parent.epoch());
+                            else
+                                std::fprintf(stderr, "strata serve: conversation parent: clear failed: %s\n", ce.c_str());
+                        }
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
-                                             "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
-                                     n_parked == 1 ? "" : "s");
+                                             "replaces the live one; dropped %zu parked conversation%s%s%zu%s\n", n_parked,
+                                     n_parked == 1 ? "" : "s", parent_mode ? " and " : "", n_parent,
+                                     parent_mode ? " in the server's store" : "");
                     }
                     std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
                                  "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
@@ -17757,6 +18039,15 @@ int main(int argc, char** argv) {
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
+                size_t n_parent = 0;
+                if (parent_mode) {   // the store is shared: every owner's entries go (the plan's §9.2)
+                    std::string ce;
+                    if (conv_parent.clear("nonfinite", n_parent, ce))
+                        std::fprintf(stderr, "strata serve: conversation parent: cleared %zu entries (nonfinite); "
+                                             "epoch=%llu\n", n_parent, (unsigned long long) conv_parent.epoch());
+                    else
+                        std::fprintf(stderr, "strata serve: conversation parent: clear failed: %s\n", ce.c_str());
+                }
                 if (const size_t n_disk = conv_disk.clear())   // (written from conversations that may hold it too)
                     std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped %zu conversation%s "
                                          "on disk\n", n_disk, n_disk == 1 ? "" : "s");
@@ -17779,10 +18070,11 @@ int main(int argc, char** argv) {
                         ++n_slots;
                     }
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
-                                     "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
-                                     "not kept after their reply); reading this prompt from token 0\n", n_checks,
-                             n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
-                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+                                     "checkpoint%s, %zu parked conversation%s%s%zu%s and %zu idle slot%s (%zu running "
+                                     "slot%s not kept after their reply); reading this prompt from token 0\n", n_checks,
+                             n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s",
+                             parent_mode ? " and " : "", n_parent, parent_mode ? " in the server's store" : "",
+                             n_slots, n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -17969,14 +18261,145 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // ---- the server's shared store: the restore path (the plan's §8).  Three short exchanges find the deepest
+            // resume point the store holds for this prompt, then one ACQUIRE hands over sealed memfds and a lease; the
+            // image is materialized here and restored by the same validators the heap path uses.  The lease is held
+            // until the materialized image is destroyed (after the GPU restore), so the store's RAM budget counts it.
+            strata::core::ParentLease parent_lease;
+            bool parent_borrow = false;
+            std::string parked_owner;   // the replica that published the entry this request restores (the log says whose)
+            if (parent_mode && o.prompt_cache > 0) {
+                // the read limits: the same shape the disk tier builds, with the physical-RAM admission as the second
+                // barrier (the store's own reservation is the first)
+                auto parent_read_limits = [&](const strata::core::ParentCandidate& c,
+                                              std::vector<strata::core::SessionReadLimits>& out, std::string& e) -> bool {
+                    out.assign(1 + stages.size(), strata::core::SessionReadLimits{});
+                    const int64_t floor_mib = std::min<int64_t>(o.conversation_cache_min_free_mib, kDiskReadFloorMib);
+                    const uint64_t floor = (uint64_t) floor_mib << 20;
+                    for (size_t k = 0; k < out.size(); ++k) {
+                        auto& l = out[k];
+                        l.progress = [](uint64_t, uint64_t) { strata::core::progress_allow(0); };
+                        l.admit = [&, floor, floor_mib](uint64_t need, std::string& why) {
+                            const auto mem = strata::core::sample_host_memory();
+                            if (strata::core::conversation_memory_admit(
+                                    mem ? std::optional<uint64_t>(mem->available) : std::nullopt, need, floor))
+                                return true;
+                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
+                                  std::to_string((long long) floor_mib) + " MiB, " + ram_note(mem) + ")";
+                            return false;
+                        };
+                        const strata::core::SessionState& sk = k == 0 ? ss : stages[k - 1]->ss;
+                        std::string ignored;
+                        if (!use_mtp || !strata::core::conversation_session_read_limits(
+                                            l, sk, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                            (uint64_t) std::max(o.prompt_cache, 1), ignored)) {
+                            l.layer_range = std::make_pair(sk.layer_lo, sk.layer_hi);
+                            l.max_file_bytes = k < c.stage_bytes.size() ? c.stage_bytes[k] : 0;
+                        }
+                    }
+                    (void) e;
+                    return true;
+                };
+                // One read, then the full "the request body extends this image" check: the store's hash is a search
+                // key, not proof that the image is this conversation.  A failure is a fallback to the prompt.
+                auto parent_try_load = [&](const strata::core::ParentCandidate& c, strata::core::ParentLease& lease,
+                                           strata::core::SavedConversation& image, std::string& e,
+                                           strata::core::SessionStatus& st) -> bool {
+                    const auto t0 = Clock::now();
+                    const char* was = strata::core::progress().where.load(std::memory_order_relaxed);
+                    strata::core::progress_at("conversation parent: reading a conversation");
+                    std::vector<strata::core::SessionReadLimits> limits;
+                    bool ok = false;
+                    try {
+                        ok = parent_read_limits(c, limits, e) &&
+                             strata::core::parent_load(lease, limits, image, e, &st);
+                        if (ok && !strata::core::conversation_disk_body_extends(ids, req_imgs, want_cvec, image, c.tokens, e)) {
+                            ok = false;
+                            st.error = strata::core::SessionError::invalid;
+                        }
+                    } catch (const std::exception& x) {   // bad_alloc, a filesystem error: read the prompt instead
+                        e = x.what();
+                        ok = false;
+                    }
+                    strata::core::progress_allow(0);
+                    strata::core::progress_at(was);
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    if (ok) {
+                        const size_t b = image.bytes();
+                        std::fprintf(stderr, "strata serve: conversation parent: read %zu tokens (%lld reused, %s, "
+                                             "owner %s) in %.1f ms, %.2f GB/s\n", image.live.ids.size(),
+                                     (long long) c.tokens, c.live ? "live" : "checkpoint", c.owner.c_str(), ms,
+                                     ms > 0 ? (double) b / ms / 1e6 : 0.0);
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation parent: cannot read (%lld tokens): %s [%s]\n",
+                                     (long long) c.tokens, e.c_str(), strata::core::session_error_name(st.error));
+                    }
+                    return ok;
+                };
+                const int64_t have = std::max({resume, slot_tokens, parked.tokens});
+                const int64_t need = have + std::max<int64_t>(o.conversation_parent_parking_min_gain, 1);
+                // the store hashes the ids as int32 (conversation_disk_ids_hash's function): one conversion per request,
+                // as ConversationDiskTier::best does
+                std::vector<int32_t> ids32(ids.begin(), ids.end());
+                std::string e;
+                std::vector<uint64_t> exclude;
+                for (int attempt = 0; attempt < 2; ++attempt) {
+                    uint64_t cookie = 0;
+                    std::vector<int64_t> lengths;
+                    if (!conv_parent.match_begin((int64_t) ids.size(), want_cvec, req_imgs, exclude, cookie, lengths, e)) {
+                        parent_note_degraded(e);
+                        std::fprintf(stderr, "strata serve: conversation parent: cannot read (%zu tokens): %s [match]\n",
+                                     ids.size(), e.c_str());
+                        break;
+                    }
+                    if (lengths.empty()) break;
+                    std::optional<strata::core::ParentCandidate> candidate;
+                    if (!conv_parent.match_end(cookie, strata::core::parent_hashes(ids32, lengths), candidate, e)) {
+                        parent_note_degraded(e);
+                        std::fprintf(stderr, "strata serve: conversation parent: cannot read (%zu tokens): %s [match]\n",
+                                     ids.size(), e.c_str());
+                        break;
+                    }
+                    if (!candidate || candidate->tokens < need) break;
+                    strata::core::ParentLease lease;
+                    if (!conv_parent.acquire(*candidate, lease, e)) {
+                        parent_note_degraded(e);
+                        const std::string code = conv_parent.last_error_code();
+                        std::fprintf(stderr, "strata serve: conversation parent: cannot read (%lld tokens): %s [%s]\n",
+                                     (long long) candidate->tokens, e.c_str(), code.empty() ? "acquire" : code.c_str());
+                        // one fresh attempt after a stale match (the plan's §8.2.4), never more
+                        if (attempt == 0 && (code == "gone" || code == "stale_generation")) {
+                            exclude = {candidate->id};
+                            continue;
+                        }
+                        break;
+                    }
+                    strata::core::SavedConversation image;
+                    strata::core::SessionStatus st;
+                    if (!parent_try_load(*candidate, lease, image, e, st)) {
+                        // invalid/mismatch quarantine the entry for every replica; memory/io keep it for another try
+                        std::string re;
+                        (void) lease.release(st.error == strata::core::SessionError::invalid ? "invalid" : "io", re);
+                        break;
+                    }
+                    incoming.emplace(std::move(image));
+                    parent_lease = std::move(lease);
+                    parent_borrow = candidate->borrow;
+                    parked_owner = candidate->owner;
+                    parked = {SIZE_MAX, candidate->tokens, candidate->live, 0};
+                    break;
+                }
+            }
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = disk_source == 0 && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
-                          conversations.borrows(parked);
-            if (disk_source == 0 && parked.tokens > std::max(resume, slot_tokens) && !borrow)
+            bool borrow = parent_mode
+                              ? parent_borrow
+                              : (disk_source == 0 && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+                                 conversations.borrows(parked));
+            if (!parent_mode && disk_source == 0 && parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
@@ -18041,8 +18464,15 @@ int main(int argc, char** argv) {
                     // --conversation-cache-dir: a conversation read from disk is not broken, only not restorable now: it
                     // stays in RAM (put, above) and its files stay offered (no mark_failed below)
                     if (disk_source != 0) { disk_source = 0; disk_tier = nullptr; parked = {}; }
-                    if (!conversations.put(std::move(retry)))
+                    if (parent_mode) {
+                        // the store's entry was never taken: it stays for another request, the lease ends and this
+                        // prompt is read (the plan's §8.3)
+                        std::string re;
+                        (void) parent_lease.release("ok", re);
+                        parked = {};
+                    } else if (!conversations.put(std::move(retry))) {
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
+                    }
                     err.clear();
                 }
             }
@@ -18053,7 +18483,8 @@ int main(int argc, char** argv) {
                 parked = {};
             }
             if (borrow) {
-                const strata::core::SavedConversation* donor = conversations.find(parked.serial);
+                // parent mode: the materialized image IS the donor (the store's entry stays available to every replica)
+                const strata::core::SavedConversation* donor = parent_mode ? &*incoming : conversations.find(parked.serial);
                 if (donor == nullptr ||
                     !strata::core::conversation_snapshot_validate(*donor, ss, g, use_mtp ? &mtp.kv_state() : nullptr,
                                                                   err)) {
@@ -18118,7 +18549,14 @@ int main(int argc, char** argv) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                 };
             }
-            if (borrow && !pin_sibling && park_worth) {
+            if (borrow && !pin_sibling && park_worth && parent_mode) {
+                // the store's entry stays available to every replica and the materialized image is already ours: there
+                // is no local donor to guard and no whole take to fall back to (the plan's §8.4)
+                if (!park_current(incoming ? incoming->bytes() : 0)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+            } else if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
                 const bool blocked = conversations.guard_blocked();
@@ -18244,7 +18682,7 @@ int main(int argc, char** argv) {
             }
             if (borrow) {
                 const auto t0 = Clock::now();
-                const strata::core::SavedConversation* donor = conversations.find(parked.serial);   // still parked
+                const strata::core::SavedConversation* donor = parent_mode ? &*incoming : conversations.find(parked.serial);
                 if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
                                                                        use_mtp ? &mtp.kv_state() : nullptr, err) !=
@@ -18264,11 +18702,22 @@ int main(int argc, char** argv) {
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
-                conversations.count_borrow();
-                std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
-                             "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
-                             (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.borrowed());
+                if (parent_mode) {
+                    std::fprintf(stderr, "strata serve: conversation parent: borrowed %lld tokens (owner %s) in %.1f ms\n",
+                                 (long long) resume, parked_owner.c_str(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    // the prefix is restored and the checkpoints are copies: the donor image is no longer needed, and
+                    // the whole-restore block below must not run for a borrow
+                    incoming.reset();
+                    std::string re;
+                    (void) parent_lease.release("ok", re);
+                } else {
+                    conversations.count_borrow();
+                    std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
+                                 "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
+                                 (long long) resume, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 conversations.size(), conversations.bytes(), conversations.borrowed());
+                }
             }
             if (incoming) {
                 const auto t0 = Clock::now();
@@ -18318,12 +18767,16 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
+                if (!parent_mode && std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                if (parent_mode) {   // the image is gone: the store may count its RAM as free again
+                    std::string re;
+                    (void) parent_lease.release("ok", re);
+                }
                 lent_slot = -1;   // (the main session holds the parked conversation now)
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
@@ -18352,7 +18805,17 @@ int main(int argc, char** argv) {
                 kv_quiesce();
                 // STRATA_KV_GROW_HOLD=1 (opt-in): keep the K/V as long as the longest parked conversation; default: trim to this request alone, as 0.1.40
                 static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
-                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                int64_t hold_tokens = 0;
+                if (hold_on) {
+                    if (parent_mode) {
+                        strata::core::ParentStats pst;
+                        std::string se;
+                        if (conv_parent.stats(pst, se)) hold_tokens = pst.longest_tokens;
+                    } else {
+                        hold_tokens = conversations.longest_tokens();
+                    }
+                }
+                if (!kvg_trim(n + 256, hold_on ? hold_tokens + 256 : 0)) {
                     std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
                     std::fflush(stdout);
                     return 1;
