@@ -20,8 +20,7 @@ IDENTITY = {"model": 0x1111222233334444, "config": 0x5555666677778888, "layout_k
 
 
 def config(**changes):
-    block = {"ram_gib": 1, "max_entries": 4, "min_tokens": 0, "min_gain": 1, "max_snapshot_mib": 64,
-             "ipc_timeout_ms": 2000}
+    block = {"ram_gib": 1, "max_entries": 4, "min_tokens": 0, "min_gain": 1, "ipc_timeout_ms": 2000}
     block.update(changes)
     return ParentParkingConfig(**block)
 

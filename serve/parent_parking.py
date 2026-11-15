@@ -31,7 +31,6 @@ Opt-in, in the run config:
       "max_entries": 20,          optional, default 10 * replicas
       "min_tokens": 8192,         optional, default 0
       "min_gain": 4096,           optional, default 4096
-      "max_snapshot_mib": 8192,   optional, default 8192
       "ipc_timeout_ms": 2000      optional, default 2000
     }
 
@@ -169,10 +168,8 @@ def session_read_peak_bytes(file_bytes: int) -> int:
 
 
 # ---- run config (plan §13.1, §13.3)
-PARENT_PARKING_KEYS = ("enabled", "ram_gib", "max_entries", "min_tokens", "min_gain", "max_snapshot_mib",
-                       "ipc_timeout_ms")
+PARENT_PARKING_KEYS = ("enabled", "ram_gib", "max_entries", "min_tokens", "min_gain", "ipc_timeout_ms")
 PARENT_PARKING_MIN_GAIN = 4096
-PARENT_PARKING_MAX_SNAPSHOT_MIB = 8192
 PARENT_PARKING_IPC_TIMEOUT_MS = 2000
 
 
@@ -188,17 +185,12 @@ class ParentParkingConfig:
     max_entries: int
     min_tokens: int = 0
     min_gain: int = PARENT_PARKING_MIN_GAIN
-    max_snapshot_mib: int = PARENT_PARKING_MAX_SNAPSHOT_MIB
     ipc_timeout_ms: int = PARENT_PARKING_IPC_TIMEOUT_MS
     enabled: bool = True
 
     @property
     def capacity_bytes(self) -> int:
         return self.ram_gib << 30
-
-    @property
-    def max_snapshot_bytes(self) -> int:
-        return self.max_snapshot_mib << 20
 
     @property
     def ipc_timeout_s(self) -> float:
@@ -258,16 +250,11 @@ def read_parent_parking(cfg: dict, replicas: int | None = None) -> ParentParking
     max_entries = _config_whole(block, "max_entries", lo=1)
     min_tokens = _config_whole(block, "min_tokens", lo=0, default=0)
     min_gain = _config_whole(block, "min_gain", lo=0, default=PARENT_PARKING_MIN_GAIN)
-    max_snapshot_mib = _config_whole(block, "max_snapshot_mib", lo=1, default=PARENT_PARKING_MAX_SNAPSHOT_MIB)
     ipc_timeout_ms = _config_whole(block, "ipc_timeout_ms", lo=1, default=PARENT_PARKING_IPC_TIMEOUT_MS)
-    if max_snapshot_mib > ram_gib * 1024:
-        raise ParentParkingConfigError(f'replica_parent_parking: "max_snapshot_mib" ({max_snapshot_mib}) is larger '
-                                       f'than "ram_gib" ({ram_gib} GiB = {ram_gib * 1024} MiB): one snapshot could '
-                                       'never fit the budget')
     if max_entries is None:
         max_entries = 10 * (replicas if replicas is not None else _config_replicas(cfg))
     return ParentParkingConfig(ram_gib=ram_gib, max_entries=max_entries, min_tokens=min_tokens, min_gain=min_gain,
-                               max_snapshot_mib=max_snapshot_mib, ipc_timeout_ms=ipc_timeout_ms)
+                               ipc_timeout_ms=ipc_timeout_ms)
 
 
 # ---- identity (plan §5)
@@ -1210,8 +1197,6 @@ class ParentParkingStore:
             self._deduplicated += 1
             return OP_PARK_BEGIN, {"pending_id": 0, "stage_bytes": [], "dedup": True, "holding_id": holding.id}, []
         incoming = sum(stage_bytes)
-        if incoming > self._config.max_snapshot_bytes:
-            raise _bad("the snapshot is larger than max_snapshot_mib")
         self._evict(self._eviction_plan(incoming, slots=1))
         fds: list = []
         try:

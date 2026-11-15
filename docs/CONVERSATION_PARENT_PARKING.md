@@ -92,7 +92,6 @@ store evicting more old entries before a restore than a per-replica budget would
   "max_entries": 20,
   "min_tokens": 8192,
   "min_gain": 4096,
-  "max_snapshot_mib": 8192,
   "ipc_timeout_ms": 2000
 }
 ```
@@ -104,11 +103,10 @@ store evicting more old entries before a restore than a per-replica budget would
 | `max_entries` | optional, default `10 × replicas` |
 | `min_tokens` | optional, default 0: park only conversations of at least this many tokens (independent of `--conversation-cache-min-tokens`) |
 | `min_gain` | default 4096: restore from the store only for at least this many more reused tokens than the live session or a batch slot offers |
-| `max_snapshot_mib` | default 8192: the largest conversation written or read |
 | `ipc_timeout_ms` | default 2000: the bound on every control exchange, not on the K/V transfer |
 
 The server writes the engine flags itself (`--conversation-parent-parking-fd`, `-owner`, `-min-tokens`, `-min-gain`,
-`-max-snapshot-mib`, `-timeout-ms`); they are not meant to be written by hand. The engine refuses a start it cannot
+`-timeout-ms`); they are not meant to be written by hand. The engine refuses a start it cannot
 honour: no `--serve`, a `--conversation-cache-dir`/`--conversation-cache-peer-dir`, `--prompt-cache 0`, a missing
 owner, or a layer split on one GPU.
 
@@ -116,7 +114,7 @@ The start is refused, never silently downgraded, when: there are fewer than two 
 slots or `--parallel` above 1 are on, the all-cards split is on, the platform is not Linux (or has no
 `memfd_create`/seals/`SCM_RIGHTS`), `replica_handoff` is on at the same time, the engine args already carry a
 `--conversation-cache-dir`/`--conversation-cache-peer-dir` or a parent flag, the block has an unknown key or a
-non-integer value, a budget is zero or negative, `max_snapshot_mib` exceeds `ram_gib`, the replicas' model/config/layout
+non-integer value, a budget is zero or negative, the replicas' model/config/layout
 fingerprints differ, or an explicit `--conversation-cache-mib 0`/`--conversation-cache-slots 0`/`--prompt-cache 0`
 makes parking meaningless.
 

@@ -10168,7 +10168,6 @@ def replica_handoff_note(plan: dict) -> str:
 # cannot be used is a start error, never a silent fallback to the local heap cache.
 PARENT_PARKING_ENGINE_FLAGS = ("--conversation-parent-parking-fd", "--conversation-parent-parking-owner",
                                "--conversation-parent-parking-min-tokens", "--conversation-parent-parking-min-gain",
-                               "--conversation-parent-parking-max-snapshot-mib",
                                "--conversation-parent-parking-timeout-ms")
 PARENT_PARKING_REFUSED_FLAGS = ("--conversation-cache-dir", "--conversation-cache-peer-dir",
                                 *PARENT_PARKING_ENGINE_FLAGS)
@@ -10273,7 +10272,6 @@ def parent_parking_args(config) -> list[str]:
     the owner are added per spawn by StrataEngine, because the fd changes with every start."""
     return ["--conversation-parent-parking-min-tokens", str(config.min_tokens),
             "--conversation-parent-parking-min-gain", str(config.min_gain),
-            "--conversation-parent-parking-max-snapshot-mib", str(config.max_snapshot_mib),
             "--conversation-parent-parking-timeout-ms", str(config.ipc_timeout_ms)]
 
 

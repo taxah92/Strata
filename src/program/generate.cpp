@@ -1116,8 +1116,6 @@ struct Options {
     /// --conversation-parent-parking-min-gain N: restore from the store only for at least N more reused tokens than
     /// the live session or a batch slot already offers (reading a whole conversation back costs a materialization).
     int64_t conversation_parent_parking_min_gain = 4096;
-    /// --conversation-parent-parking-max-snapshot-mib N: the largest conversation this engine writes or reads.
-    int64_t conversation_parent_parking_max_snapshot_mib = 8192;
     /// --conversation-parent-parking-timeout-ms N: the bound on every control exchange with the store (not on the K/V
     /// transfer through the memfds, which is a plain write).
     int64_t conversation_parent_parking_timeout_ms = 2000;
@@ -1332,7 +1330,6 @@ void usage() {
                  "  --conversation-parent-parking-min-tokens N  --serve: park only conversations of at least N tokens\n"
                  "  --conversation-parent-parking-min-gain N  --serve: restore from the store only for N more reused\n"
                  "                       tokens than the live session or a batch slot offers (default 4096)\n"
-                 "  --conversation-parent-parking-max-snapshot-mib N  --serve: the largest conversation written or read\n"
                  "  --conversation-parent-parking-timeout-ms N  --serve: the bound on every control exchange (default 2000)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
@@ -3967,7 +3964,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-parent-parking-owner")
             o.conversation_parent_parking_owner = next("--conversation-parent-parking-owner");
         else if (a == "--conversation-parent-parking-fd" || a == "--conversation-parent-parking-min-tokens" ||
-                 a == "--conversation-parent-parking-min-gain" || a == "--conversation-parent-parking-max-snapshot-mib" ||
+                 a == "--conversation-parent-parking-min-gain" ||
                  a == "--conversation-parent-parking-timeout-ms") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
@@ -3980,8 +3977,6 @@ int main(int argc, char** argv) {
             if (a == "--conversation-parent-parking-fd") o.conversation_parent_parking_fd = (int) number;
             else if (a == "--conversation-parent-parking-min-tokens") o.conversation_parent_parking_min_tokens = number;
             else if (a == "--conversation-parent-parking-min-gain") o.conversation_parent_parking_min_gain = number;
-            else if (a == "--conversation-parent-parking-max-snapshot-mib")
-                o.conversation_parent_parking_max_snapshot_mib = number;
             else o.conversation_parent_parking_timeout_ms = number;
         }
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
@@ -4596,10 +4591,6 @@ int main(int argc, char** argv) {
         if (o.conversation_parent_parking_owner.empty()) {
             std::fprintf(stderr, "strata generate: --conversation-parent-parking-fd needs --conversation-parent-parking-owner "
                                  "(the replica's name in the store)\n");
-            return 2;
-        }
-        if (o.conversation_parent_parking_max_snapshot_mib <= 0) {
-            std::fprintf(stderr, "strata generate: --conversation-parent-parking-max-snapshot-mib must be above 0\n");
             return 2;
         }
         if (o.conversation_parent_parking_timeout_ms <= 0) {
@@ -13470,9 +13461,6 @@ int main(int argc, char** argv) {
             }
             uint64_t total = 0;
             for (uint64_t b : stage_bytes) total += b;
-            if (o.conversation_parent_parking_max_snapshot_mib > 0 &&
-                total > ((uint64_t) o.conversation_parent_parking_max_snapshot_mib << 20))
-                return skip("larger than --conversation-parent-parking-max-snapshot-mib", "size");
             const auto t0 = Clock::now();
             const std::string publish_id = strata::core::parent_publish_id();
             strata::core::ParentPending pending;

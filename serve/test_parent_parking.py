@@ -208,10 +208,10 @@ class StoreCase(unittest.TestCase):
         if self.store is not None:
             self.store.close()
 
-    def make_store(self, *, ram_gib=1, max_entries=10, max_snapshot_mib=64, ipc_timeout_ms=2000,
+    def make_store(self, *, ram_gib=1, max_entries=10, ipc_timeout_ms=2000,
                    capacity_bytes=None, identity=IDENTITY):
         config = pp.ParentParkingConfig(ram_gib=ram_gib, max_entries=max_entries,
-                                        max_snapshot_mib=max_snapshot_mib, ipc_timeout_ms=ipc_timeout_ms)
+                                        ipc_timeout_ms=ipc_timeout_ms)
         self.store = pp.ParentParkingStore(config, identity, capacity_bytes=capacity_bytes)
         return self.store
 
@@ -584,7 +584,7 @@ class ParentParkingProtocol(StoreCase):
         self.assertEqual(r1.match_begin(21)["lengths"], [20])
 
     def test_identity_layout_stage_count_size_and_payload_limits(self):
-        self.make_store(max_snapshot_mib=1)
+        self.make_store()
         wrong = self.client("r0", hello=False)
         self.assert_error(wrong, pp.OP_HELLO,
                           {"owner": "r0", "protocol": 1, "model": 8, "config": IDENTITY.config,
@@ -598,8 +598,8 @@ class ParentParkingProtocol(StoreCase):
         self.assert_error(r2, pp.OP_PARK_BEGIN, r2.begin_payload([point(10, 0x10, live=True)], [100, 200]),
                           "bad_request")
         r3 = self.client("r3")
-        self.assert_error(r3, pp.OP_PARK_BEGIN, r3.begin_payload([point(10, 0x10, live=True)], [(1 << 20) + 1]),
-                          "bad_request")
+        self.assert_error(r3, pp.OP_PARK_BEGIN, r3.begin_payload([point(10, 0x10, live=True)], [(1 << 30) + 1]),
+                          "capacity")
         r4 = self.client("r4")
         self.assert_error(r4, pp.OP_PARK_BEGIN,
                           r4.begin_payload([point(i + 1, i) for i in range(pp.MAX_POINTS + 1)], [100]),
@@ -711,28 +711,18 @@ class ParentParkingConfigTests(unittest.TestCase):
                 ({"max_entries": True}, "max_entries"),
                 ({"min_tokens": -1}, "min_tokens"),
                 ({"min_gain": "4096"}, "min_gain"),
-                ({"max_snapshot_mib": 0}, "max_snapshot_mib"),
                 ({"ipc_timeout_ms": 0}, "ipc_timeout_ms"),
                 ({"ipc_timeout_ms": 1.5}, "ipc_timeout_ms")):
             with self.subTest(block=block), self.assertRaises(pp.ParentParkingConfigError) as caught:
                 pp.read_parent_parking({"replica_parent_parking": {"enabled": True, "ram_gib": 40, **block}})
             self.assertIn(expected, str(caught.exception))
 
-    def test_max_snapshot_cannot_exceed_ram_gib(self):
-        with self.assertRaises(pp.ParentParkingConfigError) as caught:
-            pp.read_parent_parking({"replica_parent_parking": {"enabled": True, "ram_gib": 1,
-                                                               "max_snapshot_mib": 1025}})
-        self.assertIn("max_snapshot_mib", str(caught.exception))
-        self.assertIsNotNone(pp.read_parent_parking({"replica_parent_parking": {"enabled": True, "ram_gib": 1,
-                                                                                "max_snapshot_mib": 1024}}))
-
     def test_the_defaults(self):
         config = pp.read_parent_parking({"replicas": 3,
                                          "replica_parent_parking": {"enabled": True, "ram_gib": 40}})
-        self.assertEqual((config.max_entries, config.min_tokens, config.min_gain, config.max_snapshot_mib,
-                          config.ipc_timeout_ms), (30, 0, 4096, 8192, 2000))
+        self.assertEqual((config.max_entries, config.min_tokens, config.min_gain, config.ipc_timeout_ms),
+                         (30, 0, 4096, 2000))
         self.assertEqual(config.capacity_bytes, 40 << 30)
-        self.assertEqual(config.max_snapshot_bytes, 8192 << 20)
         self.assertTrue(config.enabled)
 
     def test_the_replicas_argument_wins(self):
@@ -745,8 +735,7 @@ class ParentParkingThreads(unittest.TestCase):
     """open_channel is called from parallel StrataEngine starts: every channel must be its own."""
 
     def test_open_channel_from_several_threads(self):
-        store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10, max_snapshot_mib=64),
-                                      IDENTITY)
+        store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10), IDENTITY)
         clients = []
         try:
             results, errors = [], []

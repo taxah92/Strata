@@ -33,7 +33,7 @@ PULL_OFF = rp.PullSettings(False, 60.0, None, None)
 def block(**changes):
     """The plan's start block (§13.1), with any field changed for one test."""
     b = {"enabled": True, "ram_gib": 40, "max_entries": 20, "min_tokens": 8192, "min_gain": 4096,
-         "max_snapshot_mib": 8192, "ipc_timeout_ms": 2000}
+         "ipc_timeout_ms": 2000}
     b.update(changes)
     return b
 
@@ -81,20 +81,14 @@ class ParentParkingConfigTests(unittest.TestCase):
                                   ({"max_entries": True}, "max_entries"),
                                   ({"min_tokens": -1}, "min_tokens"),
                                   ({"min_gain": "4096"}, "min_gain"),
-                                  ({"max_snapshot_mib": 0}, "max_snapshot_mib"),
                                   ({"ipc_timeout_ms": 0}, "ipc_timeout_ms"),
                                   ({"ipc_timeout_ms": 1.5}, "ipc_timeout_ms")):
             with self.subTest(changes=changes):
                 self.assertIn(expected, self.problem(block(**changes)))
 
-    def test_max_snapshot_cannot_exceed_ram_gib(self):
-        self.assertIn("max_snapshot_mib", self.problem(block(ram_gib=1, max_snapshot_mib=1025)))
-        self.assertIsNotNone(self.plan(block(ram_gib=1, max_snapshot_mib=1024)))
-
     def test_the_defaults_are_the_plans_start_values(self):
         plan = self.plan({"enabled": True, "ram_gib": 40})
-        self.assertEqual((plan.max_entries, plan.min_tokens, plan.min_gain, plan.max_snapshot_mib,
-                          plan.ipc_timeout_ms), (20, 0, 4096, 8192, 2000))
+        self.assertEqual((plan.max_entries, plan.min_tokens, plan.min_gain, plan.ipc_timeout_ms), (20, 0, 4096, 2000))
         self.assertEqual(plan.capacity_bytes, 40 << 30)
         self.assertTrue(plan.enabled)
 
@@ -158,7 +152,6 @@ class ParentParkingConfigTests(unittest.TestCase):
         self.assertEqual(parent_parking_args(plan),
                          ["--conversation-parent-parking-min-tokens", "8192",
                           "--conversation-parent-parking-min-gain", "4096",
-                          "--conversation-parent-parking-max-snapshot-mib", "8192",
                           "--conversation-parent-parking-timeout-ms", "2000"])
 
     def test_the_start_line(self):
@@ -202,7 +195,7 @@ class ChannelCase(unittest.TestCase):
     """A real store and fake engine processes: the channel is a real socketpair and the fd passing is real."""
 
     def setUp(self):
-        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10, max_snapshot_mib=64),
+        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10),
                                            IDENTITY)
         self.addCleanup(self.store.close)
         self.record = []
@@ -395,7 +388,7 @@ class ReplicaLifecycle(unittest.TestCase):
     carries each replica's channel state."""
 
     def setUp(self):
-        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10, max_snapshot_mib=64),
+        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10),
                                            IDENTITY)
         self.addCleanup(self.store.close)
         self.client = Client(self.store, "r0")
@@ -462,7 +455,7 @@ class ParentParkingMetrics(unittest.TestCase):
     the global gauges and counters, and the default-off answers keep exactly their old fields."""
 
     def setUp(self):
-        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10, max_snapshot_mib=64),
+        self.store = pp.ParentParkingStore(pp.ParentParkingConfig(ram_gib=1, max_entries=10),
                                            IDENTITY)
         self.addCleanup(self.store.close)
         self.clients = [Client(self.store, "r0"), Client(self.store, "r1")]
