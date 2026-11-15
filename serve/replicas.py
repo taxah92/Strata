@@ -43,6 +43,7 @@ route() and the order of the old path stay as they were.
 from __future__ import annotations
 
 import collections
+import contextlib
 import copy
 import math
 import os
@@ -624,7 +625,7 @@ class Router:
 class ReplicaEngine:
     """Stands in for one engine (the interface Service uses), over several."""
 
-    NOT_HERE = {"session_file", "vram", "ctl", "slot_cv"}       # not offered: one conversation file / VRAM resize / control line
+    NOT_HERE = {"session_file", "ctl", "slot_cv"}       # not offered: one conversation file / control line
     PROPAGATE = {"silence_s", "gpu_busy"}
 
     def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS, *, pull: bool = False,
@@ -703,6 +704,10 @@ class ReplicaEngine:
         d["heal_at"] = [0.0] * len(engines)
         d["routed"] = [0] * len(engines)
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
+        d["paused"] = {}                            # replica index -> owner thread ident while paused
+        d["pause_depth"] = {}                       # replica index -> re-entrant pause depth
+        d["reserves"] = [None] * len(engines)       # last VRAM reserve asked per replica (None = start's)
+        d["reserves_asked"] = [False] * len(engines)
         # the server's one parent parking store (serve/parent_parking.py, plan §12.3): in __dict__, never through
         # __getattr__, so the store is this object's own and not one engine's.  None when the mode is off.
         d["parent_parking"] = parent_parking
@@ -862,6 +867,188 @@ class ReplicaEngine:
                 "picked": pick["replica"] if pick else None, "reason": pick["reason"] if pick else None,
                 **stats}
 
+    def vram_view(self) -> list[dict]:
+        """Per-replica VRAM and expert-cache readings for /v1/status and /metrics."""
+        rows = []
+        for k, e in enumerate(self.engines):
+            info = getattr(e, "info", None) or {}
+            vram = dict(info.get("vram") or {})
+            for key in ("expert_slots", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib"):
+                if key not in vram and key in info:
+                    vram[key] = info[key]
+            row = {"replica": k, "alive": e.alive(), **vram,
+                   "elastic": bool(info.get("vram_elastic"))}
+            if "reserve_mib" not in row and self.reserves_asked[k]:
+                row["reserve_mib"] = self.reserves[k]
+            rows.append(row)
+        return rows
+
+    def vram_summary(self) -> dict:
+        """Aggregated VRAM summary for /v1/status across replicas, preserving per-replica details."""
+        rows = self.vram_view()
+        out: dict = {
+            "elastic": bool(rows) and all(r.get("elastic") for r in rows),
+            "replicas": rows,
+        }
+        for key in ("expert_slots", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib"):
+            vals = [r[key] for r in rows if isinstance(r.get(key), int)]
+            if len(vals) == len(rows):
+                out[key] = sum(vals)
+        return out
+
+    def normalize_replicas(self, replica=None) -> list[int]:
+        """Validate and expand a replica selector (None -> all, int -> [int], list/tuple -> unique ordered list)."""
+        n = len(self.engines)
+        if replica is None:
+            return list(range(n))
+        if isinstance(replica, bool):
+            raise ValueError("replica: an integer index or a non-empty list of indices")
+        if isinstance(replica, int):
+            items = [replica]
+        elif isinstance(replica, (list, tuple)):
+            if not replica:
+                raise ValueError("replica: list must not be empty")
+            items = list(replica)
+        else:
+            raise ValueError("replica: an integer index or a non-empty list of indices")
+        for x in items:
+            if isinstance(x, bool) or not isinstance(x, int) or not (0 <= x < n):
+                raise ValueError(f"replica {x!r} out of range (0..{n - 1})")
+        return list(dict.fromkeys(items))
+
+    @contextlib.contextmanager
+    def pause(self, replicas=None, wait_s: float = 300.0):
+        """Pause routing to `replicas` and wait until any running request on them finishes.
+
+        Re-entrant for the same thread (e.g. a GPU vision turn holding pause on replica 0 while shrinking its
+        expert cache).  Only parallel=1 replicas (no batch slots) can be paused cleanly without slot arbitration.
+        """
+        from serve.server import ModelBusy
+        targets = self.normalize_replicas(replicas)
+        for k in targets:
+            slots = int(getattr(self.engines[k], "batch", 0) or 0)
+            if slots > 0:
+                raise ValueError(
+                    f"per-replica pause/resize is not supported with batch slots (replica {k} reports {slots}): "
+                    'use "parallel": 1 replicas'
+                )
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        tid = threading.get_ident()
+        claimed: list[int] = []
+        try:
+            with self.cv:
+                while any(self.paused.get(k) not in (None, tid) for k in targets):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise ModelBusy("another pause or VRAM resize is already in progress on the target replica")
+                    self.cv.wait(timeout=left)
+                for k in targets:
+                    self.paused[k] = tid
+                    self.pause_depth[k] = self.pause_depth.get(k, 0) + 1
+                    claimed.append(k)
+                while any(self.inflight[k] > 0 for k in targets):
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        busy = [k for k in targets if self.inflight[k] > 0]
+                        raise ModelBusy(
+                            f"replica{'s' if len(busy) > 1 else ''} {', '.join(str(k) for k in busy)} "
+                            "still busy; try again when the running request finishes"
+                        )
+                    self.cv.wait(timeout=left)
+            yield targets
+        finally:
+            if claimed:
+                with self.cv:
+                    for k in claimed:
+                        depth = self.pause_depth.get(k, 1) - 1
+                        if depth <= 0:
+                            self.pause_depth.pop(k, None)
+                            self.paused.pop(k, None)
+                        else:
+                            self.pause_depth[k] = depth
+                    if self.pull_enabled:
+                        self._pull_pump_locked(time.monotonic())
+                    self.cv.notify_all()
+
+    def _reapply_reserve(self, k: int) -> None:
+        if not self.reserves_asked[k] or self.reserves[k] is None:
+            return
+        e = self.engines[k]
+        if not hasattr(e, "vram") or not e.alive():
+            return
+        try:
+            e.vram(self.reserves[k])
+        except Exception as err:                 # noqa: BLE001
+            print(f"[strata] replica {k}: the VRAM reserve ({self.reserves[k]} MiB) was not applied: {err}", flush=True)
+
+    def vram(self, reserve_mib: int | None | dict[int, int | None], replica=None, wait_s: float = 300.0) -> dict:
+        """Apply a VRAM reserve to selected replicas (None = all), pausing and draining them first.
+
+        If one replica fails after earlier ones succeeded, already-resized replicas are rolled back to their
+        previous reserves before raising.
+        """
+        from serve.server import EngineDied
+        targets = self.normalize_replicas(replica)
+        for k in targets:
+            if not hasattr(self.engines[k], "vram"):
+                raise ValueError(f"replica {k} cannot resize its VRAM use")
+
+        def target_reserve(k: int) -> int | None:
+            return reserve_mib[k] if isinstance(reserve_mib, dict) else reserve_mib
+
+        with self.pause(targets, wait_s=wait_s):
+            if not any(e.alive() for e in self.engines):
+                rows = []
+                for k in targets:
+                    r_k = target_reserve(k)
+                    self.reserves[k] = r_k
+                    self.reserves_asked[k] = True
+                    rows.append({"replica": k, "status": "not loaded", "reserve_mib": r_k,
+                                 "note": "applied when the model loads"})
+                if len(targets) == 1:
+                    return {**rows[0], "replicas": rows}
+                return {"status": "not loaded",
+                        "reserve_mib": None if isinstance(reserve_mib, dict) else reserve_mib,
+                        "replicas": rows}
+
+            rows = []
+            applied: list[tuple[int, int | None, bool]] = []
+            try:
+                for k in targets:
+                    r_k = target_reserve(k)
+                    e = self.engines[k]
+                    if not e.alive():
+                        if getattr(e, "unloaded", False):
+                            prev = (k, self.reserves[k], self.reserves_asked[k])
+                            self.reserves[k] = r_k
+                            self.reserves_asked[k] = True
+                            applied.append(prev)
+                            rows.append({"replica": k, "status": "not loaded", "reserve_mib": r_k,
+                                         "note": "applied when the model loads"})
+                            continue
+                        raise EngineDied(f"replica {k} is not running")
+                    prev = (k, self.reserves[k], self.reserves_asked[k])
+                    out = e.vram(r_k)
+                    self.reserves[k] = r_k
+                    self.reserves_asked[k] = True
+                    applied.append(prev)
+                    rows.append({"replica": k, "status": "ok", **out})
+            except Exception:
+                for pk, prev_res, prev_asked in reversed(applied):
+                    try:
+                        if self.engines[pk].alive():
+                            self.engines[pk].vram(prev_res if prev_asked else None)
+                    except Exception as rb_err:  # noqa: BLE001
+                        print(f"[strata] replica {pk}: rollback of VRAM reserve failed: {rb_err}", flush=True)
+                    self.reserves[pk] = prev_res
+                    self.reserves_asked[pk] = prev_asked
+                raise
+
+        status = "ok" if any(r.get("status") == "ok" for r in rows) else "not loaded"
+        if len(targets) == 1:
+            return {**rows[0], "replicas": rows}
+        return {"status": status, "replicas": rows}
+
     # ---- life cycle
     def restart(self, tries: int = 3):
         dead = [k for k, e in enumerate(self.engines) if not e.alive()]
@@ -871,6 +1058,7 @@ class ReplicaEngine:
             try:
                 self.engines[k].restart(tries)
                 self.router.forget(k)
+                self._reapply_reserve(k)
                 with self.cv:
                     self.idle_since[k] = time.monotonic()
             except BaseException as e:           # noqa: BLE001
@@ -916,20 +1104,25 @@ class ReplicaEngine:
 
     # ---- routing
     def route(self, ids) -> int:
-        """The replica for this prompt (and its running count raised): lowest cost among the living ones."""
-        got = self.router.matched(ids)
-        with self.lock:
-            alive = [k for k, e in enumerate(self.engines) if e.alive()]
-            if not alive:
-                return -1
-            cost = {k: (len(ids) - got[k]) + self.load_tokens * self.inflight[k] for k in alive}
-            # the least loaded wins a tie of cost (equal cards, nothing cached): spread, do not pile on replica 0
-            k = min(alive, key=lambda k: (cost[k], self.inflight[k], -self.priorities[k], self.routed[k]))
-            self.inflight[k] += 1
-            self.routed[k] += 1
-        if len(alive) < len(self.engines):
-            self.heal()
-        return k
+        """The replica for this prompt (and its running count raised): lowest cost among the living unpaused ones."""
+        while True:
+            got = self.router.matched(ids)
+            with self.cv:
+                alive = [k for k, e in enumerate(self.engines) if e.alive()]
+                if not alive:
+                    return -1
+                avail = [k for k in alive if k not in self.paused]
+                if not avail:
+                    self.cv.wait(timeout=0.5)
+                    continue
+                cost = {k: (len(ids) - got[k]) + self.load_tokens * self.inflight[k] for k in avail}
+                # the least loaded wins a tie of cost (equal cards, nothing cached): spread, do not pile on replica 0
+                k = min(avail, key=lambda k: (cost[k], self.inflight[k], -self.priorities[k], self.routed[k]))
+                self.inflight[k] += 1
+                self.routed[k] += 1
+            if len(alive) < len(self.engines):
+                self.heal()
+            return k
 
     def heal(self) -> None:
         """Start a replica that died again, in the background (the others keep serving)."""
@@ -947,6 +1140,7 @@ class ReplicaEngine:
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()
                     self.router.forget(k)
+                    self._reapply_reserve(k)
                     with self.cv:
                         self.idle_since[k] = time.monotonic()
                     print(f"[strata] replica {k} is running again", flush=True)
@@ -954,6 +1148,8 @@ class ReplicaEngine:
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
                 finally:
                     self.healing[k] = False
+                    with self.cv:
+                        self.cv.notify_all()
             threading.Thread(target=run, daemon=True).start()
 
     # ---- pull scheduler (opt-in: "replica_pull": true; see pull_config and the module doc)
@@ -1047,7 +1243,8 @@ class ReplicaEngine:
         without a new request)."""
         if not self.pending:
             return
-        free = [k for k, e in enumerate(self.engines) if e.alive() and not self.inflight[k]]
+        free = [k for k, e in enumerate(self.engines)
+                if e.alive() and not self.inflight[k] and k not in self.paused]
         while free:
             pick = pull_choose(self.pending, free, now, self.pull_starve_s, self.router.matched,
                                priorities=self.priorities, idle_since=self.idle_since,
@@ -1263,13 +1460,15 @@ class ReplicaEngine:
                             if self.inflight[k] == 0:
                                 self.idle_since[k] = time.monotonic()
                             self._pull_pump_locked(time.monotonic())
+                            self.cv.notify_all()
                     else:
                         if held:
                             self.run_locks[k].release()
-                        with self.lock:
+                        with self.cv:
                             self.inflight[k] -= 1
                             if self.inflight[k] == 0:
                                 self.idle_since[k] = time.monotonic()
+                            self.cv.notify_all()
                         if nonfinite:                   # #879: the engine dropped every cached conversation
                             self.router.forget(k)
                             if self.__dict__.get("parent_parking") is not None:
