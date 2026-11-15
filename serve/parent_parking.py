@@ -1673,7 +1673,8 @@ class ParentParkingStore:
                              "peer_reads": stats.peer_reads if stats is not None else 0,
                              "fallbacks": stats.fallbacks if stats is not None else 0,
                              "ipc_errors": stats.ipc_errors if stats is not None else 0})
-        return {"enabled": True, "capacity_bytes": self._capacity, "charged_bytes": charged,
+        return {"enabled": True, "capacity_bytes": self._capacity, "max_entries": self._config.max_entries,
+                "charged_bytes": charged,
                 "entries": len(self._entries), "entry_bytes": self._entry_bytes,
                 "pending": len(self._pending), "pending_bytes": self._pending_bytes,
                 "leases": len(self._leases), "restore_reserved_bytes": self._restore_reserved,

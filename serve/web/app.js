@@ -367,7 +367,7 @@ function render(m) {
   modelButton(live);
   if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
-  if (tab === "monitor") renderConvCache(m.conversation_cache);
+  if (tab === "monitor") renderConvCache(m.conversation_cache, m.conversation_parent_parking);
   if (tab === "about") renderAbout(eng, hw, st);
 }
 
@@ -378,30 +378,61 @@ function since(t) {
   const s = Math.max(0, Date.now() / 1000 - t);
   return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
 }
-function renderConvCache(c) {
-  $("cc-card").hidden = !c;
-  if (!c) return;                                  // an older server
-  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
-  $("cc-bars").hidden = !c.enabled;
-  if (c.enabled) {
-    $("cc-slots-text").textContent = `${fmt(c.parked)} / ${fmt(c.slots)}`;
-    $("cc-slots-bar").style.width = pct(c.parked, c.slots);
-    const budget = c.budget_mib * 1048576;
-    $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
-    $("cc-mem-bar").style.width = pct(c.bytes, budget);
+function convCacheView(c, p) {
+  const parent = p && p.enabled ? p : null;
+  if (!c && !parent) return null;
+  const base = c || {};
+  const multi = !parent && Array.isArray(base.replicas) && base.replicas.length > 1 && base.total;
+  const enabled = Boolean(parent || base.enabled);
+  const cross = (n) => (n ? ` · ${fmt(n)} cross-replica` : "");
+  const evict = (n) => (n ? ` · ${fmt(n)} evicted` : "");
+  let slotsUsed, slotsCap, memUsed, memCap, parkedRestored = null, lastSwitch = null, note;
+  if (parent) {
+    slotsUsed = parent.entries;
+    slotsCap = parent.max_entries;
+    memUsed = parent.charged_bytes;
+    memCap = parent.capacity_bytes;
+    parkedRestored = `${fmt(parent.published)} / ${fmt(parent.reads)} · ${fmt(parent.peer_reads || 0)} cross-replica${evict(parent.evictions)}`;
+    note = "Shared RAM parking across all replicas: a follow-up routed to another replica restores the state without reading the prompt again; the oldest leaves when entries or memory fill up.";
+  } else {
+    const src = multi ? base.total : base;
+    const count = multi ? base.replicas.length : 1;
+    slotsUsed = src.parked;
+    slotsCap = base.slots != null ? base.slots * count : null;
+    memUsed = src.bytes;
+    memCap = base.budget_mib != null ? base.budget_mib * count * 1048576 : 0;
+    if (enabled) {
+      parkedRestored = `${fmt(src.parks)} / ${fmt(src.restores)}${cross(src.peer_reads)}${evict(src.evictions)}`;
+      lastSwitch = base.last_event ? `${base.last_event === "parked" ? "Parked" : "Restored"} ${fmt(base.last_tokens)} tokens, ${since(base.last_at)}` : null;
+    }
+    note = enabled
+      ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
+      : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
   }
-  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
-  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
-  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  return {base, enabled, slotsUsed, slotsCap, memUsed, memCap, parkedRestored, lastSwitch, note};
+}
+function renderConvCache(c, p) {
+  const v = convCacheView(c, p);
+  $("cc-card").hidden = !v;
+  if (!v) return;                                  // an older server
+  const pct = (a, b) => (b ? `${Math.min(100, (100 * a) / b)}%` : "0%");
+  $("cc-bars").hidden = !v.enabled;
+  if (v.enabled) {
+    $("cc-slots-text").textContent = v.slotsCap != null ? `${fmt(v.slotsUsed)} / ${fmt(v.slotsCap)}` : fmt(v.slotsUsed);
+    $("cc-slots-bar").style.width = pct(v.slotsUsed, v.slotsCap);
+    $("cc-mem-text").textContent = `${gb(v.memUsed)} / ${gb(v.memCap)} GB`;
+    $("cc-mem-bar").style.width = pct(v.memUsed, v.memCap);
+  }
+  const b = v.base;
+  $("cc-sum").textContent = b.requests ? `${fmt(b.requests_reused)} of ${fmt(b.requests)} requests reused part of their prompt` : "";
+  const share = b.prompt_tokens ? ` (${fmt((100 * b.reused_tokens) / b.prompt_tokens)}% of all prompt tokens)` : "";
   facts($("cc-facts"), [
-    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
-    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
-    ["Last switch", c.enabled ? event : null],
+    ["Last request", b.last_prompt != null ? `${fmt(b.last_reused || 0)} of ${fmt(b.last_prompt)} prompt tokens reused` : null],
+    ["Reused since start", b.requests ? `${fmt(b.reused_tokens)} tokens${share}` : null],
+    ["Parked / restored", v.parkedRestored],
+    ["Last switch", v.lastSwitch],
   ]);
-  $("cc-note").textContent = c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+  $("cc-note").textContent = v.note;
 }
 
 function renderTotals(t) {

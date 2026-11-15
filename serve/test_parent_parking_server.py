@@ -479,7 +479,8 @@ class ParentParkingMetrics(unittest.TestCase):
         svc = self.service(self.store)
         snapshot = self.store.snapshot()
         self.assertEqual(svc.metrics()["conversation_parent_parking"], snapshot)
-        self.assertEqual((snapshot["entries"], snapshot["published"], snapshot["budget_violations"]), (2, 2, 0))
+        self.assertEqual((snapshot["entries"], snapshot["max_entries"], snapshot["published"], snapshot["budget_violations"]),
+                         (2, 10, 2, 0))
         # the global figures are the store's own, and each replica's events stay in its own row
         self.assertEqual([row["replica"] for row in snapshot["replicas"]], [0, 1])
         self.assertEqual([row["published"] for row in snapshot["replicas"]], [1, 1])

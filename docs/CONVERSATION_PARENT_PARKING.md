@@ -130,7 +130,7 @@ The one start line says what was built:
 ## Metrics
 
 `/metrics` and `/v1/status` gain `conversation_parent_parking` (only when the mode is on): the store's counters
-(`capacity_bytes`, `charged_bytes`, `entries`, `entry_bytes`, `pending`, `leases`, `restore_reserved_bytes`,
+(`capacity_bytes`, `max_entries`, `charged_bytes`, `entries`, `entry_bytes`, `pending`, `leases`, `restore_reserved_bytes`,
 `retired_lease_bytes`, `published`, `deduplicated`, `reads`, `peer_reads`, `evictions`, `superseded`, `clears`,
 `damaged`, `capacity_refusals`, `budget_violations`, `store_epoch`, `longest_tokens`) and one row per replica
 (`state`, `published`, `reads`, `peer_reads`, `fallbacks`, `ipc_errors`). The global gauges are the store's own; they
