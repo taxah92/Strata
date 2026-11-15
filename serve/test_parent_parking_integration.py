@@ -42,7 +42,11 @@ class ParentParkingIntegration(unittest.TestCase):
         """Runs the C++ client with the store's end of the channel inherited, and returns its one output line."""
         proc = subprocess.run(probe_args(fd, owner, mode), pass_fds=(fd,), capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, f"the probe failed: {proc.stdout}{proc.stderr}")
-        return proc.stdout.strip()
+        lines = proc.stdout.strip().splitlines()
+        # the probe asks for the store's counters right after HELLO, exactly as the engine does, and says so on its
+        # own line; the answer the test parses is the last one
+        self.assertTrue(any(ln.startswith("STATS entries=") for ln in lines), proc.stdout)
+        return lines[-1]
 
     def test_one_replica_publishes_and_reads_its_own_snapshot(self):
         fd, channel = self.store.open_channel("r0")

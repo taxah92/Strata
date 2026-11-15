@@ -144,6 +144,15 @@ int main(int argc, char** argv) {
     std::string error;
     if (!client.connect(fd, identity, timeout_ms, error)) return fail("connect: " + error);
 
+    // the engine asks for the store's counters right after HELLO (its start line): the real store's answer must parse
+    {
+        ParentStats stats;
+        if (!client.stats(stats, error)) return fail("stats: " + error);
+        std::printf("STATS entries=%zu entry_bytes=%llu epoch=%llu longest=%lld\n", stats.entries,
+                    (unsigned long long) stats.entry_bytes, (unsigned long long) stats.store_epoch,
+                    (long long) stats.longest_tokens);
+        if (!client.ping(error)) return fail("ping: " + error);
+    }
     const SavedConversation original = sample();
     const auto sources = sources_of(original);
     auto meta = original;
