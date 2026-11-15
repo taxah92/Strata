@@ -32,11 +32,19 @@ the next start.  See shared_arena_plan.
 
 CPU cores.  On Linux the replicas get disjoint physical cores (serve/cpu_affinity.py, from PR #1436 by agorevski), so
 the host threads of the engines (the expert workers) do not compete.  "replica_cpus": false turns it off.
+
+Pull scheduler (opt-in).  The routing above gives a request a replica at once, even when every replica is busy: the
+request is pinned to a card before that card has a free slot, and the other cards may sit idle while it waits.  With
+"replica_pull": true (and no batch slots, which the MVP does not pull into) a request takes a free replica at once, or
+else waits in ONE queue shared by every replica.  When a slot frees, the waiting request that would re-read the least
+of its prompt goes into it (Router.matched); an older request goes first after "replica_starve_s".  Default off: the
+route() and the order of the old path stay as they were.
 """
 from __future__ import annotations
 
 import collections
 import copy
+import math
 import os
 import sys
 import threading
@@ -46,6 +54,9 @@ BLOCK = 64                          # tokens per hashed block of a prompt
 LOAD_TOKENS = 3000                  # the cost of one request already running on a replica, in prompt tokens
 INDEX_MAX = 262144                  # block hashes kept (about 17M tokens of prompts)
 HEAL_COOLDOWN_S = 60.0              # a replica that died is started again at most this often
+PULL_STARVE_S = 60.0                # after this long the oldest waiting request goes first, whatever its cache says
+PULL_POLL_S = 1.0                   # a waiting request checks its cancel, its deadline and the replicas this often
+PULL_BEAT_S = 5.0                   # ... and sends a None heartbeat this often (<= the server's QUEUE_BEAT_S = 10)
 
 
 class ReplicaConfigError(ValueError):
@@ -92,6 +103,111 @@ def _cards(g) -> list[int]:
         return [int(str(x).strip()) for x in items if str(x).strip() != ""]
     except ValueError:
         raise ReplicaConfigError(f"cards must be numbers, not {g!r}") from None
+
+
+PullSettings = collections.namedtuple("PullSettings", "enabled starve_s queue_timeout_s max_queue",
+                                      defaults=(None, None))
+
+
+class PullRequest:
+    """One request in the one shared pending queue.  Its fields change only under ReplicaEngine.cv."""
+    __slots__ = ("seq", "ids", "arrive", "cancel", "deadline", "replica", "matched")
+
+    def __init__(self):
+        self.seq = 0                    # the queue's own order: tie-break, and "the oldest" is the first one
+        self.ids = []                   # the prompt, as the request made it (the server does not change it)
+        self.arrive = 0.0               # time.monotonic() when it was put in the queue
+        self.cancel = None              # the request's own Event: a client that left sets it
+        self.deadline = None            # time.monotonic() after which waiting is over (queue_timeout), or None
+        self.replica = None             # the replica it was given; None while it still waits
+        self.matched = None             # Router.matched(ids) of the last selection round (the reason in the view)
+
+
+def pull_choose(pending, free, now: float, starve_s: float, matched_of):
+    """(the waiting request, the replica, was it the starvation rule) or None: the pull order as one pure function,
+    so it can be tested without threads.  `pending` is in arrival order, `free` the living replicas with
+    inflight[k] == 0.  Cost = the prompt tokens the replica would read again (len(ids) - Router.matched(ids)[k]) -
+    the first term of route()'s cost, as a free replica has no running request to pay LOAD_TOKENS for."""
+    if not free or not pending:
+        return None
+    oldest = next(iter(pending.values()))
+    if starve_s is not None and now - oldest.arrive >= starve_s:       # the oldest goes first, whatever its cache says
+        got = matched_of(oldest.ids)
+        oldest.matched = got
+        k = min(free, key=lambda k: (len(oldest.ids) - got[k], k))
+        return oldest, k, True
+    best = None
+    for e in pending.values():                  # arrival order; a smaller seq wins an equal cost
+        got = matched_of(e.ids)                 # the card's map is read AT THE CHOICE, not when the request arrived
+        e.matched = got
+        base = len(e.ids)
+        for k in free:
+            cand = (base - got[k], e.seq, k)    # re-read, then age, then the lower replica index
+            if best is None or cand < best[0]:
+                best = (cand, e, k)
+    if best is None:
+        return None
+    return best[1], best[2], False
+
+
+def _requested_slots(cfg: dict) -> int:
+    """How many batch slots the run config asks each engine for, as serve/server.py reads it ("parallel", --batch,
+    --slots; up to 1 means the engine takes one request at a time)."""
+    requested = cfg.get("parallel")
+    args = [str(a) for a in (cfg.get("args") or [])]
+    if isinstance(cfg.get("replicas"), list):
+        for e in cfg["replicas"]:
+            if isinstance(e, dict):
+                args += [str(a) for a in (e.get("args") or [])]
+    if requested is None:
+        for flag in ("--batch", "--slots"):
+            if flag in args and args.index(flag) + 1 < len(args):
+                try:
+                    requested = int(args[args.index(flag) + 1])
+                except ValueError:
+                    pass
+            for a in args:
+                if a.startswith(flag + "="):
+                    try:
+                        requested = int(a.split("=", 1)[1])
+                    except ValueError:
+                        pass
+    return requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
+
+
+def pull_config(cfg: dict) -> PullSettings:
+    """Opt-in pull scheduler: the run config's ("replica_pull", "replica_starve_s", "replica_queue_timeout_s",
+    "replica_max_queue") as a PullConfig, for serve/server.py's start_replicas:
+    ReplicaEngine(engines, load_tokens=..., pull=pc.enabled, starve_s=pc.starve_s,
+                  queue_timeout_s=pc.queue_timeout_s, max_queue=pc.max_queue).  Raises ReplicaConfigError on a bad
+    value, before any engine has been started.  queue_timeout_s and max_queue are the contract's optional
+    scheduler-level limits (None: the Service's own queue_timeout/max_queue admission is the only limit)."""
+    want = cfg.get("replica_pull", False)
+    if isinstance(want, bool) and not want:
+        return PullSettings(False, PULL_STARVE_S)
+    if not isinstance(want, bool):
+        raise ReplicaConfigError(f'"replica_pull" must be true or false, not {want!r}')
+    if not gpu_groups(cfg):
+        raise ReplicaConfigError('"replica_pull" needs "replicas": 2 or more data-parallel engines')
+    if cfg.get("split_serve"):
+        raise ReplicaConfigError('"replica_pull" is for "replicas"; split serving has its own hand-over')
+    if _requested_slots(cfg) > 1:
+        raise ReplicaConfigError('"replica_pull" does not support batch slots ("parallel"/--batch/--slots > 1): '
+                                 'run the replicas one request at a time')
+    starve = cfg.get("replica_starve_s", PULL_STARVE_S)
+    if isinstance(starve, bool) or not isinstance(starve, (int, float)) or not math.isfinite(starve) \
+            or not 0.0 <= starve <= 3600.0:
+        raise ReplicaConfigError(f'"replica_starve_s" must be seconds in 0..3600, not {starve!r}')
+    timeout = cfg.get("replica_queue_timeout_s")
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                or not math.isfinite(timeout) or not 0.0 < timeout <= 3600.0):
+        raise ReplicaConfigError('"replica_queue_timeout_s" must be seconds in 0..3600, '
+                                 f'not {timeout!r}')
+    max_queue = cfg.get("replica_max_queue")
+    if max_queue is not None and (isinstance(max_queue, bool) or not isinstance(max_queue, int)
+                                  or not 0 <= max_queue <= 4096):
+        raise ReplicaConfigError(f'"replica_max_queue" must be a whole number in 0..4096, not {max_queue!r}')
+    return PullSettings(True, float(starve), float(timeout) if timeout is not None else None, max_queue)
 
 
 ARENA_PREFIX = "strata-replicas-"
@@ -337,9 +453,35 @@ class ReplicaEngine:
     NOT_HERE = {"session_file", "vram", "ctl", "slot_cv"}       # not offered: one conversation file / VRAM resize / control line
     PROPAGATE = {"silence_s", "gpu_busy"}
 
-    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS):
+    def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS, *, pull: bool = False,
+                 starve_s: float = PULL_STARVE_S, poll_s: float = PULL_POLL_S, beat_s: float = PULL_BEAT_S,
+                 queue_timeout_s: float | None = None, max_queue: int | None = None):
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
+        if not isinstance(pull, bool):
+            raise ReplicaConfigError(f'"replica_pull" must be true or false, not {pull!r}')
+        if pull:                                    # the MVP pulls one request into one engine, never into a slot
+            slots = [int(getattr(e, "batch", 0) or 0) for e in engines]
+            if any(slots):
+                k = next(k for k, n in enumerate(slots) if n)
+                raise ReplicaConfigError(
+                    f'"replica_pull" does not support batch slots (replica {k} reports {slots[k]}): run the '
+                    'replicas one request at a time ("parallel": 1, no --batch/--slots)')
+            if isinstance(starve_s, bool) or not isinstance(starve_s, (int, float)) \
+                    or not math.isfinite(starve_s) or not 0.0 <= starve_s <= 3600.0:
+                raise ReplicaConfigError(f'"replica_starve_s" must be seconds in 0..3600, not {starve_s!r}')
+            for name, value in (("replica_pull_poll_s", poll_s), ("replica_pull_beat_s", beat_s)):
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or value <= 0:
+                    raise ReplicaConfigError(f'{name} must be a positive number of seconds, not {value!r}')
+            if queue_timeout_s is not None and (isinstance(queue_timeout_s, bool)
+                                                or not isinstance(queue_timeout_s, (int, float))
+                                                or not math.isfinite(queue_timeout_s) or queue_timeout_s <= 0):
+                raise ReplicaConfigError('"replica_queue_timeout_s" must be a positive number of seconds, '
+                                         f"not {queue_timeout_s!r}")
+            if max_queue is not None and (isinstance(max_queue, bool) or not isinstance(max_queue, int)
+                                          or not 0 <= max_queue <= 4096):
+                raise ReplicaConfigError(f'"replica_max_queue" must be a whole number in 0..4096, not {max_queue!r}')
         d = self.__dict__
         d["engines"] = list(engines)
         d["router"] = Router(len(engines))
@@ -347,6 +489,18 @@ class ReplicaEngine:
         d["inflight"] = [0] * len(engines)
         d["run_locks"] = [threading.Lock() for _ in engines]    # an engine without batch slots: one request at a time
         d["lock"] = threading.Lock()
+        d["cv"] = threading.Condition(d["lock"])    # the scheduler's condition: the same lock, so inflight and the
+        d["pull_enabled"] = pull                    # pending queue always agree (route()/finally use self.lock too)
+        d["pull_starve_s"] = float(starve_s)
+        d["pull_poll_s"] = float(poll_s)
+        d["pull_beat_s"] = float(beat_s)
+        d["queue_timeout_s"] = float(queue_timeout_s) if queue_timeout_s is not None else None
+        d["max_queue"] = max_queue
+        d["pull_seq"] = 0
+        d["pending"] = collections.OrderedDict()    # seq -> PullRequest, order = arrival: the oldest is the first
+        d["pull_stats"] = {"submitted": 0, "assigned": 0, "starved": 0, "cancelled": 0, "closed": 0,
+                           "timeouts": 0, "no_replica": 0, "rejected": 0}
+        d["last_pick"] = None                   # {"replica", "reason", "at"} of the last assignment (for /metrics)
         d["tl"] = threading.local()
         d["healing"] = {}
         d["heal_at"] = [0.0] * len(engines)
@@ -434,6 +588,8 @@ class ReplicaEngine:
 
     @property
     def progress(self):
+        if getattr(self.tl, "pending", False):         # a request still waiting for a replica shows no other's progress
+            return None
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.progress
@@ -441,6 +597,8 @@ class ReplicaEngine:
 
     @property
     def prefill_tok_s_mean(self):
+        if getattr(self.tl, "pending", False):
+            return None
         c = getattr(self.tl, "cur", None)
         if c is not None:
             return c.prefill_tok_s_mean
@@ -467,9 +625,34 @@ class ReplicaEngine:
         return out
 
     def replica_view(self) -> list[dict]:
-        """For /metrics: each replica's state, requests running, and requests routed to it so far."""
-        return [{"replica": k, "alive": e.alive(), "running": self.inflight[k], "routed": self.routed[k],
+        """For /metrics: each replica's state, requests running, and requests routed to it so far.  With the pull
+        scheduler on, each row also carries the one shared queue (depth, the oldest request's age, the replica and the
+        reason of the last assignment): the server's /metrics needs no new field to show it."""
+        rows = [{"replica": k, "alive": e.alive(), "running": self.inflight[k], "routed": self.routed[k],
                  "batch": int(getattr(e, "batch", 0) or 0)} for k, e in enumerate(self.engines)]
+        if self.pull_enabled:
+            queue = self.pull_view()
+            for row in rows:
+                row["queue"] = {"depth": queue["pending"], "oldest_s": queue["oldest_pending_s"],
+                                "picked": queue["picked"], "reason": queue["reason"],
+                                "max": queue["max_queue"], "timeout_s": queue["queue_timeout_s"]}
+        return rows
+
+    def pull_view(self) -> dict:
+        """The one pending queue for /metrics (it is global: the queue is shared by every replica, so nothing here is
+        read from a single engine's log).  oldest_pending_s is None when nothing waits (null, not 0)."""
+        now = time.monotonic()
+        with self.cv:
+            oldest = next(iter(self.pending.values()), None)
+            stats = dict(self.pull_stats)
+            depth = len(self.pending)
+            pick = self.last_pick
+        return {"enabled": self.pull_enabled, "pending": depth,
+                "oldest_pending_s": round(now - oldest.arrive, 3) if oldest is not None else None,
+                "starve_s": self.pull_starve_s, "poll_s": self.pull_poll_s, "beat_s": self.pull_beat_s,
+                "queue_timeout_s": self.queue_timeout_s, "max_queue": self.max_queue,
+                "picked": pick["replica"] if pick else None, "reason": pick["reason"] if pick else None,
+                **stats}
 
     # ---- life cycle
     def restart(self, tries: int = 3):
@@ -549,12 +732,133 @@ class ReplicaEngine:
                     self.healing[k] = False
             threading.Thread(target=run, daemon=True).start()
 
+    # ---- pull scheduler (opt-in: "replica_pull": true; see pull_config and the module doc)
+    def _pull_wait(self, ids, cancel):
+        """The replica for this prompt under the pull scheduler, or None heartbeats while the request waits - a
+        generator, so the heartbeat goes out on the request's own turn and the server's keep-alive is unchanged.
+        A free replica takes it at once (the pump); otherwise it waits in the one shared queue, and every slot that
+        frees is given to the waiting request that would re-read the least of its prompt (or to the oldest one, after
+        replica_starve_s).  Returns the replica index, or -1 when the client left (its queue entry removed).  The
+        assignment and inflight + 1 are one step under self.cv; generation happens outside it."""
+        from serve.server import EngineDied, QueueWaitExpired
+        now = time.monotonic()
+        entry = PullRequest()
+        with self.cv:
+            self.pull_seq += 1
+            entry.seq, entry.ids, entry.arrive = self.pull_seq, ids, now
+            entry.cancel = cancel
+            entry.deadline = getattr(cancel, "_strata_queue_deadline", None) if cancel is not None else None
+            if self.queue_timeout_s is not None:
+                own = now + self.queue_timeout_s
+                entry.deadline = own if entry.deadline is None else min(entry.deadline, own)
+            self.pending[entry.seq] = entry
+            self.pull_stats["submitted"] += 1
+            self.tl.pending = True
+            self._pull_pump_locked(now)             # a free replica takes the request at once
+            if entry.replica is None and self.max_queue is not None and len(self.pending) > self.max_queue:
+                self._pull_drop_locked(entry, "rejected")       # (a free card still serves: this caps waiting only)
+                self.tl.pending = False
+                raise QueueWaitExpired(f"the replica queue is full (replica_max_queue={self.max_queue}); retry later")
+            self.cv.notify_all()
+        heal = self._pull_some_dead()
+        beat = time.monotonic()
+        taken = False
+        try:
+            while True:
+                with self.cv:
+                    if entry.replica is not None:   # assigned: this request owns a slot from here
+                        k = entry.replica
+                        break
+                    now = time.monotonic()
+                    if cancel is not None and cancel.is_set():
+                        self._pull_drop_locked(entry, "cancelled")
+                        return -1
+                    if entry.deadline is not None and now >= entry.deadline:
+                        self._pull_drop_locked(entry, "timeouts")
+                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                    if not any(e.alive() for e in self.engines) and not self._pull_starting():
+                        # nothing is alive and nothing is being started: there is nothing to wait for
+                        self._pull_drop_locked(entry, "no_replica")
+                        raise EngineDied("no replica is running; this request was not sent")
+                    self._pull_pump_locked(now)     # a healed replica, or a request that has waited long enough
+                    if entry.replica is not None:
+                        k = entry.replica
+                        break
+                    left = None if entry.deadline is None else max(0.0, entry.deadline - now)
+                    self.cv.wait(timeout=min(self.pull_poll_s, left) if left is not None else self.pull_poll_s)
+                if heal:                            # outside the lock: heal() itself decides, and never blocks
+                    self.heal()
+                    heal = self._pull_some_dead()
+                if time.monotonic() - beat >= self.pull_beat_s:
+                    beat = time.monotonic()
+                    yield None                      # the None the server turns into a keep-alive
+            taken = True
+            return k
+        finally:
+            with self.cv:
+                if not taken:
+                    if entry.replica is not None:   # a slot was given but this waiter leaves before using it
+                        self.inflight[entry.replica] -= 1
+                        self.pull_stats["closed"] += 1
+                        entry.replica = None
+                        self._pull_pump_locked(time.monotonic())
+                    else:
+                        self._pull_drop_locked(entry, "closed")
+                self.cv.notify_all()
+            self.tl.pending = False
+
+    def _pull_pump_locked(self, now: float) -> None:
+        """Give a free replica to a waiting request, as many times as it can, under self.cv.  Called when a request
+        joins the queue, when a slot frees, and on every poll tick of every waiter (so a healed replica is used
+        without a new request)."""
+        if not self.pending:
+            return
+        free = [k for k, e in enumerate(self.engines) if e.alive() and not self.inflight[k]]
+        while free:
+            pick = pull_choose(self.pending, free, now, self.pull_starve_s, self.router.matched)
+            if pick is None:
+                break
+            entry, k, starved = pick
+            self.pending.pop(entry.seq, None)       # the assignment and inflight + 1 are one step under self.cv
+            entry.replica = k
+            self.inflight[k] += 1
+            self.routed[k] += 1
+            self.pull_stats["assigned"] += 1
+            if starved:
+                self.pull_stats["starved"] += 1
+            self.last_pick = {"replica": k,
+                              "reason": "starved" if starved else
+                                        ("reuse" if entry.matched and entry.matched[k] else "min-reread"),
+                              "at": time.monotonic()}
+            free.remove(k)
+        self.cv.notify_all()
+
+    def _pull_drop_locked(self, entry: PullRequest, reason: str) -> None:
+        """Take this request out of the queue, if it is still in it; idempotent, so a request that was already
+        assigned is never dropped twice.  Called under self.cv."""
+        if self.pending.pop(entry.seq, None) is not None:
+            self.pull_stats[reason] += 1
+
+    def _pull_starting(self) -> bool:
+        """Some replica is being started again (heal/restart): "every replica is dead" then means wait, not fail."""
+        return any(getattr(e, "starting", False) for e in self.engines) or any(self.healing.values())
+
+    def _pull_some_dead(self) -> bool:
+        """A replica that died could be started again: the wait loop calls heal() outside the lock."""
+        return any(not e.alive() and not getattr(e, "unloaded", False) and not getattr(e, "starting", False)
+                   for e in self.engines)
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         # imported here: serve.server imports this module
         from serve.server import EngineDied, EngineNonFinite
-        k = self.route(ids)
-        if k < 0:
-            raise EngineDied("no replica is running; this request was not sent")
+        if self.pull_enabled:                                # opt-in: wait in the shared queue for a free replica
+            k = yield from self._pull_wait(ids, cancel)
+            if k < 0:                                        # the client left before a replica was free: nothing to do
+                return
+        else:                                                # the old order: a replica at once, then run_locks
+            k = self.route(ids)
+            if k < 0:
+                raise EngineDied("no replica is running; this request was not sent")
         e = self.engines[k]
         self.tl.cur = e
         _ = self.last                                         # the caller's figures exist before this request (#2892)
@@ -567,6 +871,14 @@ class ReplicaEngine:
             selected = getattr(cancel, "_strata_replica_selected", None)
             if selected is not None:
                 selected(k)
+            if self.pull_enabled:                            # the queue is over: the terminal row becomes "reading"
+                if cancel is not None:
+                    setattr(cancel, "_strata_replica", k)
+                started = getattr(cancel, "_strata_queue_started", None)
+                if started is not None:
+                    started()
+                if getattr(cancel, "_strata_queue_deadline", None) is not None:
+                    cancel._strata_queue_deadline = None
             self.router.note(k, ids)
             if not int(getattr(e, "batch", 0) or 0):          # no slots: this replica takes one request at a time
                 lock = self.run_locks[k]
@@ -606,14 +918,27 @@ class ReplicaEngine:
                     if gen is not None and e.last is not native_before:
                         self.tl.last = dict(e.last)
                 finally:
-                    if held:
-                        self.run_locks[k].release()
-                    with self.lock:
-                        self.inflight[k] -= 1
-                    if nonfinite:                       # #879: the engine dropped every cached conversation
-                        self.router.forget(k)
-                    elif produced:
-                        self.router.note(k, list(ids) + produced)
+                    if self.pull_enabled:
+                        # the card's map is updated BEFORE the slot is handed on: the next assignment (the pump
+                        # below) must see the fresh map, and the freed control line before it can run (design §5.5)
+                        if nonfinite:                   # #879: the engine dropped every cached conversation
+                            self.router.forget(k)
+                        elif produced:
+                            self.router.note(k, list(ids) + produced)
+                        if held:
+                            self.run_locks[k].release()
+                        with self.cv:
+                            self.inflight[k] -= 1
+                            self._pull_pump_locked(time.monotonic())
+                    else:
+                        if held:
+                            self.run_locks[k].release()
+                        with self.lock:
+                            self.inflight[k] -= 1
+                        if nonfinite:                   # #879: the engine dropped every cached conversation
+                            self.router.forget(k)
+                        elif produced:
+                            self.router.note(k, list(ids) + produced)
 
     def quarantine(self, k: int) -> None:
         """A replica whose pipe could not be drained is out of the routing until it has been started again: its process

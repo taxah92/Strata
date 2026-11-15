@@ -1,5 +1,6 @@
 """Data-parallel replicas (serve/replicas.py): the config, the router, and the real Service over HTTP with two fake
 engines (the fake of test_parallel.py) behind a ReplicaEngine."""
+import collections
 import json
 import sys
 import tempfile
@@ -11,9 +12,10 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.replicas import (BLOCK, ReplicaConfigError, ReplicaEngine, Router, cpu_sets, gpu_groups, remove_arena,
-                            replica_cfg, shared_arena_plan, sweep_stale_arenas)
-from serve.server import ByteTokenizer, Service, StrataEngine, serve
+from serve.replicas import (BLOCK, PullRequest, ReplicaConfigError, ReplicaEngine, Router, cpu_sets, gpu_groups,
+                            pull_choose, pull_config, remove_arena, replica_cfg, shared_arena_plan,
+                            sweep_stale_arenas)
+from serve.server import (ByteTokenizer, EngineDied, QueueWaitExpired, Service, StrataEngine, serve)
 from serve.test_parallel import FAKE_BATCH
 
 
@@ -158,8 +160,692 @@ class RouteChoice(unittest.TestCase):
         self.assertEqual(selected, [1])
 
 
+class GateEngine:
+    """A replica without batch slots for the pull scheduler tests: the tokens it yields, the requests it served,
+    whether it is alive and the figures its last request left - enough to see which replica took which request, with
+    no engine and no GPU."""
+
+    def __init__(self, name: str = "r", out=(7,)):
+        self.name, self.batch, self.up = name, 0, True
+        self.max_context, self.info, self.log_path = 4096, {}, None
+        self.last = {}
+        self.out = list(out)
+        self.calls = []
+        self.restarts = 0
+
+    def alive(self):
+        return self.up
+
+    def restart(self, tries: int = 3):
+        self.restarts += 1
+        self.up = True
+
+    def death_note(self):
+        return "the test replica ended"
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.calls.append(list(ids))
+        self.last = {"replica": self.name, "generated": len(self.calls)}
+        for t in self.out:
+            yield t
+
+
+class PullChoice(unittest.TestCase):
+    """The opt-in pull scheduler (replica_pull): a free replica takes a request at once, otherwise the request waits in
+    the one shared queue; the least re-read takes a free slot, the oldest one after replica_starve_s; and every way a
+    waiting request can leave (cancel, disconnect, queue_timeout, max_queue, death) is known to the queue."""
+
+    def engine(self, **kw):
+        kw.setdefault("poll_s", 0.01)               # (the tests do not wait the real 1 s / 5 s of the defaults)
+        kw.setdefault("beat_s", 0.02)
+        self.engines = [GateEngine("r0"), GateEngine("r1")]
+        return ReplicaEngine(self.engines, pull=True, **kw)
+
+    @staticmethod
+    def request(engine, ids, seen=None):
+        cancel = threading.Event()
+        if seen is not None:
+            cancel._strata_replica_selected = seen.append
+        return engine.generate(list(ids), 16, {}, cancel), cancel
+
+    def hold(self, engine, ids):
+        """A request running on a replica: it holds that replica's slot until the test closes it."""
+        g, _ = self.request(engine, ids)
+        self.assertEqual(next(g), 7)
+        return g
+
+    def token(self, g, limit=200):
+        """Advance a request to its token through the None heartbeats it sends while it waits."""
+        for _ in range(limit):
+            t = next(g)
+            if t is not None:
+                return t
+        self.fail("the request never got a token")
+
+    def test_a_free_replica_takes_a_new_request_without_waiting(self):
+        e = self.engine()
+        seen = []
+        g0, _ = self.request(e, [1] * 40, seen)
+        self.assertEqual(next(g0), 7)              # no None: it never waited in the queue
+        self.assertEqual(dict(e.pending), {})
+        self.assertEqual(e.routed[0], 1)           # the tie of two idle cards goes to the lower index
+        g1, _ = self.request(e, [2] * 40, seen)
+        self.assertEqual(next(g1), 7)
+        self.assertEqual(seen, [0, 1])             # the idle cards are used in turn
+        self.assertEqual(e.inflight, [1, 1])
+        g0.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_a_waiting_request_is_not_pinned_to_the_busy_replica(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)                # holds replica 0
+        g1 = self.hold(e, [2] * 40)                # holds replica 1
+        ids = [3] * (BLOCK * 2)
+        e.router.note(0, ids)                      # replica 0 holds its prefix: pinning would wait for card 0
+        seen = []
+        waiting, _ = self.request(e, ids, seen)
+        self.assertIsNone(next(waiting))           # both cards are busy: the request waits, a heartbeat goes out
+        self.assertEqual(len(e.pending), 1)
+        self.assertEqual(e.inflight, [1, 1])
+        g1.close()                                 # card 1 frees first
+        self.assertEqual(self.token(waiting), 7)
+        self.assertEqual(seen, [1])                # it took the idle card, not its conversation's busy one
+        g0.close()
+        waiting.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_the_request_that_reads_least_again_goes_to_the_freed_replica(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        reuse = [7] * (BLOCK * 4)
+        plain = [8] * (BLOCK * 4)
+        g_plain, _ = self.request(e, plain)
+        self.assertIsNone(next(g_plain))           # arrives first, reads everything on card 0
+        g_reuse, _ = self.request(e, reuse)
+        self.assertIsNone(next(g_reuse))
+        self.assertEqual(len(e.pending), 2)
+        e.router.note(0, reuse)                     # the map changes WHILE both wait: the choice must see it
+
+        g0.close()                                 # card 0 frees: the request the card knows takes it
+        self.assertEqual(self.token(g_reuse), 7)
+        self.assertIsNone(next(g_plain))           # the older one waits: its prompt is not on that card
+        self.assertEqual(e.pull_stats["assigned"], 3)
+        self.assertEqual(e.replica_view()[0]["queue"]["reason"], "reuse")
+        g1.close()
+        self.assertEqual(self.token(g_plain), 7)
+        g_plain.close()
+        g_reuse.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_equal_cost_goes_to_the_earlier_request(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        seen = []
+        g_old, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertIsNone(next(g_old))
+        g_new, _ = self.request(e, [4] * (BLOCK * 2))
+        self.assertIsNone(next(g_new))
+        g0.close()
+        self.assertEqual(self.token(g_old), 7)     # equal re-reads: the earlier one goes first
+        self.assertEqual(seen, [0])
+        self.assertIsNone(next(g_new))
+        g1.close()
+        self.assertEqual(self.token(g_new), 7)
+        g_old.close()
+        g_new.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_the_oldest_request_goes_first_after_the_starve_threshold(self):
+        e = self.engine(starve_s=0.05)
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        seen = []
+        g_old, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertIsNone(next(g_old))             # no cache anywhere
+        later = [7] * (BLOCK * 2)
+        e.router.note(0, later)                    # the later one would read none of its prompt again on card 0
+        g_new, _ = self.request(e, later)
+        self.assertIsNone(next(g_new))
+        time.sleep(0.06)
+        g0.close()                                 # affinity says `later`, starvation says the oldest
+        self.assertEqual(self.token(g_old), 7)
+        self.assertEqual(seen, [0])
+        self.assertEqual(e.replica_view()[0]["queue"]["reason"], "starved")
+        self.assertEqual(e.pull_stats["starved"], 1)
+        g1.close()
+        self.assertEqual(self.token(g_new), 7)
+        g_old.close()
+        g_new.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_two_frees_assign_two_requests_and_never_one_slot_twice(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        seen = []
+        ga, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertIsNone(next(ga))
+        gb, _ = self.request(e, [4] * (BLOCK * 2), seen)
+        self.assertIsNone(next(gb))
+        barrier = threading.Barrier(2)
+
+        def free(g):
+            barrier.wait()
+            g.close()
+        threads = [threading.Thread(target=free, args=(g,)) for g in (g0, g1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(dict(e.pending), {})      # both waiters were given a card, one each
+        self.assertEqual(e.inflight, [1, 1])
+        self.assertEqual(e.pull_stats["assigned"], 4)
+        self.assertEqual(self.token(ga), 7)
+        self.assertEqual(self.token(gb), 7)
+        self.assertEqual(set(seen), {0, 1})
+        self.assertEqual(sorted(len(eng.calls) for eng in self.engines), [2, 2])   # nothing was served twice
+        ga.close()
+        gb.close()
+        self.assertEqual((e.inflight, e.routed), ([0, 0], [2, 2]))
+
+    def test_a_slot_is_released_when_the_request_ends_or_is_closed(self):
+        e = self.engine()
+        g = self.hold(e, [1] * 40)                 # replica 0
+        self.assertEqual(e.inflight, [1, 0])
+        g.close()                                  # closed in the middle of its generation
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+        seen = []
+        again, _ = self.request(e, [2] * 40, seen)
+        self.assertEqual(next(again), 7)           # the freed card takes the next request at once
+        self.assertEqual(seen, [0])
+        again.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_a_slot_given_to_a_client_that_left_is_given_back(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        waiting, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(waiting))           # suspended at its heartbeat, still in the queue
+        g0.close()                                 # the pump gives the waiting request replica 0 ...
+        self.assertEqual((e.inflight, dict(e.pending)), ([1, 1], {}))
+        waiting.close()                            # ... but the client left before using it: the slot comes back
+        self.assertEqual((e.inflight, e.pull_stats["closed"]), ([0, 1], 1))
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_generation_happens_outside_the_scheduler_lock_and_inside_run_locks(self):
+        e = self.engine()
+        g = self.hold(e, [1] * 40)                 # replica 0 is running this request
+        self.assertTrue(e.run_locks[0].locked())   # the control line is protected, as before (run_locks[k] stays)
+        self.assertTrue(e.lock.acquire(timeout=1.0))   # but the scheduler lock is free while it generates
+        e.lock.release()
+        g.close()
+        self.assertFalse(e.run_locks[0].locked())
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_a_dead_replica_is_never_chosen(self):
+        e = self.engine()
+        e.heal = lambda: None                      # (this test: the dead card stays dead)
+        g0 = self.hold(e, [1] * 40)                # card 0 is busy, card 1 is dead
+        self.engines[1].up = False
+        seen = []
+        waiting, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertIsNone(next(waiting))
+        self.assertEqual(len(e.pending), 1)
+        g0.close()                                 # the living card frees; the dead one is not offered the request
+        self.assertEqual(self.token(waiting), 7)
+        self.assertEqual(seen, [0])
+        self.assertEqual(self.engines[1].calls, [])
+        waiting.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_all_replicas_dead_end_the_pending_request(self):
+        e = self.engine()
+        e.heal = lambda: None
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        waiting, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(waiting))
+        self.engines[0].up = False
+        self.engines[1].up = False
+        with self.assertRaises(EngineDied):
+            next(waiting)
+        self.assertEqual((dict(e.pending), e.pull_stats["no_replica"]), ({}, 1))   # no eternal pending request
+        g0.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_a_healed_replica_picks_up_a_waiting_request(self):
+        e = self.engine()
+        e.heal = lambda: None                      # (the heal is imitated: the card comes back by itself)
+        g0 = self.hold(e, [1] * 40)
+        self.engines[1].up = False
+        seen = []
+        waiting, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertIsNone(next(waiting))
+        self.engines[1].up = True
+        self.assertEqual(self.token(waiting), 7)   # the poll tick sees the living card and gives it the request
+        self.assertEqual(seen, [1])
+        self.assertEqual((dict(e.pending), e.inflight), ({}, [1, 1]))
+        waiting.close()
+        g0.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_heal_starting_a_replica_picks_up_the_waiting_request(self):
+        e = self.engine()                          # real heal(): GateEngine.restart() brings the card back
+        g0 = self.hold(e, [1] * 40)                # card 0 serves and stays busy
+        self.engines[1].up = False                 # card 1 is down
+        self.engines[0].calls, self.engines[1].calls = [], []
+        seen = []
+        waiting, _ = self.request(e, [3] * (BLOCK * 2), seen)
+        self.assertEqual(self.token(waiting), 7)   # the wait loop called heal(), card 1 came back and took it
+        self.assertEqual(seen, [1])
+        self.assertTrue(self.engines[1].alive())
+        self.assertEqual(self.engines[1].restarts, 1)
+        self.assertEqual(dict(e.pending), {})
+        waiting.close()
+        g0.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_a_replica_that_does_not_come_back_ends_the_pending_request(self):
+        e = self.engine()
+        e.engines[0].restart = mock.Mock(side_effect=RuntimeError("this replica will not start"))
+        e.engines[0].up = False
+        g1 = self.hold(e, [2] * 40)                # only card 1 is alive, so it serves
+        waiting, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(waiting))
+        e.engines[1].up = False                    # now every replica is dead and one heal attempt fails
+        with self.assertRaises(EngineDied):
+            for _ in range(300):
+                next(waiting)
+        self.assertEqual((dict(e.pending), e.pull_stats["no_replica"]), ({}, 1))
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_cancel_removes_only_its_own_pending_request(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        ids_a, ids_b = [3] * (BLOCK * 2), [4] * (BLOCK * 2)
+        ga, cancel_a = self.request(e, ids_a)
+        self.assertIsNone(next(ga))
+        seen = []
+        gb, cancel_b = self.request(e, ids_b, seen)
+        self.assertIsNone(next(gb))
+        self.assertEqual(len(e.pending), 2)
+        cancel_a.set()
+        self.assertEqual(list(ga), [])             # a client that left before assignment: nothing generated
+        self.assertEqual([p.ids for p in e.pending.values()], [ids_b])   # its own entry only
+        self.assertEqual((e.inflight, e.pull_stats["cancelled"]), ([1, 1], 1))   # no slot leaked, none taken
+        g0.close()
+        self.assertEqual(self.token(gb), 7)        # the other one still gets its card
+        self.assertEqual(seen, [0])
+        self.assertEqual(e.engines[0].calls[-1], ids_b)
+        g1.close()
+        gb.close()
+        self.assertEqual((e.inflight, e.pending), ([0, 0], {}))
+
+    def test_a_client_that_leaves_removes_its_waiting_request(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        ids = [3] * (BLOCK * 2)
+        waiting, _ = self.request(e, ids)
+        self.assertIsNone(next(waiting))
+        self.assertEqual(len(e.pending), 1)
+        waiting.close()                            # GeneratorExit: the server closes a request of a client that left
+        self.assertEqual(dict(e.pending), {})
+        self.assertEqual((e.inflight, e.pull_stats["closed"]), ([1, 1], 1))   # its own entry only, no slot leaked
+        self.assertNotIn(ids, self.engines[0].calls + self.engines[1].calls)
+        g0.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_queue_deadline_while_pending_raises_queue_wait_expired(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        ga, cancel_a = self.request(e, [3] * (BLOCK * 2))
+        cancel_a._strata_queue_deadline = time.monotonic() + 0.1
+        self.assertIsNone(next(ga))
+        gb, _ = self.request(e, [4] * (BLOCK * 2))
+        self.assertIsNone(next(gb))
+        with self.assertRaises(QueueWaitExpired):
+            self.token(ga)
+        self.assertEqual([p.ids for p in e.pending.values()], [[4] * (BLOCK * 2)])   # only its own entry went
+        self.assertEqual((e.inflight, e.pull_stats["timeouts"]), ([1, 1], 1))
+        g0.close()
+        g1.close()
+        gb.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_queue_timeout_from_the_config_removes_the_own_pending(self):
+        e = self.engine(queue_timeout_s=0.05)
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        ga, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(ga))
+        with self.assertRaises(QueueWaitExpired):
+            self.token(ga)
+        self.assertEqual((dict(e.pending), e.inflight, e.pull_stats["timeouts"]), ({}, [1, 1], 1))
+        g0.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_max_queue_is_a_cap_and_a_full_queue_is_rejected(self):
+        e = self.engine(max_queue=1)
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        ga, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(ga))                # the one place of the queue
+        self.assertEqual(len(e.pending), 1)
+        gb, _ = self.request(e, [4] * (BLOCK * 2))
+        with self.assertRaises(QueueWaitExpired) as caught:
+            next(gb)
+        self.assertIn("replica_max_queue=1", str(caught.exception))
+        self.assertEqual((e.pull_stats["rejected"], len(e.pending), e.inflight), (1, 1, [1, 1]))
+        g0.close()
+        self.assertEqual(self.token(ga), 7)        # the queued one still gets its card
+        g1.close()
+        ga.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_max_queue_zero_means_no_waiting_but_a_free_card_still_serves(self):
+        e = self.engine(max_queue=0)
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        gb, _ = self.request(e, [4] * (BLOCK * 2))
+        with self.assertRaises(QueueWaitExpired):
+            next(gb)                               # no waiting allowed
+        self.assertEqual((dict(e.pending), e.inflight), ({}, [1, 1]))
+        g1.close()
+        g = self.hold(e, [4] * (BLOCK * 2))        # a free card takes a request as before, without the queue
+        self.assertEqual(dict(e.pending), {})
+        g.close()
+        g0.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_heartbeats_are_yielded_while_pending(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        waiting, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(waiting))           # the keep-alive the server turns into a "ping"
+        self.assertIsNone(next(waiting))           # and it keeps coming while the request waits
+        self.assertEqual(len(e.pending), 1)
+        g0.close()
+        self.assertEqual(self.token(waiting), 7)
+        waiting.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_last_produced_and_router_note_belong_to_the_assigned_replica(self):
+        e = self.engine()
+        a = [1] * (BLOCK * 2 - 1)                  # with the produced token it is exactly two blocks
+        seen = []
+        g, _ = self.request(e, a, seen)
+        self.assertEqual(next(g), 7)
+        g.close()
+        self.assertEqual(seen, [0])
+        self.assertEqual(e.last["replica"], "r0")  # this thread's figures are the replica that served it
+        self.assertEqual(e.router.matched(a + [7]), [BLOCK * 2, 0])   # note(ids + produced), on replica 0 only
+        hold = self.hold(e, [9] * 40)              # keeps replica 0 busy, so the next request must take replica 1
+        b = [2] * BLOCK
+        seen = []
+        g, _ = self.request(e, b, seen)
+        self.assertEqual(next(g), 7)
+        g.close()
+        self.assertEqual(seen, [1])
+        self.assertEqual(e.last["replica"], "r1")  # this thread's figures followed the request to its replica
+        self.assertEqual(e.router.matched(b + [7]), [0, BLOCK])
+        hold.close()
+        self.assertEqual(e.router.matched(a + [7]), [BLOCK * 2, 0])   # the first request's note stayed on its card
+        self.assertEqual((e.routed, e.inflight), ([2, 1], [0, 0]))
+
+    def test_the_selected_replica_is_reported_at_assignment(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        seen = []
+        waiting, cancel = self.request(e, [3] * (BLOCK * 2), seen)
+        cancel._strata_queue_deadline = time.monotonic() + 60
+        self.assertIsNone(next(waiting))
+        self.assertEqual(seen, [])                 # nothing is reported while it waits
+        self.assertIsNone(getattr(cancel, "_strata_replica", None))
+        g1.close()
+        self.assertEqual(self.token(waiting), 7)
+        self.assertEqual(seen, [1])
+        self.assertEqual(cancel._strata_replica, 1)
+        self.assertIsNone(cancel._strata_queue_deadline)   # the queue is over: the deadline is cleared
+        waiting.close()
+        g0.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_pull_view_is_global_and_replica_view_per_replica(self):
+        e = self.engine()
+        g0 = self.hold(e, [1] * 40)
+        g1 = self.hold(e, [2] * 40)
+        waiting, _ = self.request(e, [3] * (BLOCK * 2))
+        self.assertIsNone(next(waiting))
+        q = e.pull_view()
+        self.assertEqual((q["enabled"], q["pending"]), (True, 1))
+        self.assertIsNotNone(q["oldest_pending_s"])
+        self.assertGreater(q["oldest_pending_s"], 0.0)
+        rows = e.replica_view()
+        self.assertEqual([r["replica"] for r in rows], [0, 1])
+        self.assertEqual([r["running"] for r in rows], [1, 1])
+        self.assertEqual([r["routed"] for r in rows], [1, 1])
+        self.assertEqual(rows[0]["queue"]["depth"], 1)          # (contract §7: the queue is visible in the view)
+        self.assertEqual(rows[1]["queue"], rows[0]["queue"])
+        g0.close()
+        self.assertEqual(self.token(waiting), 7)
+        self.assertEqual(e.pull_stats["assigned"], 3)
+        waiting.close()
+        g1.close()
+        self.assertEqual(e.inflight, [0, 0])
+
+    def test_pull_choose_is_the_order_without_threads(self):
+        def matched(ids):
+            return ([BLOCK * 2, 0] if ids[0] == 1 else [0, BLOCK])
+        a, b = PullRequest(), PullRequest()
+        a.seq, a.ids, a.arrive = 1, [2] * (BLOCK * 2), 100.0
+        b.seq, b.ids, b.arrive = 2, [1] * (BLOCK * 2), 101.0
+        pending = collections.OrderedDict((p.seq, p) for p in (a, b))
+        self.assertEqual(pull_choose(pending, [], 102.0, 60.0, matched), None)          # nothing free
+        self.assertEqual(pull_choose(collections.OrderedDict(), [0], 102.0, 60.0, matched), None)
+        got = pull_choose(pending, [0], 102.0, 60.0, matched)                          # b reads none of it again
+        self.assertEqual((got[0].seq, got[1], got[2]), (2, 0, False))
+        got = pull_choose(pending, [0], 160.5, 60.0, matched)                          # a is now the oldest
+        self.assertEqual((got[0].seq, got[1], got[2]), (1, 0, True))
+        got = pull_choose(pending, [0, 1], 102.0, 60.0, matched)                       # free cards, one request
+        self.assertEqual((got[0].seq, got[1], got[2]), (2, 0, False))
+        got = pull_choose(pending, [0], 102.0, 0.0, matched)                           # starve_s = 0: the oldest.
+        self.assertEqual((got[0].seq, got[1], got[2]), (1, 0, True))
+        self.assertEqual((a.matched, b.matched), ([0, BLOCK], [BLOCK * 2, 0]))         # the last round is kept
+
+    def test_batch_slots_are_refused_at_start(self):
+        with self.assertRaises(ReplicaConfigError) as caught:
+            ReplicaEngine([FakeEngine(4), FakeEngine(4)], pull=True)
+        self.assertIn("replica_pull", str(caught.exception))
+        self.assertIn("batch", str(caught.exception))
+        self.assertTrue(ReplicaEngine([FakeEngine(0), FakeEngine(0)], pull=True).pull_enabled)
+
+    def test_the_default_engine_keeps_the_old_path(self):
+        e = ReplicaEngine([FakeEngine(0), FakeEngine(0)])
+        self.assertFalse(e.pull_enabled)
+        self.assertEqual(dict(e.pending), {})
+        self.assertFalse(e.pull_view()["enabled"])
+        self.assertEqual(set(e.replica_view()[0]), {"replica", "alive", "running", "routed", "batch"})
+        self.assertEqual([e.route([1] * 100) for _ in range(4)], [0, 1, 0, 1])   # the old least-loaded order
+        e.inflight = [0, 0]
+        with mock.patch.object(e, "route", wraps=e.route) as routed:
+            g = e.generate([1] * 100, 10, {}, threading.Event())
+            self.assertEqual(next(g), 7)
+            g.close()
+        self.assertEqual(routed.call_count, 1)     # the old generate() still goes through route()
+
+
+class PullConfig(unittest.TestCase):
+    def test_off_by_default(self):
+        pc = pull_config({})
+        self.assertEqual((pc.enabled, pc.starve_s), (False, 60.0))
+        self.assertEqual(pull_config({"replica_pull": False}).enabled, False)
+
+    def test_the_keys_are_validated(self):
+        for cfg in ({"replica_pull": 1}, {"replica_pull": "yes"}, {"replica_pull": None},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_starve_s": -1},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_starve_s": True},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_starve_s": "60"},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_queue_timeout_s": -1},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_max_queue": -1}):
+            with self.assertRaises(ReplicaConfigError, msg=cfg):
+                pull_config(cfg)
+        pc = pull_config({"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_starve_s": 0,
+                          "replica_queue_timeout_s": 30, "replica_max_queue": 2})
+        self.assertEqual((pc.enabled, pc.starve_s, pc.queue_timeout_s, pc.max_queue), (True, 0.0, 30.0, 2))
+        with self.assertRaises(ReplicaConfigError):
+            ReplicaEngine([GateEngine(), GateEngine()], pull=1)
+
+    def test_pull_needs_replicas_and_no_split(self):
+        for cfg in ({"replica_pull": True},
+                    {"replica_pull": True, "replicas": 1, "gpu": [0, 1]},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "split_serve": {"prefill_gpu": 0}}):
+            with self.assertRaises(ReplicaConfigError, msg=cfg):
+                pull_config(cfg)
+        self.assertTrue(pull_config({"replica_pull": True, "replicas": 2, "gpu": [0, 1]}).enabled)
+
+    def test_pull_refuses_batch_slots(self):
+        for cfg in ({"replica_pull": True, "replicas": 2, "gpu": [0, 1], "parallel": 2},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "args": ["--batch", "2"]},
+                    {"replica_pull": True, "replicas": 2, "gpu": [0, 1], "args": ["--slots=4"]}):
+            with self.assertRaises(ReplicaConfigError, msg=cfg):
+                pull_config(cfg)
+        pull_config({"replica_pull": True, "replicas": 2, "gpu": [0, 1], "parallel": 1})
+
+    def test_the_engine_starts_from_the_run_config(self):
+        pc = pull_config({"replica_pull": True, "replicas": 2, "gpu": [0, 1], "replica_starve_s": 5,
+                          "replica_queue_timeout_s": 1.5, "replica_max_queue": 2})
+        e = ReplicaEngine([GateEngine(), GateEngine()], pull=pc.enabled, starve_s=pc.starve_s,
+                          queue_timeout_s=pc.queue_timeout_s, max_queue=pc.max_queue)
+        self.assertTrue(e.pull_enabled)
+        self.assertEqual((e.pull_starve_s, e.queue_timeout_s, e.max_queue), (5.0, 1.5, 2))
+
+
+class PullService(unittest.TestCase):
+    """The pull scheduler behind the real Service (no HTTP): its keep-alives, its queue timeout with the existing
+    429 contract, the admission limit, the terminal row, a death while waiting, and the queue in /metrics' view."""
+
+    def setUp(self):
+        self.engine = ReplicaEngine([GateEngine("r0"), GateEngine("r1")], pull=True, poll_s=0.01, beat_s=0.02)
+        self.tok = ByteTokenizer()
+        self.svc = Service(self.engine, self.tok,
+                           ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+
+    def hold(self, name="x"):
+        g = self.engine.generate(list(name.encode()), 16, {}, threading.Event())
+        self.assertEqual(next(g), 7)
+        return g
+
+    def run_request(self):
+        cancel = threading.Event()
+        return self.svc.run(self.tok.encode("hi"), False, None, 8, {}, cancel), cancel
+
+    def test_service_keepalives_while_a_request_waits_for_a_replica(self):
+        g0 = self.hold()
+        g1 = self.hold()
+        run, cancel = self.run_request()
+        self.assertEqual(next(run), ("ping", None))            # the Service turned the None into its keep-alive
+        row = self.svc.terminal_requests[cancel._strata_request_id]
+        self.assertEqual((row["state"], row.get("replica")), ("waiting", None))
+        self.assertIsNone(row.get("first_engine_token_s"))
+        g0.close()
+        kinds = []
+        for kind, _ in run:
+            kinds.append(kind)
+            if kind == "done":
+                break
+        self.assertIn("event", kinds)                          # the answer came once a replica was free
+        g1.close()
+        self.assertEqual(self.engine.inflight, [0, 0])
+
+    def test_service_reports_queue_wait_timeout_as_the_existing_error(self):
+        self.svc.queue_timeout_s = 0.1
+        g0 = self.hold()
+        g1 = self.hold()
+        run, cancel = self.run_request()
+        self.assertEqual(next(run), ("ping", None))
+        with self.assertRaises(QueueWaitExpired):
+            list(run)
+        self.assertEqual(self.svc.queue_timeouts, 1)
+        self.assertEqual(dict(self.engine.pending), {})
+        self.assertEqual(self.engine.inflight, [1, 1])
+        g0.close()
+        g1.close()
+        self.assertEqual(self.engine.inflight, [0, 0])
+
+    def test_max_queue_is_still_the_admission_limit(self):
+        self.svc.max_queue = 0
+        self.assertEqual(self.svc.admission_limit(), 2)        # max(1, engine.batch) + max_queue, as before
+        self.assertTrue(self.svc.reserve_inference())
+        self.assertTrue(self.svc.reserve_inference())
+        self.assertFalse(self.svc.reserve_inference())
+        self.assertEqual(self.svc.admission_rejected, 1)
+        self.svc.release_inference()
+        self.svc.release_inference()
+        self.assertEqual(self.svc.admission_reserved, 0)
+
+    def test_the_terminal_row_names_the_replica_only_after_assignment(self):
+        g0 = self.hold()
+        g1 = self.hold()
+        run, cancel = self.run_request()
+        self.assertEqual(next(run), ("ping", None))
+        request_id = cancel._strata_request_id
+        self.assertNotIn("replica", self.svc.terminal_requests[request_id])
+        g1.close()
+        for kind, _ in run:
+            if kind != "ping":
+                break
+        row = self.svc.terminal_requests[request_id]
+        self.assertEqual((row["state"], row["replica"]), ("reading", 1))
+        for _ in run:
+            pass
+        g0.close()
+        self.assertEqual(self.engine.inflight, [0, 0])
+
+    def test_a_replica_death_while_waiting_ends_with_an_engine_died(self):
+        g0 = self.hold()
+        g1 = self.hold()
+        run, cancel = self.run_request()
+        self.assertEqual(next(run), ("ping", None))
+        self.engine.engines[0].up = False
+        self.engine.engines[1].up = False
+        with self.assertRaises(EngineDied):
+            list(run)
+        self.assertEqual((dict(self.engine.pending), self.engine.pull_stats["no_replica"]), ({}, 1))
+        g0.close()
+        g1.close()
+        self.assertEqual(self.engine.inflight, [0, 0])
+
+    def test_the_queue_reaches_metrics_through_the_existing_view(self):
+        g0 = self.hold()
+        g1 = self.hold()
+        m = self.svc.metrics()
+        rows = m["live"]["replicas"]
+        self.assertEqual([r["replica"] for r in rows], [0, 1])
+        self.assertEqual(rows[0]["queue"]["depth"], 0)         # (no new field is needed on the server's side)
+        self.assertIsNone(rows[0]["queue"]["oldest_s"])
+        self.assertEqual(m["live"]["queued"], 0)
+        self.assertEqual(self.svc.v1_status()["concurrency"]["serving"], 2)   # the engine still counts as parallel
+        g0.close()
+        g1.close()
+
+
 class ReplicaService(unittest.TestCase):
-    def start(self, slots=4, n=2):
+    def start(self, slots=4, n=2, pull=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -172,7 +858,7 @@ class ReplicaService(unittest.TestCase):
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
                 engines.append(StrataEngine("strata", extra))
-        self.engine = ReplicaEngine(engines)
+        self.engine = ReplicaEngine(engines, **(dict(pull=True, poll_s=0.01, beat_s=0.02) if pull else {}))
         self.svc = Service(self.engine, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -289,6 +975,16 @@ class ReplicaService(unittest.TestCase):
         out = self.burst(["a" * 40, "b" * 40])
         self.assertEqual(self.served(), [1, 1])
         self.assertEqual(len(set(out)), 1)
+
+    def test_a_burst_over_replica_pull_uses_both_replicas(self):
+        self.start(slots=0, pull=True)                     # two engines, one request each at a time, one shared queue
+        solo = self.chat("hello there")
+        before = self.served()
+        out = self.burst([f"request number {i} " + "x" * 300 for i in range(4)])
+        got = [b - a for a, b in zip(before, self.served())]
+        self.assertTrue(all(g >= 1 for g in got), got)     # the queued requests waited for a card, then ran
+        self.assertEqual(sum(got), 4)                      # every request ran exactly once
+        self.assertEqual(set(out), {solo})
 
     def test_a_conversation_goes_back_to_its_replica(self):
         self.start()
