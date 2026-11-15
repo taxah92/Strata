@@ -240,4 +240,34 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
 
+// ---- the same format on a file descriptor the caller owns (POSIX).  The parent parking store (conversation_parent.hpp)
+// hands the engine a memfd per stage, so a session file is written to and read from a descriptor instead of a path:
+// there is no temporary file, no rename, no folder flush and no O_DIRECT, and the descriptor is NEVER closed here.
+// The bytes are the same format v1 the path API writes (a test compares them byte for byte), and the read keeps the
+// same fail-closed order: size, header, identity, bounded parse, payload hash, before `image` is replaced.
+//
+// A descriptor is trusted the way a path is not: it came from this process's own server over SCM_RIGHTS, so the
+// symlink and hard-link checks of the path API do not apply and `st_nlink == 0` (a memfd) is allowed.  What is still
+// checked on the opened descriptor: a regular file, and a size this engine's limits admit.
+
+// The exact size `session_file_write` (the sources overload) writes for `meta` + `kv`: header, payload, trailer.  The
+// same walk the write does, counting instead of writing, so the two cannot disagree.  The parent parking store asks
+// for it before it creates the memfd, and the engine writes exactly that many bytes into it.
+bool session_file_measure(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, uint64_t& bytes,
+                          std::string& error);
+
+// Writes format v1 into `fd` from offset 0 (pwrite; the descriptor's own offset is not used) and cuts it to the exact
+// size (ftruncate).  `options.durable` must be false and `options.min_free_bytes` must be 0: a descriptor has no
+// folder to flush and no filesystem to preflight, and a durable write is refused rather than promised.  `options.fault`
+// still injects a "write" failure for tests.  `fd` is not closed.
+bool session_file_write_fd(int fd, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                           const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                           const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+
+// Reads format v1 from `fd` (pread; the descriptor's own offset is left where it was).  `limits` are the path API's,
+// `admit` included, and it runs before any payload allocation.  `fd` is not closed.
+bool session_file_read_fd(int fd, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                          std::string& error, const SessionReadLimits& limits = {},
+                          SessionStatus* status = nullptr);
+
 } // namespace strata::core

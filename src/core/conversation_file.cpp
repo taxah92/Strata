@@ -383,26 +383,44 @@ public:
         size = (uint64_t) st.st_size;
         return true;
     }
+    // a descriptor the caller owns (the parent parking store's memfd, conversation_parent.hpp): never closed here, no
+    // O_DIRECT (a memfd has no page cache to bypass), and every transfer goes through pwrite/pread at this object's
+    // own offset, so the descriptor's file offset is left exactly where the caller had it.  The path API's symlink and
+    // hard-link checks do not apply: the descriptor came from this process's own server, and a memfd has no name at all
+    // (st_nlink == 0).  What is still checked: a regular file.
+    bool adopt(int fd, uint64_t& size) {
+        struct stat st {};
+        if (::fstat(fd, &st) != 0) { kind_ = errno_kind(errno); error_ = std::strerror(errno); return false; }
+        if (!S_ISREG(st.st_mode)) { refused_ = true; error_ = "not a regular file"; return false; }
+        fd_ = fd;
+        owned_ = false;
+        positioned_ = true;
+        pos_ = 0;
+        size = (uint64_t) st.st_size;
+        return true;
+    }
     bool is_open() const { return fd_ >= 0; }
     bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
         while (n) {
-            const ssize_t w = ::write(fd_, p, n);
+            const ssize_t w = positioned_ ? ::pwrite(fd_, p, n, (off_t) pos_) : ::write(fd_, p, n);
             if (w < 0 && errno == EINTR) continue;
             // a filesystem that took O_DIRECT at open but refuses this transfer: nothing was written, go buffered
             if (w < 0 && errno == EINVAL && direct_ && leave_direct()) continue;
             if (w <= 0) { kind_ = w < 0 ? errno_kind(errno) : SessionError::io; error_ = w < 0 ? std::strerror(errno) : "short write"; return false; }
             p += w; n -= (size_t) w;
+            pos_ += (uint64_t) w;
         }
         return true;
     }
     // bytes read, 0 at the end of the file, -1 on error
     long long read_some(uint8_t* p, size_t n) {
         for (;;) {
-            const ssize_t r = ::read(fd_, p, n);
+            const ssize_t r = positioned_ ? ::pread(fd_, p, n, (off_t) pos_) : ::read(fd_, p, n);
             if (r < 0 && errno == EINTR) continue;
             if (r < 0 && errno == EINVAL && direct_ && leave_direct()) continue;
             if (r < 0) { kind_ = errno_kind(errno); error_ = std::strerror(errno); }
+            if (r > 0) pos_ += (uint64_t) r;
             return (long long) r;
         }
     }
@@ -422,6 +440,7 @@ public:
         return false;
     }
     bool sync() {
+        if (positioned_) return true;   // a descriptor has no folder to flush; the fd API refuses a durable write
         if (::fsync(fd_) == 0) return true;
         kind_ = errno_kind(errno);
         error_ = std::strerror(errno);
@@ -429,7 +448,7 @@ public:
     }
     bool close() {
         if (fd_ < 0) return true;
-        const bool ok = ::close(fd_) == 0;
+        const bool ok = owned_ ? ::close(fd_) == 0 : true;   // an adopted descriptor belongs to the caller
         if (!ok) { kind_ = errno_kind(errno); error_ = std::strerror(errno); }
         fd_ = -1;
         return ok;
@@ -455,6 +474,9 @@ private:
     }
     int fd_ = -1;
     bool direct_ = false, missing_ = false, refused_ = false;
+    bool owned_ = true;      // false: adopted from the caller, never closed here
+    bool positioned_ = false; // true: pwrite/pread at pos_ (an adopted descriptor), not write/read
+    uint64_t pos_ = 0;
     SessionError kind_ = SessionError::io;
     std::string error_;
 };
@@ -1024,11 +1046,11 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 }
 
 namespace {
-bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
-                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
-    st = {};
-    st.error = SessionError::invalid;   // refusals before any disk access
+// The exact size of the file `image` + `sources` writes: header, payload, trailer.  The same walk the write does,
+// counting instead of writing (Out with no sink), so the two cannot disagree.  Also the refusals that come before any
+// byte is written, so a caller that measures first learns them before it creates a file or a memfd.
+bool measure_impl(const SavedConversation& image, const std::vector<SessionKvSource>* sources, uint64_t& total,
+                  std::string& error) {
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
@@ -1038,7 +1060,58 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         error = "session file: the state is too large for this build";
         return false;
     }
-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    total = kHeader + sizing.n + kTrailer;
+    return true;
+}
+
+// Writes the file into an open sink: header, payload, trailer, then the sink's finish (the last block, the flush when
+// durable, the close).  `total` is measure_impl's figure and `payload` its payload part.  The sink's own close is a
+// no-op on an adopted descriptor, so the caller's fd stays open.
+bool write_stream(RawFile& raw, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                  const SessionFileIdentity& id, const SessionWriteOptions& opt, uint64_t total, uint64_t payload,
+                  std::string& error, SessionStatus& st) {
+    FileSink f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+    if (opt.progress) f.progress.emplace(opt.progress);
+    f.phase = opt.phase;
+    f.expected = total;
+    if (f.progress) (*f.progress)(0, total);   // the file exists: the transfer starts
+    const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
+    f.write_fault = injected(fault, "write");
+    f.flush_fault = injected(fault, "file_flush");
+    uint8_t h[kHeader];
+    header_bytes(h, id, payload);
+    bool ok = f.write(h, kHeader);
+    SessionHasher hash(0);
+    Out out;
+    out.f = &f;
+    out.hash = &hash;
+    if (ok) put_payload(out, image, sources);
+    ok = ok && out.ok && out.n == payload;
+    if (ok) {
+        const uint64_t ph = hash.digest();
+        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+    }
+    ok = f.finish(opt.durable) && ok;
+    if (!ok) {
+        const std::string why = out.read_failed
+                                    ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+                                    : f.error();
+        st.error = out.read_failed ? SessionError::io : f.kind();
+        error = why;
+        return false;
+    }
+    return true;
+}
+
+bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+                SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any disk access
+    uint64_t total = 0;
+    if (!measure_impl(image, sources, total, error)) return false;
+    const uint64_t payload = total - kHeader - kTrailer;
     st.error = SessionError::io;
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
@@ -1059,45 +1132,21 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
         return false;
     }
-    FileSink f(raw);
-    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
-    if (opt.progress) f.progress.emplace(opt.progress);
-    f.phase = opt.phase;
-    f.expected = total;
-    if (f.progress) (*f.progress)(0, total);   // the temporary file exists: the transfer starts
-    const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
-    f.write_fault = injected(fault, "write");
-    f.flush_fault = injected(fault, "file_flush");
-    uint8_t h[kHeader];
-    header_bytes(h, id, payload);
-    bool ok = f.write(h, kHeader);
-    SessionHasher hash(0);
-    Out out;
-    out.f = &f;
-    out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
-    ok = ok && out.ok && out.n == payload;
-    if (ok) {
-        const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
-    }
-    ok = f.finish(opt.durable) && ok;
     std::string why;
-    if (!ok) {
-        why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
-                              : f.error();
-        st.error = out.read_failed ? SessionError::io : f.kind();
-    } else {
-        if (opt.phase) opt.phase("publish", total);
-        if (pub.publish(why, opt.durable, st, fault)) {
-            st.error = SessionError::none;
-            bytes = (size_t) total;
-            return true;
-        }
+    if (!write_stream(raw, image, sources, id, opt, total, payload, why, st)) {
+        error = "session file: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
+        return false;   // Publisher removes this call's temporary file, and only that
+    }
+    if (opt.phase) opt.phase("publish", total);
+    const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
+    if (pub.publish(why, opt.durable, st, fault)) {
+        st.error = SessionError::none;
+        bytes = (size_t) total;
+        return true;
     }
     error = "session file: writing " + path + " failed" + (why.empty() ? std::string() : ": " + why);
     if (st.published) error += " (the new file has already replaced the old one; its folder entry may not survive a power loss)";
-    return false;   // Publisher removes this call's temporary file, and only that
+    return false;
 }
 
 bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
@@ -1171,18 +1220,10 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
 }
 
 namespace {
-bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
-               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
-    error.clear();
-    st = {};
-    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
-    uint64_t size = 0;
-    if (!raw.open_session(path, size)) {
-        st.error = raw.refused() ? SessionError::invalid : raw.kind();
-        error = "session file: " + path + ": " + raw.error();
-        return false;
-    }
+// The validation and the parse, over an already-open source of `size` bytes: the path API and the fd API share every
+// check from here on, so a memfd and a file are read by the same fail-closed order.
+bool read_body(RawFile& raw, uint64_t size, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+               std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
     const uint64_t max_size = session_read_max_file_bytes(limits);
     if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
@@ -1236,6 +1277,21 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     st.error = SessionError::none;
     return true;
 }
+
+bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+               size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: " + path + ": " + raw.error();
+        return false;
+    }
+    return read_body(raw, size, id, image, bytes, error, limits, st);
+}
 } // namespace
 
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
@@ -1252,5 +1308,126 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     if (status) *status = st;
     return ok;
 }
+
+bool session_file_measure(const SavedConversation& meta, const std::vector<SessionKvSource>& kv, uint64_t& bytes,
+                          std::string& error) {
+    error.clear();
+    try {
+        return measure_impl(meta, &kv, bytes, error);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while measuring the state";
+        return false;
+    }
+}
+
+#ifndef _WIN32
+namespace {
+// The descriptor variants: the same measure and the same stream as the path API, over a descriptor the caller owns.
+// No temporary file, no rename, no folder flush, no O_DIRECT, and the descriptor is never closed here.
+bool write_fd_impl(int fd, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                   const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+                   SessionStatus& st) {
+    st = {};
+    st.error = SessionError::invalid;   // refusals before any byte is written
+    if (opt.durable) {
+        error = "session file: a descriptor write is not durable (a durable write needs a path to flush and rename)";
+        return false;
+    }
+    if (opt.min_free_bytes) {
+        error = "session file: a descriptor write has no free-space preflight (the caller sized the descriptor)";
+        return false;
+    }
+    uint64_t total = 0;
+    if (!measure_impl(image, sources, total, error)) return false;
+    const uint64_t payload = total - kHeader - kTrailer;
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.adopt(fd, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: the descriptor: " + raw.error();
+        return false;
+    }
+    st.error = SessionError::io;
+    std::string why;
+    if (!write_stream(raw, image, sources, id, opt, total, payload, why, st)) {
+        error = "session file: writing the descriptor failed" + (why.empty() ? std::string() : ": " + why);
+        return false;
+    }
+    // the exact size, whatever the descriptor held before: the parent sized the memfd to the measured bytes, and a
+    // disagreement here is what its COMMIT check refuses
+    if (::ftruncate(fd, (off_t) total) != 0) {
+        st.error = errno_kind(errno);
+        error = std::string("session file: cutting the descriptor to its size: ") + std::strerror(errno);
+        return false;
+    }
+    st.error = SessionError::none;
+    bytes = (size_t) total;
+    return true;
+}
+
+bool read_fd_impl(int fd, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes, std::string& error,
+                  const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.adopt(fd, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: the descriptor: " + raw.error();
+        return false;
+    }
+    return read_body(raw, size, id, image, bytes, error, limits, st);
+}
+} // namespace
+
+bool session_file_write_fd(int fd, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                           const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                           const SessionWriteOptions& options, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = write_fd_impl(fd, meta, &kv, id, bytes, error, options, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while writing the descriptor";
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool session_file_read_fd(int fd, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                          std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = read_fd_impl(fd, id, image, bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading the descriptor";
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+#else
+// Windows has no descriptor to hand a session file to (the parent parking store is Linux only): the API exists so the
+// header is portable, and it refuses rather than pretending.
+bool session_file_write_fd(int, const SavedConversation&, const std::vector<SessionKvSource>&,
+                           const SessionFileIdentity&, size_t&, std::string& error, const SessionWriteOptions&,
+                           SessionStatus* status) {
+    error = "session file: a descriptor write is not supported on this platform";
+    if (status) { *status = {}; status->error = SessionError::invalid; }
+    return false;
+}
+
+bool session_file_read_fd(int, const SessionFileIdentity&, SavedConversation&, size_t&, std::string& error,
+                          const SessionReadLimits&, SessionStatus* status) {
+    error = "session file: a descriptor read is not supported on this platform";
+    if (status) { *status = {}; status->error = SessionError::invalid; }
+    return false;
+}
+#endif
 
 } // namespace strata::core

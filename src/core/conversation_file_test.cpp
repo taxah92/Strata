@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 #ifndef _WIN32
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -148,6 +150,79 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
     }
     return !ok && !error.empty();
 }
+
+#ifndef _WIN32
+// The K/V of `image` as streaming sources, the shape the parent parking path writes (conversation_snapshot_sources):
+// each part is read from the image's own buffers, so the file bytes must equal the captured-image write's.
+std::vector<SessionKvSource> sources_of(const SavedConversation& image) {
+    std::vector<SessionKvSource> out;
+    for (const auto& kv : image.kv) {
+        SessionKvSource s;
+        s.format = kv.format; s.cells = kv.cells; s.heads = kv.heads; s.head_dim = kv.head_dim;
+        s.page_size = kv.page_size; s.pooled_rows = kv.pooled_rows; s.idx_dim = kv.idx_dim;
+        const std::array<const ConversationBuffer*, 5> parts = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+        for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+        s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+            return part < 5 && parts[part]->read(dst, offset, n);
+        };
+        s.error = [] { return std::string("test source"); };
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// A memfd of `size` bytes (0: not truncated), or -1.
+int memfd(const char* name, size_t size) {
+    const int fd = ::memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return -1;
+    if (size && ::ftruncate(fd, (off_t) size) != 0) { ::close(fd); return -1; }
+    return fd;
+}
+
+// The bytes of an open descriptor, from offset 0, without moving its offset.
+std::vector<char> slurp_fd(int fd) {
+    std::vector<char> out;
+    char buf[65536];
+    off_t at = 0;
+    for (;;) {
+        const ssize_t n = ::pread(fd, buf, sizeof buf, at);
+        if (n <= 0) break;
+        out.insert(out.end(), buf, buf + n);
+        at += n;
+    }
+    return out;
+}
+
+// A descriptor that reads `bytes` from offset 0 (a memfd holding them).
+int memfd_with(const char* name, const std::vector<char>& bytes) {
+    const int fd = memfd(name, bytes.size());
+    if (fd < 0) return -1;
+    if (!bytes.empty() && ::pwrite(fd, bytes.data(), bytes.size(), 0) != (ssize_t) bytes.size()) { ::close(fd); return -1; }
+    return fd;
+}
+
+// The options a descriptor write requires: it cannot be durable and has no filesystem to preflight.
+SessionWriteOptions fd_options() {
+    SessionWriteOptions o;
+    o.durable = false;
+    o.min_free_bytes = 0;
+    return o;
+}
+
+// A read of `fd` that must fail, with `expect` inside the error text.
+bool rejects_fd(int fd, const SessionFileIdentity& id, const char* expect = nullptr,
+                const SessionReadLimits& limits = {}) {
+    SavedConversation out;
+    size_t bytes = 0;
+    std::string error;
+    const bool ok = session_file_read_fd(fd, id, out, bytes, error, limits);
+    if (!ok && expect && error.find(expect) == std::string::npos) {
+        std::fprintf(stderr, "  unexpected descriptor error text: %s (wanted %s)\n", error.c_str(), expect);
+        return false;
+    }
+    return !ok && !error.empty();
+}
+#endif
 } // namespace
 
 int main() {
@@ -766,6 +841,158 @@ int main() {
         check(slurp(target) == std::vector<char>(7, 't'), "the link's target is untouched");
         struct stat st {};
         check(::stat(link.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "the session file is mode 0600");
+    }
+#endif
+
+#ifndef _WIN32
+    // ---- the descriptor API (conversation_parent.hpp's parent parking store hands the engine a memfd per stage)
+    {
+        // measure: the exact size the write produces, and the same walk the write does
+        auto meta = original;
+        meta.kv.clear();
+        const auto sources = sources_of(original);
+        uint64_t measured = 0;
+        check(session_file_measure(meta, sources, measured, error), "fd: measure succeeds");
+        check(measured == image.size(), "fd: measure equals the path write's size");
+        {
+            auto bad = original;   // stage parts cannot be saved, by either API
+            bad.live.stage_parts.push_back(checkpoint(3, 9));
+            uint64_t n = 0;
+            check(!session_file_measure(bad, sources, n, error) && error.find("layer-split") != std::string::npos,
+                  "fd: measure refuses layer-split state");
+            auto both = meta;
+            both.kv = original.kv;
+            check(!session_file_measure(both, sources, n, error) && error.find("both") != std::string::npos,
+                  "fd: measure refuses K/V in the image and as sources");
+        }
+        // a streamed write to a memfd is byte-identical to the captured-image path write and to the streamed path write
+        {
+            const int fd = memfd("strata-test-session", (size_t) measured);
+            check(fd >= 0, "fd: memfd created");
+            check(::lseek(fd, 5, SEEK_SET) == 5, "fd: offset moved before the write");
+            size_t written_fd = 0;
+            SessionStatus st;
+            check(session_file_write_fd(fd, meta, sources, id, written_fd, error, fd_options(), &st), "fd: streamed write");
+            check(st.error == SessionError::none && written_fd == measured, "fd: write reports the measured size");
+            check(::lseek(fd, 0, SEEK_CUR) == 5, "fd: the write leaves the descriptor's offset alone");
+            check(slurp_fd(fd) == image, "fd: streamed write is byte-identical to the captured-image path write");
+            const fs::path streamed = dir / "streamed.bin";
+            size_t written_path = 0;
+            check(session_file_write(streamed.string(), meta, sources, id, written_path, error) &&
+                  written_path == measured, "fd: streamed path write");
+            check(slurp(streamed) == image, "fd: the streamed path write is byte-identical too");
+            // read it back through the descriptor: a memfd has st_nlink == 0, which the path API refuses
+            SavedConversation back;
+            size_t read = 0;
+            check(::lseek(fd, 7, SEEK_SET) == 7, "fd: offset moved before the read");
+            check(session_file_read_fd(fd, id, back, read, error, {}, &st), "fd: read a memfd (st_nlink == 0)");
+            check(read == measured && same(original, back), "fd: round trip through a memfd is identical");
+            check(::lseek(fd, 0, SEEK_CUR) == 7, "fd: the read leaves the descriptor's offset alone");
+            struct stat fst {};
+            check(::fstat(fd, &fst) == 0 && fst.st_nlink == 0, "fd: the memfd really has no name");
+            ::close(fd);
+        }
+        // the write refuses what a descriptor cannot promise, before it writes anything
+        {
+            const int fd = memfd("strata-test-refuse", (size_t) measured);
+            check(fd >= 0, "fd: memfd for the refusals");
+            size_t written_fd = 0;
+            SessionStatus st;
+            SessionWriteOptions durable = fd_options();
+            durable.durable = true;
+            check(!session_file_write_fd(fd, meta, sources, id, written_fd, error, durable, &st) &&
+                  st.error == SessionError::invalid && error.find("durable") != std::string::npos,
+                  "fd: a durable write is refused");
+            SessionWriteOptions preflight = fd_options();
+            preflight.min_free_bytes = 1u << 20;
+            check(!session_file_write_fd(fd, meta, sources, id, written_fd, error, preflight, &st) &&
+                  st.error == SessionError::invalid && error.find("free-space") != std::string::npos,
+                  "fd: a free-space preflight is refused");
+            check(slurp_fd(fd) == std::vector<char>(image.size(), '\0'), "fd: a refused write wrote nothing");
+            ::close(fd);
+        }
+        // the write touches no path: no rename, no folder flush, no file flush, no phase, no temporary file
+        {
+            const int fd = memfd("strata-test-steps", (size_t) measured);
+            check(fd >= 0, "fd: memfd for the step audit");
+            std::vector<std::string> steps;
+            SessionWriteOptions opt = fd_options();
+            opt.fault = [&](const char* step) { steps.push_back(step); return 0; };
+            opt.phase = [&](const char* phase, uint64_t) { steps.push_back(std::string("phase:") + phase); };
+            size_t written_fd = 0;
+            check(session_file_write_fd(fd, meta, sources, id, written_fd, error, opt), "fd: write with the audit hooks");
+            bool saw_write = false, saw_publish_step = false;
+            for (const auto& step : steps) {
+                saw_write = saw_write || step == "write";
+                saw_publish_step = saw_publish_step || step == "rename" || step == "dir_flush" ||
+                                   step.rfind("phase:", 0) == 0;
+            }
+            check(saw_write && !saw_publish_step,
+                  "fd: the block write is asked about, but no rename, folder flush or phase (there is no path)");
+            check(no_temp(dir), "fd: no temporary file appears in any folder");
+            ::close(fd);
+        }
+        // the read refuses what is not a session file, and a size the limits do not admit
+        {
+            int pipefd[2] = {-1, -1};
+            check(::pipe(pipefd) == 0, "fd: pipe");
+            check(rejects_fd(pipefd[0], id, "regular"), "fd: a pipe is not a regular file");
+            ::close(pipefd[0]); ::close(pipefd[1]);
+            const int short_fd = memfd_with("strata-test-short", std::vector<char>(image.begin(), image.begin() + 100));
+            check(short_fd >= 0 && rejects_fd(short_fd, id), "fd: a short descriptor is refused");
+            ::close(short_fd);
+            auto longer = image;
+            longer.push_back('\0');
+            const int long_fd = memfd_with("strata-test-long", longer);
+            check(long_fd >= 0 && rejects_fd(long_fd, id, "does not match the header"), "fd: an oversized descriptor is refused");
+            ::close(long_fd);
+            const int good_fd = memfd_with("strata-test-id", image);
+            check(good_fd >= 0 && rejects_fd(good_fd, {id.model ^ 1, id.config}, "model"),
+                  "fd: another model fingerprint is refused");
+            check(rejects_fd(good_fd, {id.model, id.config ^ 1}, "config"), "fd: another configuration is refused");
+            SessionReadLimits l;
+            l.max_file_bytes = image.size() - 1;
+            check(rejects_fd(good_fd, id, "limit", l), "fd: a size over the limit is refused");
+            // the RAM preflight runs before any payload allocation, with the parsed image's peak
+            uint64_t asked = 0;
+            bool admitted = false;
+            SessionReadLimits gated;
+            gated.admit = [&](uint64_t need, std::string& why) {
+                asked = need;
+                admitted = true;
+                why = "no room for the test";
+                return false;
+            };
+            SavedConversation untouched;
+            untouched.layer_lo = 12345;
+            size_t read = 0;
+            SessionStatus st;
+            check(!session_file_read_fd(good_fd, id, untouched, read, error, gated, &st) &&
+                  st.error == SessionError::memory, "fd: a refused RAM preflight fails as memory");
+            check(admitted && asked == session_read_peak_bytes(image.size()),
+                  "fd: the preflight is asked for the parsed image's peak, before the payload");
+            check(untouched.layer_lo == 12345 && untouched.live.ids.empty(), "fd: a refused read leaves the image alone");
+            ::close(good_fd);
+        }
+        // a descriptor opened read-only cannot be written, and one opened write-only cannot be read
+        {
+            const fs::path p = dir / "ro.bin";
+            spit(p, image);
+            const int ro = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+            check(ro >= 0, "fd: read-only descriptor");
+            size_t written_fd = 0;
+            SessionStatus st;
+            check(!session_file_write_fd(ro, meta, sources, id, written_fd, error, fd_options(), &st) &&
+                  st.error == SessionError::io, "fd: a read-only descriptor refuses the write");
+            ::close(ro);
+            const int wo = ::open(p.c_str(), O_WRONLY | O_CLOEXEC);
+            check(wo >= 0, "fd: write-only descriptor");
+            SavedConversation back;
+            size_t read = 0;
+            check(!session_file_read_fd(wo, id, back, read, error, {}, &st) && st.error == SessionError::io,
+                  "fd: a write-only descriptor refuses the read");
+            ::close(wo);
+        }
     }
 #endif
 
