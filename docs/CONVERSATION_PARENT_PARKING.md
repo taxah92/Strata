@@ -1,7 +1,7 @@
 # Parent parking: one RAM store in the server for every replica (`replica_parent_parking`)
 
-Status: **built, unit-tested on the CPU, and integration-tested against the real Python store; compiled for CUDA
-sm_89 and sm_70; not yet run on a GPU or on the live stand.** The code is in `serve/parent_parking.py` (the store),
+Status: **built, unit-tested on the CPU, integration-tested against the real Python store, and run on the live stand
+(two Tesla V100: a conversation parked on one card was restored on the other).** The code is in `serve/parent_parking.py` (the store),
 `include/strata/core/conversation_parent.hpp` and `src/core/conversation_parent.cpp` (the engine's client), the
 `--serve` loop of `src/program/generate.cpp`, and the fd variants of the session file in
 `include/strata/core/conversation_file.hpp`. Tests: `src/core/conversation_file_test.cpp` (the fd API),
@@ -182,4 +182,8 @@ in their own heap again, exactly as before; nothing has to be migrated between s
 | CUDA sm_89 build (`strata`, `libstrata_kq.so`) | compiled |
 | CUDA sm_70 build (container, CUDA 12.9.1, `-DSTRATA_EXPERIMENTAL_SM60=ON`) | compiled |
 | HIP and SYCL builds | **not run**: no ROCm and no `icpx` on the development host |
-| A GPU run, the live stand and the three-arm A/B | **not run**: needs the owner's window on the llm host |
+| A GPU run of park/local restore/peer restore | **passed** on the live stand (two Tesla V100, Qwen3.8-Flash-Next): a 28 485-token conversation was parked in 400 ms (707 MB, 1.77 GB/s), restored on the SAME replica in 528 ms (28 181 of 28 485 tokens reused) and restored on the OTHER replica in 528 ms; the store's `peer_reads` counted it. CLEAR through `unload`, the fallback after it, SIGKILL of one replica (the committed entry stayed), `budget_violations=0`, and `diskstats` +0.01 MiB over a park+restore cycle were checked the same day |
+| The three-arm A/B (baseline / disk A / parent) | **not run** |
+| A byte-exact comparison with a reference (`--adapt-swaps 0`) | **not run**: the stand ran with the ordinary settings, where the baseline itself is not deterministic (#1937) |
+| Borrow and an eviction while a restored image is held, on the live stand | **not run**: covered by the store's unit tests only |
+| Three or more replicas on the live stand | **not run**: the stand had two cards |
