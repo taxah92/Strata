@@ -1,5 +1,6 @@
 // CPU-only tests for the conversation cache's disk tier (include/strata/core/conversation_disk.hpp).
-// Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
+// Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.  The peer mode and the cross-process leases are
+// in conversation_disk_peer_test.cpp.
 #include "strata/core/conversation_disk.hpp"
 
 #include <chrono>
@@ -82,6 +83,17 @@ std::vector<int32_t> prompt_of(const std::vector<int32_t>& ids, size_t extra) {
     for (size_t i = 0; i < extra; ++i) p.push_back(7);
     return p;
 }
+
+size_t count_files(const std::string& folder, const char* suffix) {
+    size_t n = 0;
+    std::error_code ec;
+    for (const auto& d : fs::directory_iterator(folder, ec))
+        if (d.path().filename().string().size() >= std::string(suffix).size() &&
+            d.path().filename().string().compare(d.path().filename().string().size() - std::string(suffix).size(),
+                                                 std::string(suffix).size(), suffix) == 0)
+            ++n;
+    return n;
+}
 } // namespace
 
 int main() {
@@ -91,6 +103,7 @@ int main() {
     const SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
     ConversationDiskOptions opt;
     opt.dir = dir.string();
+    opt.owner = "r0";
     opt.budget_bytes = 64ull << 20;
     opt.durable = false;
     std::string error;
@@ -101,15 +114,22 @@ int main() {
     {
         ConversationDiskTier t;
         check(t.open(opt, id, split_layout(), error), "open an empty folder");
+        check(t.owner() == "r0", "the writer's name");
         check(t.spill(a, ida, error) && ida != 0, "spill a two-stage conversation");
         check(t.spill(b, idb, error) && idb != 0 && idb != ida, "spill a second one");
         check(t.size() == 2 && t.writes() == 2, "two kept, two written");
+        check(t.generation(ida) != 0 && t.generation(idb) != 0, "every published conversation has a generation");
+        check(t.generation(ida) != t.generation(idb), "different conversations: different generations");
+        const uint64_t gen_ida = t.generation(ida);
         uint64_t again = 0;
         check(t.spill(a, again, error) && again == ida && t.writes() == 2, "an identical image is not written again");
+        check(t.generation(ida) == gen_ida, "an identical image keeps its generation");
+        check(fs::exists(fs::path(dir) / "writer.lock"), "the writer's lifetime lock file is in the writer folder");
 
         // matching: the live end (the prompt goes on past it), a checkpoint (the prompt diverges after it), none
         auto m = t.best(prompt_of(a_ids, 3), {}, true);
         check(m.id == ida && m.tokens == 5000 && m.live, "the live end matches a continuing prompt");
+        check(m.generation == t.generation(ida), "a match carries the content generation");
         auto diverged = std::vector<int32_t>(a_ids.begin(), a_ids.begin() + 4500);
         diverged.push_back(-1);
         m = t.best(diverged, {}, true);
@@ -127,6 +147,17 @@ int main() {
         check(back.kv[0].k == a.kv[0].k && back.stage_images[0].kv[0].k == a.stage_images[0].kv[0].k,
               "K/V bytes of both stages");
         check(back.checkpoints.size() == 1 && back.checkpoints[0].ids.size() == 4000, "checkpoints");
+        // a lease file exists for every published snapshot (a peer takes it before it reads the stage files)
+        check(count_files(t.folder(), ".lock") == 2, "one lease file per published conversation");
+    }
+    {   // one writer per folder for its lifetime: a second one is refused, and does not touch the first's files
+        ConversationDiskTier first;
+        check(first.open(opt, id, split_layout(), error), "the first writer opens");
+        ConversationDiskTier second;
+        std::string e2;
+        check(!second.open(opt, id, split_layout(), e2), "a second writer of the same folder is refused");
+        check(e2.find("another engine") != std::string::npos, "and the reason names the owner lock");
+        check(first.size() == 2, "the first writer still holds its entries");
     }
     {   // restart: the index files bring both back; the LRU order survives (a was read last)
         ConversationDiskTier t;
@@ -151,11 +182,16 @@ int main() {
         uint64_t x = 0;
         check(!t.spill(a, x, error), "an image of another stage count is refused");
     }
-    {   // crash leftovers: a stage file without an index and a temporary file go; a damaged index drops its entry
-        ConversationDiskTier t;
-        check(t.open(opt, id, split_layout(), error), "reopen");
-        const std::string folder = t.folder();
+    {   // crash leftovers: a stage file without an index, a temporary file and a lease file go; a damaged index
+        // drops its entry (the writer owns the folder; no other writer may be open while the folder is edited)
+        std::string folder;
+        {
+            ConversationDiskTier t;
+            check(t.open(opt, id, split_layout(), error), "reopen for the crash test");
+            folder = t.folder();
+        }
         { std::ofstream(fs::path(folder) / "00000000000000aa.s0.strses") << "x"; }
+        { std::ofstream(fs::path(folder) / "00000000000000aa.lock") << "x"; }
         { std::ofstream(fs::path(folder) / ".00000000000000aa.s1.strses.0123456789abcdef.tmp") << "x"; }
         fs::path victim;
         for (const auto& d : fs::directory_iterator(folder))
@@ -164,7 +200,8 @@ int main() {
         ConversationDiskTier u;
         ConversationDiskTier::OpenReport rep;
         check(u.open(opt, id, split_layout(), error, &rep), "reopen after a crash");
-        check(rep.orphans >= 2 && rep.dropped == 1 && u.size() == 1, "stray files removed, the damaged entry dropped");
+        check(rep.orphans >= 3 && rep.dropped == 1 && u.size() == 1, "stray files removed, the damaged entry dropped");
+        check(count_files(u.folder(), ".lock") == 1, "the damaged entry's lease file went with it");
     }
     {   // the budget: the least recently used conversation leaves
         ConversationDiskOptions small = opt;
@@ -175,6 +212,7 @@ int main() {
         uint64_t x = 0, y = 0;
         check(t.spill(a, x, error) && t.spill(b, y, error), "two spills");
         check(t.size() == 1 && t.contains(y) && t.evictions() == 1, "the older one was evicted for room");
+        check(!t.overshoot(), "the budget is kept when nothing is leased");
         check(t.clear() == 1 && t.size() == 0 && t.bytes() == 0, "clear");
     }
     {   // a conversation this run cannot restore is not offered again, but its files stay for the next start-up
@@ -202,6 +240,27 @@ int main() {
         check(t.open(o3, id, split_layout(), error) && t.spill(a, x, error) && t.spill(b, y, error), "a, then b");
         check(t.spill(a, again, error) && again == x, "a again: kept, now the most recent");
         check(t.spill(c, z, error) && t.contains(x) && !t.contains(y) && t.contains(z), "b (least recent) goes, not a");
+    }
+    {   // --conversation-cache-max-snapshot-mib: a larger conversation is neither written nor read
+        ConversationDiskOptions o4 = opt;
+        o4.dir = (dir / "maxsnap").string();
+        o4.max_snapshot_bytes = 1024;   // far below one image
+        uint64_t x = 0;
+        {
+            ConversationDiskTier t;
+            check(t.open(o4, id, split_layout(), error), "open with a snapshot ceiling");
+            check(!t.spill(a, x, error) && x == 0, "a conversation over the ceiling is not written");
+        }
+        {
+            ConversationDiskOptions o5 = o4;
+            o5.max_snapshot_bytes = 0;
+            ConversationDiskTier u;
+            check(u.open(o5, id, split_layout(), error) && u.spill(a, x, error), "written without the ceiling");
+        }
+        ConversationDiskTier t;
+        check(t.open(o4, id, split_layout(), error), "reopened with the ceiling");
+        SavedConversation back;
+        check(!t.load(x, {}, back, error), "a conversation over the ceiling is not read");
     }
     {   // the RAM cache hands evicted entries to the hook, and the idle writer's marks
         ConversationCache cache(1ull << 30, 2);
