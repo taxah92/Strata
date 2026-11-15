@@ -247,6 +247,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
     src/core/conversation_file.cpp)
   target_include_directories(conversation_parent_test PRIVATE include)
   add_test(NAME conversation_parent_test COMMAND conversation_parent_test)
+  # the C++ side of serve/test_parent_parking_integration.py: not a test itself (the real Python store is the other end)
+  add_executable(conversation_parent_probe src/core/conversation_parent_probe.cpp src/core/conversation_parent.cpp
+    src/core/conversation_file.cpp)
+  target_include_directories(conversation_parent_probe PRIVATE include)
   add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
     src/core/conversation_file.cpp)
   target_include_directories(conversation_disk_test PRIVATE include)
