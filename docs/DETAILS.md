@@ -731,6 +731,13 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
+| `--conversation-cache-dir PATH` (opt-in) | Keep parked conversations as files on a local SSD too, so tens stay restorable and they survive a restart. Default off. See [CONVERSATION_CACHE_DISK.md](CONVERSATION_CACHE_DISK.md). |
+| `--conversation-cache-peer-dir PATH` (repeatable, opt-in) | Read another engine's `--conversation-cache-dir` read-only: the two replicas of one host can restore each other's parked conversations without a control exchange. One folder per neighbouring replica; with `--replicas` the server sets both sides up itself (`"replica_handoff"` in the run config). A network or FUSE folder is refused. |
+| `--conversation-cache-owner NAME` | This engine's name in the disk index and the log (`r0`, `r1`); default: the folder's name. |
+| `--conversation-cache-spill-on-park` (opt-in) | Write a conversation to the disk folder at the park itself, not only on eviction or after an idle period, so the other replica finds it at once. A snapshot the RAM floor refuses is written to disk too instead of being dropped. |
+| `--conversation-cache-max-snapshot-mib N` | The largest conversation the disk tier writes or reads, default 8192; a larger one is refused rather than restored. |
+| `--conversation-cache-refresh-ms N` | A peer re-scans the other engine's folder at most this often (default 250); a match miss forces one re-scan regardless. |
+| `--conversation-cache-allow-unsafe-fs` | Start on a network (NFS/CIFS) or FUSE folder anyway. The store relies on `flock`, atomic rename and modification times: experiments only. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
 
 The RAM figure the floor is checked against is the smallest of `MemAvailable`, the room under each cgroup limit visible to
