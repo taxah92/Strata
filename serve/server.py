@@ -826,12 +826,51 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 class ConvCacheLog:
     """#596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
     cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
-    which is the log): read on from where it was last read, from the start of the engine's current run."""
+    which is the log): read on from where it was last read, from the start of the engine's current run.
+
+    One reader per engine log: with the opt-in replicas every engine writes its own log, so the server keeps a
+    ConvCacheLog for each replica and reports them one by one (never one replica's figures as all of them).  Besides
+    the RAM cache it reads the disk tier's lines of this replica (the formats the C++ side fixed for stage 3), and
+    each is cumulative or one event for this engine's current run:
+
+      conversation disk: <folder> (owner=<own>): N conversations kept from earlier runs, ...
+      conversation disk: peer <dir> (owner=<peer>): N conversations, X.XX GiB, read-only
+      conversation disk: wrote N tokens (<why>) in T ms, R GB/s; entries=E bytes=B evictions=V
+      conversation disk: not written (<why>, N tokens): <reason> [<kind>]
+      conversation disk: read N tokens (R reused, live|checkpoint[, peer <owner>]) in T ms, R GB/s; entries=E bytes=B
+      conversation disk: cannot read a conversation (N tokens[, peer <owner>]): <reason> [<kind>]
+      conversation disk: peer <owner> refreshed: A new, G gone, D damaged
+      conversation disk: stats (<tag>) wrote=W read=R evictions=V skipped=S lease_conflicts=L overshoot=O entries=E
+                        bytes=B peer_read=PR peer_refresh=PF peer_entries=PE peer_bytes=PB
+
+    The "stats" line is cumulative and the last one wins (it is never added up); the event lines only carry what it
+    does not (the milliseconds and tokens of each write/read).  A line it does not know changes nothing; no line
+    carries a prompt, a token id or a snapshot's content."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
-    # --conversation-cache-dir: "conversation disk: wrote|read N tokens ...; entries=E bytes=B"
-    DISK = re.compile(r"conversation disk: (wrote|read) (\d+) tokens.*?entries=(\d+) bytes=(\d+)")
+    WRITER_OPEN = re.compile(r"conversation disk: (.+?) \(owner=([^)]+)\): (\d+) conversations kept from earlier runs")
+    PEER_OPEN = re.compile(r"conversation disk: peer (.+?) \(owner=([^)]+)\): (\d+) conversations")
+    # wrote N tokens (evicted|idle|direct|on-park) in T ms, ...; entries=E bytes=B evictions=V
+    WRITE = re.compile(r"conversation disk: wrote (\d+) tokens \(([a-z-]+)\) in ([\d.]+) ms.*?entries=(\d+) bytes=(\d+)"
+                       r"(?: evictions=(\d+))?")
+    # not written (<why>, N tokens): <reason> [<kind>]
+    NOT_WRITTEN = re.compile(r"conversation disk: not written \(([^,)]+), \d+ tokens\): (.*?)(?: \[([^\]]*)\])?$")
+    # read N tokens (R reused, live|checkpoint[, peer <owner>]) in T ms, ...; entries=E bytes=B
+    READ = re.compile(r"conversation disk: read (\d+) tokens \((\d+) reused, (live|checkpoint)[^)]*\) in ([\d.]+) ms"
+                      r".*?entries=(\d+) bytes=(\d+)")
+    PEER_IN_READ = re.compile(r", *peer ([A-Za-z0-9_.-]+)")
+    # cannot read a conversation (N tokens[, peer[ <owner>]]): <reason> [<kind>]  -- the engine's own line says
+    # ", peer" without the owner, so the marker alone is what makes a refusal a peer fallback
+    CANNOT_READ = re.compile(r"conversation disk: cannot read a conversation \(\d+ tokens(?:, peer(?: [A-Za-z0-9_.-]+)?)?\): "
+                             r"(.*?)(?: \[([^\]]*)\])?$")
+    PEER_MARK = re.compile(r"\([^)]*, peer(?: [A-Za-z0-9_.-]+)?\)")
+    # peer <owner> refreshed: A new, G gone, D damaged
+    PEER_REFRESH = re.compile(r"conversation disk: peer ([A-Za-z0-9_.-]+) refreshed: (\d+) new, (\d+) gone, (\d+) damaged")
+    # stats (<tag>) wrote=W read=R evictions=V skipped=S lease_conflicts=L overshoot=O entries=E bytes=B peer_read=PR
+    # peer_refresh=PF peer_entries=PE peer_bytes=PB
+    STATS = re.compile(r"conversation disk: stats \(([a-z-]+)\)(.*)$")
+    STATS_PAIR = re.compile(r"([a-z_]+)=([0-9]+)")
     READ_MAX = 1 << 20                                  # at most the last MiB of new lines per read
 
     def __init__(self):
@@ -842,7 +881,26 @@ class ConvCacheLog:
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
                       "last_tokens": None, "last_at": None,
-                      "disk_entries": 0, "disk_bytes": 0, "disk_writes": 0, "disk_reads": 0}
+                      # the disk tier of this replica (the "stats" line assigns these: cumulative, last one wins)
+                      "disk_owner": None, "last_stats_tag": None,
+                      "disk_entries": 0, "disk_bytes": 0, "disk_writes": 0, "disk_reads": 0,
+                      "disk_evictions": 0, "disk_write_failed": 0, "disk_read_failed": 0,
+                      "disk_write_failed_reasons": {}, "disk_read_failed_reasons": {},
+                      # per-event detail the "stats" line does not carry: milliseconds and tokens
+                      "disk_write_ms": 0.0, "disk_write_tokens": 0, "disk_read_ms": 0.0, "disk_read_tokens": 0,
+                      "disk_write_causes": {},
+                      "spills": 0, "spill_ms": 0.0, "spill_bytes": 0, "spill_failed": 0,
+                      "restore_ms": 0.0, "restore_tokens": 0, "restore_reused": 0, "restore_read": 0,
+                      # the peer writer directories of the other replicas (read only)
+                      "peer_tiers": 0, "peer_last_owner": None,
+                      "peer_refreshes": 0, "peer_new_entries": 0, "peer_gone_entries": 0, "peer_damaged_entries": 0,
+                      "peer_entries": 0, "peer_bytes": 0,
+                      "peer_reads": 0, "peer_misses": 0,
+                      "peer_fallbacks": 0, "peer_fallback_reasons": {},
+                      "peer_restore_ms": 0.0, "peer_restore_tokens": 0, "peer_restore_reused": 0,
+                      "peer_restore_read": 0,
+                      # leases (POSIX flock) of a snapshot another engine reads, and the budget a full tier keeps
+                      "lease_conflicts": 0, "evictions_skipped": 0, "budget_overshoot": 0}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
@@ -871,12 +929,8 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
-            if "conversation disk:" in line:
-                m = self.DISK.search(line)
-                if m:
-                    st = self.state
-                    st["disk_writes" if m.group(1) == "wrote" else "disk_reads"] += 1
-                    st["disk_entries"], st["disk_bytes"] = int(m.group(3)), int(m.group(4))
+            if "conversation disk:" in line:             # this replica's disk tier (writer, peers, leases)
+                self._disk_line(line)
                 continue
             if "conversation cache:" not in line:
                 continue
@@ -895,6 +949,123 @@ class ConvCacheLog:
                 self.state["parked"] = int(m.group(1))
         return dict(self.state)
 
+    @staticmethod
+    def _reason(text: str) -> str:
+        """A reason as one metric key ("max snapshot bytes" -> "max_snapshot_bytes"); it is printed, never invented."""
+        return re.sub(r"[^a-z0-9]+", "_", (text or "").strip().lower()).strip("_") or "other"
+
+    def _disk_line(self, line: str) -> None:
+        """One "conversation disk:" line: the tier's event lines, its open lines and its cumulative "stats" line."""
+        st = self.state
+        m = self.STATS.search(line)                      # cumulative counters: the last line wins, never add them up
+        if m:
+            st["last_stats_tag"] = m.group(1)
+            for key, raw in self.STATS_PAIR.findall(m.group(2)):
+                self._stats(key, int(raw))
+            return
+        m = self.WRITE.search(line)                      # one written snapshot (its milliseconds and tokens)
+        if m:
+            tokens, why, ms, entries, nbytes, evictions = m.groups()
+            st["disk_entries"], st["disk_bytes"] = int(entries), int(nbytes)
+            if evictions is not None:
+                st["disk_evictions"] = int(evictions)
+            st["disk_writes"] += 1                       # the next "stats" line sets the cumulative figure anyway
+            st["disk_write_tokens"] += int(tokens)
+            st["disk_write_ms"] += float(ms)
+            st["disk_write_causes"][why] = st["disk_write_causes"].get(why, 0) + 1
+            if why == "on-park":                         # a parked conversation published at once (spill-on-park)
+                st["spills"] += 1
+                st["spill_ms"] += float(ms)
+            return
+        m = self.NOT_WRITTEN.search(line)                # a write the tier refused (a threshold, a filesystem error)
+        if m:
+            why, reason, _kind = m.group(1).strip(), self._reason(m.group(2)), m.group(3)
+            st["disk_write_failed"] += 1
+            st["disk_write_failed_reasons"][reason] = st["disk_write_failed_reasons"].get(reason, 0) + 1
+            if why == "on-park":
+                st["spill_failed"] += 1
+            return
+        m = self.READ.search(line)                       # one read: this replica's own folder or a peer's
+        if m:
+            tokens, reused, _kind, ms, entries, nbytes = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+            st["disk_entries"], st["disk_bytes"] = int(entries), int(nbytes)
+            restored, reuse = int(tokens), int(reused)
+            peer = self.PEER_IN_READ.search(line)
+            st["disk_reads"] += 1
+            st["disk_read_tokens"] += restored
+            st["disk_read_ms"] += float(ms)
+            if peer:                                     # a neighbour's snapshot: its own figures, not the local ones
+                st["peer_last_owner"] = peer.group(1)
+                st["peer_reads"] += 1
+                st["peer_restore_ms"] += float(ms)
+                st["peer_restore_tokens"] += restored
+                st["peer_restore_reused"] += reuse
+                st["peer_restore_read"] += max(0, restored - reuse)
+            else:
+                st["restore_ms"] += float(ms)
+                st["restore_tokens"] += restored
+                st["restore_reused"] += reuse
+                st["restore_read"] += max(0, restored - reuse)
+            return
+        m = self.CANNOT_READ.search(line)                # a read that fell back (a peer one: fallback by reason)
+        if m:
+            reason = self._reason(m.group(1))
+            if self.PEER_MARK.search(line):
+                st["peer_fallbacks"] += 1
+                st["peer_fallback_reasons"][reason] = st["peer_fallback_reasons"].get(reason, 0) + 1
+            else:
+                st["disk_read_failed"] += 1
+                st["disk_read_failed_reasons"][reason] = st["disk_read_failed_reasons"].get(reason, 0) + 1
+            return
+        m = self.PEER_REFRESH.search(line)               # a peer folder that was really re-scanned and changed
+        if m:
+            st["peer_last_owner"] = m.group(1)
+            st["peer_refreshes"] += 1                     # the "stats" line sets the cumulative figure anyway
+            st["peer_new_entries"] += int(m.group(2))
+            st["peer_gone_entries"] += int(m.group(3))
+            st["peer_damaged_entries"] += int(m.group(4))
+            return
+        m = self.PEER_OPEN.search(line)                  # one read-only neighbour folder at start-up
+        if m:
+            st["peer_tiers"] += 1
+            st["peer_last_owner"] = m.group(2)
+            return
+        m = self.WRITER_OPEN.search(line)                # this replica's own folder at start-up
+        if m:
+            st["disk_owner"] = m.group(2)
+            return
+
+    def _stats(self, key: str, value: int) -> None:
+        """One "stats" pair: the cumulative figures the C++ side reports for this replica."""
+        st = self.state
+        if key == "wrote":
+            st["disk_writes"] = value
+        elif key == "read":
+            st["disk_reads"] = value
+        elif key == "evictions":
+            st["disk_evictions"] = value
+        elif key == "skipped":
+            st["evictions_skipped"] = value               # an eviction skipped: another engine holds the lease
+        elif key == "lease_conflicts":
+            st["lease_conflicts"] = value
+        elif key == "overshoot":
+            st["budget_overshoot"] = value                # 0/1: the budget is exceeded right now
+        elif key == "entries":
+            st["disk_entries"] = value
+        elif key == "bytes":
+            st["disk_bytes"] = value
+        elif key == "peer_read":
+            st["peer_reads"] = value
+        elif key == "peer_refresh":
+            st["peer_refreshes"] = value
+        elif key == "peer_entries":
+            st["peer_entries"] = value
+        elif key == "peer_bytes":
+            st["peer_bytes"] = value
+        elif key == "spill_bytes":                        # requested addition: bytes of the on-park images
+            st["spill_bytes"] = value
+        elif key == "peer_miss":                          # requested addition: peer lookups with no candidate
+            st["peer_misses"] = value
 
 def conversation_slots(engine) -> int | None:
     """How many conversations the engine's cache holds: its --conversation-cache-slots argument, which is known
@@ -920,6 +1091,61 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
             "reused_tokens": totals.get("reused", 0), "prompt_tokens": totals.get("prompt_tokens", 0),
             "last_reused": last.get("reused") if last else None,
             "last_prompt": last.get("prompt_tokens") if last else None}
+
+
+# What /metrics' "conversation_cache" held before stage 3: one engine, its own log.  With the opt-in replicas the new
+# counters live in each replica's row and in "total", so the old single-engine answer keeps exactly its own fields.
+CONV_CACHE_LEGACY_KEYS = ("parked", "bytes", "evictions", "parks", "restores", "last_event", "last_tokens",
+                          "last_at", "disk_entries", "disk_bytes", "disk_writes", "disk_reads")
+CONV_CACHE_FLOAT_KEYS = ("disk_write_ms", "disk_read_ms", "spill_ms", "restore_ms", "peer_restore_ms")
+CONV_CACHE_SUM_KEYS = ("parked", "bytes", "evictions", "parks", "restores",
+                       "disk_entries", "disk_bytes", "disk_writes", "disk_reads",
+                       "disk_evictions", "disk_write_tokens", "disk_read_tokens",
+                       "disk_write_failed", "disk_read_failed",
+                       "spills", "spill_bytes", "spill_failed",
+                       "restore_tokens", "restore_reused", "restore_read",
+                       "peer_refreshes", "peer_new_entries", "peer_gone_entries", "peer_damaged_entries",
+                       "peer_entries", "peer_bytes", "peer_reads", "peer_misses", "peer_fallbacks",
+                       "peer_restore_tokens", "peer_restore_reused", "peer_restore_read",
+                       "lease_conflicts", "evictions_skipped", "budget_overshoot",
+                       *CONV_CACHE_FLOAT_KEYS)
+CONV_CACHE_REASON_KEYS = ("disk_write_failed_reasons", "disk_read_failed_reasons", "peer_fallback_reasons")
+CONV_CACHE_TABLE_KEYS = ("disk_write_causes",)          # counts by cause: summed key by key
+
+
+def conv_cache_views(views: list[dict]) -> list[dict]:
+    """The per-replica rows of /metrics' and /v1/status' conversation cache: one ConvCacheLog's figures each."""
+    return [{"replica": k, **view} for k, view in enumerate(views)]
+
+
+def conv_cache_total(views: list[dict]) -> dict:
+    """The sum of the replicas' figures (counters and gauges added, the reason tables merged).  The single-replica
+    "last_*" values are not summed: each replica keeps its own in its row.  Never used as replica 0's numbers."""
+    total = {key: 0 for key in CONV_CACHE_SUM_KEYS}
+    total.update({key: {} for key in CONV_CACHE_REASON_KEYS + CONV_CACHE_TABLE_KEYS})
+    for view in views:
+        for key in CONV_CACHE_SUM_KEYS:
+            total[key] += view.get(key) or 0
+        for key in CONV_CACHE_REASON_KEYS + CONV_CACHE_TABLE_KEYS:
+            for reason, count in (view.get(key) or {}).items():
+                total[key][reason] = total[key].get(reason, 0) + count
+    for key in CONV_CACHE_FLOAT_KEYS:
+        total[key] = round(total[key], 3)
+    return total
+
+
+def replica_queue_view(rows: list[dict]) -> dict:
+    """The pull scheduler's ONE shared pending queue, from serve/replicas.py's replica_view(): every replica row carries
+    the same queue (depth, the oldest request's age, the last assignment's replica and reason, the decisions counted),
+    so it is reported once, not added up per replica.  The scheduler is opt-in: without it the figures are None."""
+    queues = [row["queue"] for row in rows if isinstance(row.get("queue"), dict)]
+    if not queues:
+        return {"depth": None, "oldest_s": None, "picked": None, "reason": None}
+    queue = queues[0]                                    # one queue for every replica: the same dict in each row
+    out = {key: queue.get(key) for key in ("depth", "oldest_s", "max", "timeout_s", "picked", "reason",
+                                           "assigned", "starved", "cancelled", "timed_out", "rejected")}
+    out["reachable"] = int(sum(1 for row in rows if row.get("alive")))
+    return out
 
 
 _BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
@@ -4895,6 +5121,11 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        # stage 3: one ConvCacheLog per replica (serve/replicas.py's ReplicaEngine: every engine has its own log),
+        # made here so that two monitor threads never make a second set; empty with a single engine
+        _engines = getattr(engine, "engines", None)
+        self.conv_logs: list[ConvCacheLog] = ([ConvCacheLog() for _ in _engines]
+                                              if isinstance(_engines, (list, tuple)) and len(_engines) > 1 else [])
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -5739,6 +5970,22 @@ class Service:
                     | {"wallclock_s": r.get("wallclock_s", round(time.perf_counter() - r["_clock"], 3))}
                     for r in reversed(records)]
 
+    def conv_cache_readings(self):
+        """(the engine's own conversation-cache figures, one set per replica or None, their sum or None).
+
+        One engine: its log, exactly as #596 read it.  The opt-in replicas (serve/replicas.py's ReplicaEngine): one
+        ConvCacheLog per engine and its OWN log (the ReplicaEngine's log_path is replica 0's only), so the figures are
+        reported per replica and summed; the first element is replica 0's, never the sum."""
+        engines = getattr(self.engine, "engines", None)
+        if not isinstance(engines, (list, tuple)) or len(engines) < 2:
+            return (self.conv_log.poll(getattr(self.engine, "log_path", None),
+                                       getattr(self.engine, "log_start", None)), None, None)
+        if len(self.conv_logs) != len(engines):
+            self.conv_logs = [ConvCacheLog() for _ in engines]
+        views = [log.poll(getattr(engine, "log_path", None), getattr(engine, "log_start", None))
+                 for engine, log in zip(engines, self.conv_logs)]
+        return views[0], views, conv_cache_total(views)
+
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
         the hardware (with a minute of history per series)."""
@@ -5792,9 +6039,27 @@ class Service:
         if getattr(self.vision, "cpu_note", None):         # the card had no room for the picture reader: the Terminal says so in its summary
             engine["vision_note"] = self.vision.cpu_note
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
+        parked, per_replica, cache_total = self.conv_cache_readings()
+        # The top-level card keeps exactly the fields it always had, and they are replica 0's (with one engine: the
+        # engine's own).  The stage-3 counters are only in "replicas" and "total", so r0 and the sum never mix.
+        parked = {key: parked.get(key) for key in CONV_CACHE_LEGACY_KEYS}
+        cache = conversation_cache_view(engine, hist, totals, parked)
+        if per_replica is not None:                        # opt-in replicas: each engine's own log, and their sum
+            cache["replicas"] = conv_cache_views(per_replica)   # (the fields above stay replica 0's, not the sum)
+            cache["total"] = cache_total
+            rows = live.get("replicas") or []
+            for row in rows:                               # the same figures next to each replica's state
+                k = row.get("replica")
+                if isinstance(k, int) and 0 <= k < len(per_replica):
+                    row["cache"] = per_replica[k]
+            live["replica_queue"] = replica_queue_view(rows)
+            if hasattr(self.engine, "pull_view"):           # "replica_pull": true - the one shared waiting queue
+                pull = self.engine.pull_view()
+                if pull.get("enabled"):
+                    live["replica_pull"] = pull
+                    live["replica_pending"] = int(pull.get("pending") or 0)
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
-                "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
+                "conversation_cache": cache,
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
@@ -5836,6 +6101,17 @@ class Service:
              t.get("tool_args_repaired", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
+        if hasattr(self.engine, "pull_view"):            # "replica_pull": true - the one shared waiting queue
+            pull = self.engine.pull_view()
+            if pull.get("enabled"):
+                rows += [("strata:replica_pull", "gauge", "1 while requests wait for a free replica", 1),
+                         ("strata:replica_pending", "gauge", "Requests waiting for a free replica", pull.get("pending") or 0),
+                         ("strata:replica_pending_oldest_s", "gauge", "Age of the oldest waiting request",
+                          pull.get("oldest_pending_s") or 0),
+                         ("strata:replica_pull_assigned_total", "counter", "Requests given a replica by the pull scheduler",
+                          pull.get("assigned") or 0),
+                         ("strata:replica_pull_starved_total", "counter", "Requests that went first after starving",
+                          pull.get("starved") or 0)]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
@@ -5855,7 +6131,7 @@ class Service:
 
         busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None
-        return {
+        out = {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
@@ -5883,6 +6159,19 @@ class Service:
                         "temp_c": hw.get("gpu_temp"), "power_w": hw.get("gpu_power")} if static.get("gpu_name") else None,
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+        engines = getattr(self.engine, "engines", None)
+        if isinstance(engines, (list, tuple)) and len(engines) > 1:   # opt-in replicas: per replica and summed
+            _, per_replica, cache_total = self.conv_cache_readings()
+            rows = self.engine.replica_view() if hasattr(self.engine, "replica_view") else []
+            out["replicas"] = rows
+            out["replica_queue"] = replica_queue_view(rows)
+            out["conversation_cache"] = {"replicas": conv_cache_views(per_replica), "total": cache_total}
+            if hasattr(self.engine, "pull_view"):          # "replica_pull": true - the one shared waiting queue
+                pull = self.engine.pull_view()
+                out["concurrency"].update(replica_pull=bool(pull.get("enabled")),
+                                          replica_pending=int(pull.get("pending") or 0),
+                                          replica_pending_oldest_s=pull.get("oldest_pending_s"))
+        return out
 
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
@@ -6701,7 +6990,9 @@ class Service:
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
-                                "drafts_accepted": last.get("drafts_accepted")})
+                                "drafts_accepted": last.get("drafts_accepted"),
+                                # the replica this request ran on (None: one engine, or the pull scheduler is off)
+                                "replica": getattr(cancel, "_strata_replica", None)})
                             if not admission_rejected:                  # #3040: a refused admission did no work
                                 t = self.totals
                                 t["requests"] += 1
@@ -9562,12 +9853,244 @@ def start_engine_or_fallback(cfg: dict, exe: str, effort_end: list[str] | None, 
     return engine
 
 
+# ------------------------------------------------------- stage 3: the run config's replica_handoff (peer storage)
+# One block in the run config, off by default (no block: nothing changes).  start_replicas writes each replica's own
+# writer directory and its read-only neighbour directories; the engine flags are the documented --conversation-cache-*
+# ones of #5835 and of the handoff prototype (see the block's keys below).
+REPLICA_HANDOFF_KEYS = ("enabled", "dir", "spill", "min_tokens", "min_gain", "disk_gib_per_replica",
+                        "max_snapshot_mib", "min_free_mib", "refresh_ms")
+REPLICA_HANDOFF_MIN_GAIN = 4096      # what --conversation-cache-disk-min-gain defaults to without the key
+REPLICA_HANDOFF_REFRESH_MS = 250    # the prototype's start value for --conversation-cache-refresh-ms
+
+
+class ReplicaHandoffConfigError(ValueError):
+    """The run config's "replica_handoff" block cannot be used as written: the start says why (never a silent
+    fallback to no handoff)."""
+
+
+def _handoff_whole(block: dict, key: str, *, lo: int, default=None):
+    """The block's whole number `key` (>= lo), `default` when it is absent; anything else is a start error."""
+    value = block.get(key, default)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < lo:
+        raise ReplicaHandoffConfigError(f'replica_handoff: "{key}" must be a whole number >= {lo}, not {value!r}')
+    return value
+
+
+def _handoff_root(block: dict) -> str:
+    """The store root: an absolute path (each engine gets <root>/rN; a relative one would mean a different directory
+    in the server and in the engines)."""
+    value = block.get("dir")
+    if value is None:
+        raise ReplicaHandoffConfigError('replica_handoff: "enabled": true needs "dir", the store root for the replica '
+                                        'directories (a local NVMe path, for example "/srv/strata-handoff")')
+    if not isinstance(value, str) or not value.strip():
+        raise ReplicaHandoffConfigError(f'replica_handoff: "dir" must be a directory path, not {value!r}')
+    path = os.path.expanduser(value.strip())
+    if any(ord(c) < 32 for c in path):
+        raise ReplicaHandoffConfigError('replica_handoff: "dir" must not contain control characters')
+    if not os.path.isabs(path):
+        raise ReplicaHandoffConfigError(f'replica_handoff: "dir" must be an absolute path, not {value!r} '
+                                        f'(each engine gets <dir>/rN)')
+    return os.path.normpath(path)
+
+
+def read_replica_handoff(cfg: dict) -> dict | None:
+    """The checked run config's "replica_handoff" block with its defaults filled in; None when it is off (no block, or
+    "enabled": false - the default).  Raises ReplicaHandoffConfigError for a block that cannot be used."""
+    block = cfg.get("replica_handoff")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ReplicaHandoffConfigError(f'"replica_handoff" must be an object (a block of keys), not {block!r}')
+    enabled = block.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ReplicaHandoffConfigError(f'replica_handoff: "enabled" must be true or false, not {enabled!r}')
+    if not enabled:                                     # off by default: the rest of the block is not read
+        return None
+    unknown = sorted(key for key in block if key not in REPLICA_HANDOFF_KEYS)
+    if unknown:
+        raise ReplicaHandoffConfigError('replica_handoff: unknown key(s) ' + ", ".join(repr(k) for k in unknown) +
+                                        '; the block takes ' + ", ".join(REPLICA_HANDOFF_KEYS))
+    spill = block.get("spill")
+    if spill is not None and spill != "on-park":
+        raise ReplicaHandoffConfigError(f'replica_handoff: "spill" must be "on-park" (publish the parked conversation '
+                                        f'at once) or left out, not {spill!r}')
+    root = _handoff_root(block)
+    disk_gib = block.get("disk_gib_per_replica")
+    if disk_gib is None:
+        raise ReplicaHandoffConfigError('replica_handoff: "enabled": true needs "disk_gib_per_replica", the byte budget '
+                                        'of each replica\'s writer directory (16 GiB in the prototype\'s start config)')
+    return {"dir": root,
+            "spill": "on-park" if spill is not None else None,
+            "min_tokens": _handoff_whole(block, "min_tokens", lo=0),
+            "min_gain": _handoff_whole(block, "min_gain", lo=0, default=REPLICA_HANDOFF_MIN_GAIN),
+            "disk_gib_per_replica": _handoff_whole(block, "disk_gib_per_replica", lo=1),
+            "max_snapshot_mib": _handoff_whole(block, "max_snapshot_mib", lo=1),
+            "min_free_mib": _handoff_whole(block, "min_free_mib", lo=0),
+            "refresh_ms": _handoff_whole(block, "refresh_ms", lo=0, default=REPLICA_HANDOFF_REFRESH_MS)}
+
+
+def replica_engine_args(cfg: dict, i: int) -> list[str]:
+    """The engine arguments replica i is started with before the handoff's own: the config's "args", the replica
+    entry's "args" (serve/replicas.py replica_cfg appends them) and the person's "user_args" on top, as engine_args
+    merges them.  Read only: the start builds the real list itself."""
+    spec = cfg.get("replicas")
+    entry = spec[i] if isinstance(spec, list) and i < len(spec) and isinstance(spec[i], dict) else {}
+    args = [str(a) for a in (cfg.get("args") or [])]
+    args += [str(a) for a in (entry.get("args") or [])]
+    if cfg.get("user_args"):
+        args = user_args.merge(args, cfg["user_args"])
+    return args
+
+
+def _flag_value(args: list[str], flag: str) -> str | None:
+    """The value of `flag` in argv: None when it is not there, "" when it has no value."""
+    for i, arg in enumerate(args):
+        if arg == flag and i + 1 < len(args):
+            return str(args[i + 1])
+        if isinstance(arg, str) and arg.startswith(flag + "="):
+            return arg[len(flag) + 1:]
+    return "" if flag in args else None
+
+
+def _handoff_batch_problem(cfg: dict, n: int) -> str | None:
+    """Why batch slots are on (the handoff's MVP runs one request per replica), or None."""
+    parallel = cfg.get("parallel")
+    if isinstance(parallel, int) and not isinstance(parallel, bool) and parallel > 1:
+        return f'"parallel": {parallel}'
+    for i in range(n):
+        args = replica_engine_args(cfg, i)
+        for flag in ("--batch", "--slots", "--parallel"):
+            value = _flag_value(args, flag)
+            if value is not None and value.strip().isdigit() and int(value) > 1:
+                return f'{flag} {value} (replica {i})'
+    return None
+
+
+def replica_handoff_plan(cfg: dict, groups: list[list[int]], *, posix: bool | None = None) -> dict | None:
+    """The validated handoff plan of this start (None: the block is off, nothing changes), or a
+    ReplicaHandoffConfigError that names what to fix.  The prototype's rules: two or more replicas, one request each
+    (no batch slots), POSIX (flock leases), no hand-written --conversation-cache-dir/peer-dir in the engine args, and
+    each replica with its own writer directory."""
+    plan = read_replica_handoff(cfg)
+    if plan is None:
+        return None
+    n = len(groups)
+    if n < 2:
+        raise ReplicaHandoffConfigError(f'replica_handoff needs "replicas" 2 or more: every engine writes its own '
+                                        f'directory and reads its neighbours\'; this start has {n}')
+    if not (os.name == "posix" if posix is None else posix):
+        raise ReplicaHandoffConfigError("replica_handoff is POSIX only (the snapshots are leased with flock): Windows "
+                                        "has no peer mode, turn the block off there")
+    batch = _handoff_batch_problem(cfg, n)
+    if batch:
+        raise ReplicaHandoffConfigError(f"replica_handoff does not run with batch slots ({batch}); a replica takes one "
+                                        "request at a time in this prototype, remove --parallel/--batch/--slots")
+    writer_dirs, peer_dirs = {}, []
+    for i in range(n):
+        args = replica_engine_args(cfg, i)
+        value = _flag_value(args, "--conversation-cache-dir")
+        if value is not None:
+            writer_dirs.setdefault(value, []).append(i)
+        value = _flag_value(args, "--conversation-cache-peer-dir")
+        if value is not None:
+            peer_dirs.append((i, value))
+    shared = [(value, replicas) for value, replicas in writer_dirs.items() if len(replicas) > 1]
+    if shared:
+        value, replicas = shared[0]
+        raise ReplicaHandoffConfigError(f'replica_handoff: replicas {", ".join(map(str, replicas))} would write to the '
+                                        f'same --conversation-cache-dir {value!r}; the handoff gives each replica '
+                                        f'its own "{plan["dir"]}/rN" and a neighbour\'s is read-only')
+    if writer_dirs:
+        value, replicas = next(iter(writer_dirs.items()))
+        raise ReplicaHandoffConfigError(f'replica_handoff: replica {replicas[0]} already has its own '
+                                        f'--conversation-cache-dir {value!r} in the engine args; the block writes the '
+                                        f'writer and peer directories itself, remove it from "args"/"user_args"')
+    if peer_dirs:
+        i, value = peer_dirs[0]
+        raise ReplicaHandoffConfigError(f'replica_handoff: replica {i} already has its own --conversation-cache-peer-dir '
+                                        f'{value!r} in the engine args; the block writes one peer directory per '
+                                        f'neighbour itself, remove it from "args"/"user_args"')
+    plan["replicas"] = n
+    return plan
+
+
+def replica_handoff_args(plan: dict, i: int, n: int | None = None) -> list[str]:
+    """The handoff options of replica i: its own writer directory, exactly one read-only peer directory per neighbour,
+    its owner name, the budgets of the prototype's start config, and the optional thresholds it was given."""
+    n = plan["replicas"] if n is None else n
+    root = plan["dir"]
+    args = ["--conversation-cache-dir", os.path.join(root, f"r{i}")]
+    for j in range(n):
+        if j != i:
+            args += ["--conversation-cache-peer-dir", os.path.join(root, f"r{j}")]
+    args += ["--conversation-cache-owner", f"r{i}",
+             "--conversation-cache-disk-gib", str(plan["disk_gib_per_replica"]),
+             "--conversation-cache-disk-min-gain", str(plan["min_gain"]),
+             "--conversation-cache-refresh-ms", str(plan["refresh_ms"])]
+    if plan.get("spill") == "on-park":
+        args.append("--conversation-cache-spill-on-park")
+    for key, flag in (("min_tokens", "--conversation-cache-min-tokens"),
+                      ("max_snapshot_mib", "--conversation-cache-max-snapshot-mib"),
+                      ("min_free_mib", "--conversation-cache-min-free-mib")):
+        if plan.get(key) is not None:
+            args += [flag, str(plan[key])]
+    return args
+
+
+def ensure_replica_handoff_dirs(plan: dict) -> list[str]:
+    """<dir> and <dir>/rN, created private to this user (0700) before any engine starts: the store holds snapshots of
+    conversations.  Returns the replica directories; an unusable path is a start error, not a quiet downgrade."""
+    root = plan["dir"]
+    try:
+        made_root = not os.path.isdir(root)
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        if made_root:
+            os.chmod(root, 0o700)
+        paths = []
+        for i in range(plan["replicas"]):
+            path = os.path.join(root, f"r{i}")
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            os.chmod(path, 0o700)                        # an existing rN is ours too: the engines must not share it
+            paths.append(path)
+        return paths
+    except OSError as e:
+        raise ReplicaHandoffConfigError(f"replica_handoff: cannot create the store directories under {root!r}: {e}") \
+            from None
+
+
+def replica_handoff_note(plan: dict) -> str:
+    """The one start-up line of an enabled handoff: where the store is, how many replicas, their GiB, and whether a
+    parked conversation is published at once."""
+    n = plan["replicas"]
+    spill = ", spill on park" if plan.get("spill") == "on-park" else ""
+    return (f"replica handoff: {n} replicas, {plan['dir']} (r0..r{n - 1}), {plan['disk_gib_per_replica']} GiB per "
+            f"replica{spill}; a parked conversation is written to its own directory and a neighbour can restore it")
+
+
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
-                   *, offline: bool = False):
+                   *, offline: bool = False, handoff: dict | None = None, pull=None):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
-    and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
+    and CPU cores, started together; the ReplicaEngine in front spreads the requests.
+
+    With the run config's "replica_handoff" block (stage 3) each engine also gets its own writer directory under the
+    block's "dir", a read-only peer directory per neighbour, and the handoff flags; the directories are created 0700
+    before the engines start.  `handoff` is the already validated replica_handoff_plan (the caller checked it before
+    the minutes-long start); None means "work it out here".
+
+    With "replica_pull": true (serve/replicas.py's pull scheduler) the ReplicaEngine is built with its validated
+    PullSettings (`pull`, from rp.pull_config): a request then waits in one shared queue for a free replica instead of
+    being pinned to one on arrival.  The engines' real batch slots are checked once they are up (the MVP pulls one
+    request into one engine): batch slots close them with a start error rather than silently not pulling."""
     from serve import replicas as rp
     n = len(groups)
+    plan = handoff if handoff is not None else replica_handoff_plan(cfg, groups)
+    pull = rp.pull_config(cfg) if pull is None else pull
+    if plan is not None:
+        ensure_replica_handoff_dirs(plan)
+        print(f"[strata] {replica_handoff_note(plan)}", flush=True)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
@@ -9580,6 +10103,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
+        if plan is not None:                         # stage 3: this replica's writer dir, its peers, its budgets
+            rc["args"] = list(rc["args"]) + replica_handoff_args(plan, i, n)
         if arena:
             rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
         try:
@@ -9621,10 +10146,35 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         if arena:       # a shared arena that could not be made (no room in /dev/shm, a file of another pack): as before
             print(f"[strata] replica {i} did not start with the shared expert arena ({e}); starting every replica with "
                   "its own copy of the experts instead", flush=True)
-            return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline)
+            return start_replicas({**cfg, "replica_shared_arena": False}, groups, exe, effort_end, lazy, offline=offline,
+                                  handoff=plan, pull=pull)
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
+    if pull is not None and pull.enabled:
+        # the authoritative check: the engines may have been started with --batch in their own args, whatever the
+        # config said (a lazy start reports 0 until READY, where rp.pull_config already refused a configured count)
+        slots = sorted((k, int(getattr(engine, "batch", 0) or 0)) for k, engine in enumerate(engines))
+        busy = [(k, n) for k, n in slots if n]
+        if busy:
+            for engine in engines:
+                try:
+                    engine.close()
+                except Exception:        # noqa: BLE001
+                    pass
+            rp.remove_arena(arena)
+            k, n = busy[0]
+            raise SystemExit(f'[strata] config "replica_pull" does not support batch slots (replica {k} reports {n}): '
+                             'run the replicas one request at a time ("parallel": 1, no --batch/--slots)')
+        timeout = "off" if pull.queue_timeout_s is None else f"{pull.queue_timeout_s:g} s"
+        queue = "unbounded" if pull.max_queue is None else f"at most {pull.max_queue}"
+        print(f"[strata] replica pull: a request takes a free card at once, or waits in one shared queue for the one "
+              f"that would re-read the least of its prompt (starve {pull.starve_s:g} s, queue timeout {timeout}, "
+              f"{queue} waiting)", flush=True)
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
-    eng = rp.ReplicaEngine(engines, load_tokens=load)
+    if pull is not None and pull.enabled:
+        eng = rp.ReplicaEngine(engines, load_tokens=load, pull=True, starve_s=pull.starve_s,
+                               queue_timeout_s=pull.queue_timeout_s, max_queue=pull.max_queue)
+    else:
+        eng = rp.ReplicaEngine(engines, load_tokens=load)
     if arena:
         eng.__dict__["arena_file"] = arena
         import atexit
@@ -10265,8 +10815,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 split_mod.check_cfg(cfg, split)
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        try:                                            # stage 3: said before the engines start, never a silent fallback
+            handoff = replica_handoff_plan(cfg, groups)
+        except ReplicaHandoffConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
+        try:                                            # the pull scheduler's own config is checked by its module
+            pull = rp.pull_config(cfg)
+        except rp.ReplicaConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
         if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
+            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline, handoff=handoff,
+                                    pull=pull)
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
