@@ -1095,6 +1095,9 @@ struct Options {
     /// --conversation-cache-refresh-ms: a peer re-scans the other engine's folder at most this often (an on-demand
     /// re-scan after a match miss ignores the interval)
     int64_t conversation_cache_refresh_ms = 250;
+    /// --conversation-cache-allow-unsafe-fs: start on a network (NFS/CIFS) or FUSE folder anyway.  The store relies on
+    /// flock, atomic rename and modification times, which mean something else there: experiments only.
+    bool conversation_cache_allow_unsafe_fs = false;
     /// --conversation-cache-spill-on-park (opt-in, --serve): publish a parked conversation to the disk folder at the
     /// park itself, so a peer can pick it up the moment this engine switches to another conversation.  The eviction
     /// and idle writers keep working; an image the disk already holds is not written again.
@@ -1301,6 +1304,8 @@ void usage() {
                  "  --conversation-cache-max-snapshot-mib N  --serve: the largest conversation written or read (default 8192)\n"
                  "  --conversation-cache-refresh-ms N  --serve: how often a peer re-scans the other engine's folder\n"
                  "                       (default 250)\n"
+                 "  --conversation-cache-allow-unsafe-fs  --serve: start on a network or FUSE folder anyway (the store\n"
+                 "                       relies on flock and atomic rename: experiments only)\n"
                  "  --conversation-cache-spill-on-park  --serve: write every parked conversation to the disk at the park\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
@@ -3930,6 +3935,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-peer-dir")
             o.conversation_cache_peer_dirs.push_back(next("--conversation-cache-peer-dir"));
         else if (a == "--conversation-cache-owner") o.conversation_cache_owner = next("--conversation-cache-owner");
+        else if (a == "--conversation-cache-allow-unsafe-fs") o.conversation_cache_allow_unsafe_fs = true;
         else if (a == "--conversation-cache-spill-on-park") o.conversation_cache_spill_on_park = true;
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -13390,7 +13396,15 @@ int main(int argc, char** argv) {
                     ++evicted;
                     fits = admit();
                 }
-                if (!fits) {
+                if (!fits && o.conversation_cache_spill_on_park && disk_spill_direct && !disk_only) {
+                    // --conversation-cache-spill-on-park: a snapshot the physical-RAM floor refuses is still worth its
+                    // disk copy - the alternative is reading the whole prompt again on the next turn; capture it for
+                    // the disk only (the direct path below: the image lives for the write and is freed)
+                    disk_only = true;
+                    std::fprintf(stderr, "strata serve: conversation cache: the RAM floor refuses this snapshot (%zu MiB "
+                                         "plus a %lld MiB floor, %s); writing it to disk\n", additional >> 20,
+                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str());
+                } else if (!fits) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
@@ -13587,6 +13601,7 @@ int main(int argc, char** argv) {
             dopt.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
             dopt.max_snapshot_bytes = (uint64_t) o.conversation_cache_max_snapshot_mib << 20;
             dopt.refresh_ms = o.conversation_cache_refresh_ms;
+            dopt.allow_unsafe_fs = o.conversation_cache_allow_unsafe_fs;
             bool have_id = conversations.enabled();
             if (!have_id) e = "the conversation cache is off (--conversation-cache-mib, --conversation-cache-slots, --prompt-cache)";
             try {
@@ -13617,6 +13632,9 @@ int main(int argc, char** argv) {
                                      conv_disk.owner().c_str(), rep.kept, (double) conv_disk.bytes() / (1ull << 30),
                                      (long long) o.conversation_cache_disk_gib, rep.dropped, rep.orphans,
                                      rep.other_folders, (double) rep.other_bytes / (1ull << 30));
+                        if (rep.tmpfs)
+                            std::fprintf(stderr, "strata serve: conversation disk: the folder is a tmpfs: a restore "
+                                                 "materialises the image in RAM, so a tmpfs keeps a second copy\n");
                         disk_spill_direct = [&](const strata::core::SavedConversation& image, const char* why) -> uint64_t {
                             return disk_spill(image, why);
                         };

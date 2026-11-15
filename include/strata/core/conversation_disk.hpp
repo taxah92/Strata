@@ -59,6 +59,7 @@ struct ConversationDiskOptions {
     uint64_t max_snapshot_bytes = 0; ///< --conversation-cache-max-snapshot-mib: a larger conversation is refused, 0 = no limit
     int64_t refresh_ms = 250;        ///< peer: the least interval between two automatic re-scans (an on-demand one ignores it)
     bool durable = true;             ///< flush each file and the folder (crash safety); off only in tests
+    bool allow_unsafe_fs = false;    ///< --conversation-cache-allow-unsafe-fs: start on a network or FUSE folder anyway
 };
 
 /// One point a request can resume from: the conversation's live end or one of its checkpoints.
@@ -124,6 +125,7 @@ public:
         size_t kept = 0, dropped = 0, orphans = 0;   ///< index files taken, refused and stray files removed
         size_t other_folders = 0;                    ///< subfolders of other identities or layouts, left alone
         uint64_t other_bytes = 0;
+        bool tmpfs = false;                          ///< the folder is a tmpfs: a restore adds a second RAM copy (warned)
     };
     struct RefreshReport {
         size_t added = 0, gone = 0, damaged = 0;   ///< entries new to the local index, disappeared, unreadable (kept on disk)

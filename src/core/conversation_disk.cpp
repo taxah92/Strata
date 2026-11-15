@@ -20,6 +20,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 #endif
 
@@ -241,6 +242,26 @@ bool ends_with(const std::string& s, const char* suffix) {
     const size_t n = std::strlen(suffix);
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
+
+// The store must be a local filesystem: NFS and CIFS have other flock, rename and mtime semantics, so a folder
+// there would fail in ways the engineering does not promise.  A tmpfs is allowed but reported (a restore
+// materialises the image in RAM, so tmpfs adds a second copy).
+enum class FsKind { local, network, fuse, tmpfs };
+FsKind filesystem_kind(const std::string& dir) {
+#ifndef _WIN32
+    struct statfs st{};
+    if (::statfs(dir.c_str(), &st) != 0) return FsKind::local;   // no answer: let the open decide
+    const uint64_t t = (uint64_t) st.f_type;
+    if (t == 0x6969ull || t == 0xff534d42ull || t == 0x517bull) return FsKind::network;   // NFS, CIFS, SMB (old)
+    if (t == 0xfe534d42ull) return FsKind::network;                                     // SMB2
+    if (t == 0x65735546ull) return FsKind::fuse;
+    if (t == 0x01021994ull) return FsKind::tmpfs;
+    return FsKind::local;
+#else
+    (void) dir;
+    return FsKind::local;
+#endif
+}
 } // namespace
 
 uint64_t ConversationDiskLayout::key() const {
@@ -392,6 +413,12 @@ bool ConversationDiskTier::open_impl(const ConversationDiskOptions& options, con
             error = "conversation disk: the peer folder is not there: " + options.dir;
             return false;
         }
+        const FsKind kind = filesystem_kind(options.dir);
+        if ((kind == FsKind::network || kind == FsKind::fuse) && !options_.allow_unsafe_fs) {
+            error = "conversation disk: the peer folder " + options.dir + " is not a local filesystem; a read-only "
+                    "peer of a network folder is not supported (--conversation-cache-allow-unsafe-fs overrides this)";
+            return false;
+        }
         open_ = true;
         leaf_seen_ = fs::is_directory(folder_, ec);
         if (leaf_seen_) {
@@ -411,6 +438,18 @@ bool ConversationDiskTier::open_impl(const ConversationDiskOptions& options, con
     }
 #ifndef _WIN32
     fs::permissions(writer_dir_, fs::perms::owner_all, fs::perm_options::replace, ec);   // 0700: the user's own state
+#endif
+    {
+        const FsKind kind = filesystem_kind(writer_dir_);
+        if ((kind == FsKind::network || kind == FsKind::fuse) && !options_.allow_unsafe_fs) {
+            error = "conversation disk: " + writer_dir_ + " is not a local filesystem (flock, atomic rename and "
+                    "modification times mean something else there); put the folder on a local SSD, or start with "
+                    "--conversation-cache-allow-unsafe-fs to try";
+            return false;
+        }
+        if (kind == FsKind::tmpfs && report) report->tmpfs = true;
+    }
+#ifndef _WIN32
     {
         // one writer per folder for its whole lifetime: a second engine is refused instead of cleaning up under the first
         HeldLock lifetime;
