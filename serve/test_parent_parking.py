@@ -365,6 +365,37 @@ class ParentParkingProtocol(StoreCase):
         self.assertEqual(r0.abort(other, begin4["pending_id"])["gone"], True)
         self.assertEqual(r0.abort(publish_id, begin1["pending_id"])["gone"], True)
 
+    def test_a_repeated_commit_does_not_claim_an_entry_that_is_gone(self):
+        """A lost COMMIT answer is retried; the retry must not report a park that no reader can find."""
+        self.make_store()
+        r0 = self.client("r0")
+        publish_id = "e" * 32
+        _pid, begin, fds = r0.begin(POINTS_A, [100], publish_id=publish_id)
+        for fd in fds:
+            os.pwrite(fd, b"x" * 100, 0)
+            os.close(fd)
+        entry = r0.commit(publish_id, begin["pending_id"], [100])
+        self.assertEqual(self.store.clear("nonfinite"), 1)
+        self.assert_error(r0, pp.OP_PARK_COMMIT,
+                          {"publish_id": publish_id, "pending_id": begin["pending_id"], "written_bytes": [100],
+                           "epoch": self.store.snapshot()["store_epoch"]}, "gone")
+        self.assertEqual(r0.ping()["epoch"], 2)                         # the channel stays open
+
+    def test_a_repeated_commit_after_an_eviction_says_gone(self):
+        self.make_store(capacity_bytes=100)
+        r0 = self.client("r0")
+        first = "f" * 32
+        _pid, begin, fds = r0.begin(POINTS_A, [100], publish_id=first)
+        for fd in fds:
+            os.pwrite(fd, b"x" * 100, 0)
+            os.close(fd)
+        entry = r0.commit(first, begin["pending_id"], [100])
+        _pid, e2 = r0.publish(POINTS_B, [100])                          # evicts the first entry
+        self.assertNotEqual(e2["id"], entry["id"])
+        self.assert_error(r0, pp.OP_PARK_COMMIT,
+                          {"publish_id": first, "pending_id": begin["pending_id"], "written_bytes": [100],
+                           "epoch": 1}, "gone")
+
     def test_conflicting_publish_id_is_rejected(self):
         self.make_store()
         r0 = self.client("r0")

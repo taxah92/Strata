@@ -16340,7 +16340,9 @@ int main(int argc, char** argv) {
         // or the engine.
         auto park_slot = [&](int b) {
             BSlot& sl = bs[(size_t) b];
-            if (!conversations.enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
+            // parking is on when either the local cache or the server's store is (the store's budget is the only one
+            // in parent mode, and the local cache's holds/supersedes_richer checks below are then trivially false)
+            if (!parking_enabled() || sl.active || !sl.cached || sl.img || sl.ids.empty()) return;
             auto prefix_of = [&](const std::vector<int32_t>& whole) {
                 return whole.size() >= sl.ids.size() && std::equal(sl.ids.begin(), sl.ids.end(), whole.begin());
             };

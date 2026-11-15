@@ -211,6 +211,42 @@ for the next model, and explains a failed start on a card that is taken. Two mod
 Both loaded (33 s and 59 s with the files cached, 114 s the first time) and answered chats at about 60 tokens/s each. Unloading
 one left the other answering. The same app code drives NVIDIA cards, but two models on two NVIDIA cards were not run.
 
+## Two independent engines (replicas) and one shared parking store
+
+The other way to use several cards is **data-parallel replicas**: two or more independent engines, each on its own
+group of cards, behind the one server. A model that fits two cards runs better as two 2-card engines than as one
+4-card layer split, because the split runs one pipeline whose stages wait on each other while two replicas run two
+pipelines. In the run config:
+
+```json
+"replicas": 2,
+"replica_pull": true,
+"replica_parent_parking": {"enabled": true, "ram_gib": 40, "max_entries": 20}
+```
+
+`"replicas"` cuts the `"gpu"` list into groups (or names them: `[{"gpus": [0, 1]}, {"gpus": [2, 3]}]`). Each engine
+keeps its own copy of the experts in RAM unless `"replica_shared_arena": true` backs them with one shared memory
+object. `"replica_pull"` puts a request that finds every replica busy into one shared queue instead of pinning it to a
+card before that card has a free slot.
+
+**Parking across replicas.** `--conversation-cache-mib` parks a conversation in the RAM of the engine that served it,
+so a request the pull scheduler moves to the other card reads its whole prompt again. Two opt-in modes fix that:
+
+- `"replica_handoff"` writes the parked conversation to a local NVMe folder that the other replica reads read-only.
+  It survives an engine restart and a server restart. See [CONVERSATION_CACHE_DISK.md](CONVERSATION_CACHE_DISK.md).
+- `"replica_parent_parking"` keeps **one RAM copy for the whole server**, in the server process, and hands the engines
+  sealed memory descriptors. No file is written anywhere; the snapshots survive a replica restart but not a server
+  restart. See [CONVERSATION_PARENT_PARKING.md](CONVERSATION_PARENT_PARKING.md).
+
+The two modes are alternatives for the same job and cannot be on at the same time. Both need `"replica_pull": true`
+and one request per replica (no batch slots).
+
+**Measured on:** the disk handoff, on the two V100 cards of the development host, Qwen3.8-Flash-Next: a conversation
+parked on one card was restored on the other in 676 ms (28 181 of 28 585 tokens reused) instead of reading the prompt
+again; the three-arm A/B was 11.15 s baseline, 20.94 s pull-only, 10.10 s pull plus handoff (p50 7.12 / 7.37 / 6.33 s).
+The parent parking mode has **not been run on a GPU yet**: its evidence so far is the CPU test suites and a compile for
+CUDA sm_89 and sm_70.
+
 ## Small cards: what a split gives up when it is short of memory
 
 Two 8 GB cards used to stop at the start ("expert cache: no room", "the GPU has too little free VRAM for the prompt path"): every card loads a copy of the

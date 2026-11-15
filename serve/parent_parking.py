@@ -1254,9 +1254,14 @@ class ParentParkingStore:
             raise _RequestError("stale_epoch", "the store has another epoch")
         committed = self._committed_by_publish.get(publish_id)
         if committed is not None:
-            return OP_PARK_COMMIT, {"id": committed[0], "generation": committed[1], "entry_bytes": committed[2],
-                                    "dedup": False, "entries": len(self._entries), "bytes": self._entry_bytes,
-                                    "evictions": 0, "superseded": 0}, []
+            # the answer is repeated only while the entry it names is still there: an entry evicted or cleared since
+            # must not be reported as published (the engine would log a park that no reader can find)
+            if committed[0] in self._entries:
+                return OP_PARK_COMMIT, {"id": committed[0], "generation": committed[1], "entry_bytes": committed[2],
+                                        "dedup": False, "entries": len(self._entries), "bytes": self._entry_bytes,
+                                        "evictions": 0, "superseded": 0}, []
+            self._committed_by_publish.pop(publish_id, None)
+            raise _RequestError("gone", "the entry this publish id named is gone")
         pending = self._pending.get(pending_id)
         if pending is None or pending.conn is not conn or pending.publish_id != publish_id:
             raise _RequestError("gone", "no such pending publish")
@@ -1646,6 +1651,8 @@ class ParentParkingStore:
             self._matches.pop(cookie, None)
             if match.conn.match == cookie:
                 match.conn.match = None
+        # a publish id must not answer for an entry this clear removed: a repeated COMMIT after it has to say gone
+        self._committed_by_publish.clear()
         self._store_epoch += 1
         self._clears += 1
         return cleared
