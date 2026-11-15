@@ -1095,6 +1095,10 @@ struct Options {
     /// --conversation-cache-refresh-ms: a peer re-scans the other engine's folder at most this often (an on-demand
     /// re-scan after a match miss ignores the interval)
     int64_t conversation_cache_refresh_ms = 250;
+    /// --conversation-cache-spill-on-park (opt-in, --serve): publish a parked conversation to the disk folder at the
+    /// park itself, so a peer can pick it up the moment this engine switches to another conversation.  The eviction
+    /// and idle writers keep working; an image the disk already holds is not written again.
+    bool conversation_cache_spill_on_park = false;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -1297,6 +1301,7 @@ void usage() {
                  "  --conversation-cache-max-snapshot-mib N  --serve: the largest conversation written or read (default 8192)\n"
                  "  --conversation-cache-refresh-ms N  --serve: how often a peer re-scans the other engine's folder\n"
                  "                       (default 250)\n"
+                 "  --conversation-cache-spill-on-park  --serve: write every parked conversation to the disk at the park\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
@@ -3925,6 +3930,7 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-peer-dir")
             o.conversation_cache_peer_dirs.push_back(next("--conversation-cache-peer-dir"));
         else if (a == "--conversation-cache-owner") o.conversation_cache_owner = next("--conversation-cache-owner");
+        else if (a == "--conversation-cache-spill-on-park") o.conversation_cache_spill_on_park = true;
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-cache-park-gain" || a == "--conversation-cache-disk-gib" ||
@@ -13454,6 +13460,11 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // --conversation-cache-spill-on-park: publish the parked conversation to this engine's folder now, so a
+                // peer can restore it the moment this engine switches to another one.  spill() finds a copy it already
+                // holds (holding) and does not write it again.  A park the RAM cache refuses right below keeps this
+                // copy: the next turn reads it back instead of reading its prompt again.
+                if (o.conversation_cache_spill_on_park && disk_spill_direct) (void) disk_spill_direct(image, "on-park");
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens%s in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
