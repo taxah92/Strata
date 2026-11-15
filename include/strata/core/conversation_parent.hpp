@@ -57,6 +57,7 @@ struct ParentCandidate {
     bool live = false, borrow = false;
     std::vector<uint64_t> stage_bytes;
     uint64_t read_charge_bytes = 0;
+    std::string owner;   // the replica that published it ("r0".."rN"): the log says whose conversation this is
 };
 
 // The store's counters (the plan's §14.2 snapshot).  The engine reads them for its own log line and for
@@ -154,6 +155,10 @@ public:
     const std::string& owner() const { return identity_.owner; }
     uint64_t epoch() const { return epoch_; }
     int timeout_ms() const { return timeout_ms_; }
+    // The last failure's protocol code ("gone", "stale_generation", "capacity", "stale_epoch", ...), empty when the
+    // last call succeeded or the failure was local (a timeout, a closed channel).  The caller needs it to tell a stale
+    // match (worth one fresh attempt) from a real refusal.
+    const std::string& last_error_code() const { return last_error_code_; }
 
     // PARK_ADVICE: the identical entry already in the store (dedup) and the longest entry this conversation supersedes.
     bool advice(const std::vector<ParentPoint>& points, bool cvec, ParentAdvice& out, std::string& error);
@@ -197,6 +202,7 @@ private:
     uint64_t epoch_ = 0;
     uint64_t next_request_id_ = 1;
     std::string last_error_;
+    std::string last_error_code_;
 };
 
 // The resume points of `image`: the live end first, then every checkpoint in the image's order.

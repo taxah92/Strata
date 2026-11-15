@@ -243,6 +243,10 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
+  add_executable(conversation_parent_test src/core/conversation_parent_test.cpp src/core/conversation_parent.cpp
+    src/core/conversation_file.cpp)
+  target_include_directories(conversation_parent_test PRIVATE include)
+  add_test(NAME conversation_parent_test COMMAND conversation_parent_test)
   add_executable(conversation_disk_test src/core/conversation_disk_test.cpp src/core/conversation_disk.cpp
     src/core/conversation_file.cpp)
   target_include_directories(conversation_disk_test PRIVATE include)
