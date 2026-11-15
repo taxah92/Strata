@@ -447,7 +447,7 @@ bool ConversationDiskTier::open_impl(const ConversationDiskOptions& options, con
                     "--conversation-cache-allow-unsafe-fs to try";
             return false;
         }
-        if (kind == FsKind::tmpfs && report) report->tmpfs = true;
+        if (kind == FsKind::tmpfs) rep.tmpfs = true;   // (copied into the caller's report at the end)
     }
 #ifndef _WIN32
     {
