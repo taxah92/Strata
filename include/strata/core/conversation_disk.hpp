@@ -153,6 +153,7 @@ public:
     size_t size() const { return entries_.size(); }
     uint64_t bytes() const { return bytes_; }
     size_t writes() const { return writes_; }
+    uint64_t written_bytes() const { return written_bytes_; }   ///< cumulative bytes this writer published (all causes)
     size_t reads() const { return reads_; }
     size_t evictions() const { return evictions_; }
     size_t eviction_skipped() const { return eviction_skipped_; }   ///< a victim another process had leased (writer)
@@ -225,7 +226,7 @@ private:
     std::string folder_;               ///< the leaf folder (the identity's and the layout's)
     std::string writer_dir_;           ///< the folder --conversation-cache-dir names (writer.lock lives there)
     std::vector<Entry> entries_;
-    uint64_t bytes_ = 0, eviction_skipped_ = 0, lease_conflicts_ = 0, refreshes_ = 0;
+    uint64_t bytes_ = 0, eviction_skipped_ = 0, lease_conflicts_ = 0, refreshes_ = 0, written_bytes_ = 0;
     size_t writes_ = 0, reads_ = 0, evictions_ = 0;
     uint64_t clock_ = 0;               ///< writer: the LRU stamp source
     uint64_t loading_ = 0;             ///< writer: the conversation its own load is reading (not a victim)

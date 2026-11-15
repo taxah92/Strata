@@ -13528,6 +13528,7 @@ int main(int argc, char** argv) {
         Clock::time_point disk_spill_retry_at{};   // a failed write is not retried before this (a disk that said no)
         // The per-replica counters (serve/replicas.py reads them from each engine's own log, never from r0's): the
         // line is cumulative, so the last one wins and nothing has to be summed.  No prompt text, no token ids.
+        unsigned long long disk_peer_miss = 0;   // peer lookups with no candidate (a candidate the threshold refuses is not a miss)
         auto disk_stats = [&](const char* tag) {
             unsigned long long peer_read = 0, peer_refresh = 0, peer_entries = 0, peer_bytes = 0;
             for (const auto& peer : conv_peers) {
@@ -13538,12 +13539,12 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "strata serve: conversation disk: stats (%s) wrote=%llu read=%llu evictions=%llu "
                                  "skipped=%llu lease_conflicts=%llu overshoot=%d entries=%zu bytes=%llu peer_read=%llu "
-                                 "peer_refresh=%llu peer_entries=%llu peer_bytes=%llu\n",
+                                 "peer_refresh=%llu peer_entries=%llu peer_bytes=%llu spill_bytes=%llu peer_miss=%llu\n",
                          tag, (unsigned long long) conv_disk.writes(), (unsigned long long) conv_disk.reads(),
                          (unsigned long long) conv_disk.evictions(), (unsigned long long) conv_disk.eviction_skipped(),
                          (unsigned long long) conv_disk.lease_conflicts(), conv_disk.overshoot() ? 1 : 0,
                          conv_disk.size(), (unsigned long long) conv_disk.bytes(), peer_read, peer_refresh, peer_entries,
-                         peer_bytes);
+                         peer_bytes, (unsigned long long) conv_disk.written_bytes(), disk_peer_miss);
         };
         auto disk_spill = [&](const strata::core::SavedConversation& image, const char* why) -> uint64_t {
             if (!conv_disk.enabled() || !conversations.wants((int64_t) image.live.ids.size())) return 0;
@@ -13735,13 +13736,14 @@ int main(int argc, char** argv) {
         };
         auto disk_pick = [&](const auto& p_ids, const std::vector<ImgKey>& p_imgs, bool p_cvec, bool force_peers) -> DiskPick {
             DiskPick best;
-            auto consider = [&](strata::core::ConversationDiskTier& t, int kind) {
-                const auto m = t.best(p_ids, p_imgs, p_cvec);
-                if (m.id == 0) return;
+            auto consider = [&](strata::core::ConversationDiskTier& t, int kind) -> bool {
+                const auto m = t.best(p_ids, p_imgs, p_cvec);   // one hash scan of the prompt per folder
+                if (m.id == 0) return false;
                 if (m.tokens > best.tokens ||
                     (m.tokens == best.tokens && m.live && !best.live) ||
                     (m.tokens == best.tokens && m.live == best.live && best.kind == 2 && kind == 1))
                     best = {&t, m.id, m.generation, m.tokens, m.live, kind};
+                return true;
             };
             if (conv_disk.enabled()) consider(conv_disk, 1);
             for (auto& peer : conv_peers) {
@@ -13751,7 +13753,7 @@ int main(int argc, char** argv) {
                 if (rep.added != 0 || rep.gone != 0 || rep.damaged != 0)
                     std::fprintf(stderr, "strata serve: conversation disk: peer %s refreshed: %zu new, %zu gone, %zu "
                                          "damaged\n", peer->owner().c_str(), rep.added, rep.gone, rep.damaged);
-                consider(*peer, 2);
+                if (!consider(*peer, 2)) ++disk_peer_miss;
             }
             return best;
         };

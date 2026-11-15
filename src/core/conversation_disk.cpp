@@ -897,6 +897,7 @@ bool ConversationDiskTier::spill(const SavedConversation& image, uint64_t& id, s
         return fail(error, SessionError::io);
     }
     bytes_ += e.bytes;
+    written_bytes_ += e.bytes;
     id = e.id;
     entries_.push_back(std::move(e));
     ++writes_;
