@@ -413,6 +413,8 @@ bool ConversationDiskTier::open_impl(const ConversationDiskOptions& options, con
             error = "conversation disk: the peer folder is not there: " + options.dir;
             return false;
         }
+        // a peer's logs and counters name the OTHER engine: its folder (r0, r1), not this engine's own --owner
+        owner_ = fs::path(options.dir).filename().string();
         const FsKind kind = filesystem_kind(options.dir);
         if ((kind == FsKind::network || kind == FsKind::fuse) && !options_.allow_unsafe_fs) {
             error = "conversation disk: the peer folder " + options.dir + " is not a local filesystem; a read-only "
