@@ -1144,6 +1144,9 @@ def replica_queue_view(rows: list[dict]) -> dict:
     queue = queues[0]                                    # one queue for every replica: the same dict in each row
     out = {key: queue.get(key) for key in ("depth", "oldest_s", "max", "timeout_s", "picked", "reason",
                                            "assigned", "starved", "cancelled", "timed_out", "rejected")}
+    for key in ("migrated", "migrate_fallbacks", "prefer_idle_s"):
+        if key in queue:
+            out[key] = queue.get(key)
     out["reachable"] = int(sum(1 for row in rows if row.get("alive")))
     return out
 
@@ -1885,6 +1888,49 @@ class StrataEngine:
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def park(self, timeout: float = 120.0) -> dict:
+        with self._exclusive_control():
+            return self._park(timeout)
+
+    def _park(self, timeout: float = 120.0) -> dict:
+        """Park the engine's current live conversation into the parent store (or local cache) between requests.
+        Returns {"status": ..., "tokens": int, "bytes": int, "ms": float}; raises ValueError on ERR and EngineDied
+        when the engine ended or timed out."""
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        try:
+            self.proc.stdin.write("PARK\n")
+            self.proc.stdin.flush()
+        except OSError:
+            raise EngineDied("the engine ended") from None
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the PARK command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the PARK command")
+            if line.startswith("PARK "):
+                out = {}
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    if k == "ms":
+                        try:
+                            out[k] = float(v)
+                        except ValueError:
+                            out[k] = v
+                    elif v.lstrip("-").isdigit():
+                        out[k] = int(v)
+                    else:
+                        out[k] = v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the PARK command")
 
     def pen_from_key(self, orig_len: int, prompt_len: int) -> str:
         """` pen_from=N` for a leg that continues a request (prompt + what it generated): where the reply began, Strata's penalty window start. The all-cards split engine
@@ -10396,16 +10442,21 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                              'run the replicas one request at a time ("parallel": 1, no --batch/--slots)')
         timeout = "off" if pull.queue_timeout_s is None else f"{pull.queue_timeout_s:g} s"
         queue = "unbounded" if pull.max_queue is None else f"at most {pull.max_queue}"
+        prefer = "" if pull.prefer_idle_s is None else f", prefer idle {pull.prefer_idle_s:g} s"
         print(f"[strata] replica pull: a request takes a free card at once, or waits in one shared queue for the one "
               f"that would re-read the least of its prompt (starve {pull.starve_s:g} s, queue timeout {timeout}, "
-              f"{queue} waiting)", flush=True)
+              f"{queue} waiting{prefer})", flush=True)
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     if pull is not None and pull.enabled:
         eng = rp.ReplicaEngine(engines, load_tokens=load, pull=True, starve_s=pull.starve_s,
                                queue_timeout_s=pull.queue_timeout_s, max_queue=pull.max_queue,
+                               prefer_idle_s=pull.prefer_idle_s, priorities=pull.priorities,
                                parent_parking=parking_store)
     else:
-        eng = rp.ReplicaEngine(engines, load_tokens=load, parent_parking=parking_store)
+        eng = rp.ReplicaEngine(engines, load_tokens=load,
+                               prefer_idle_s=rp.prefer_idle_config(cfg),
+                               priorities=rp.replica_priorities(cfg, n),
+                               parent_parking=parking_store)
     if arena:
         eng.__dict__["arena_file"] = arena
         import atexit

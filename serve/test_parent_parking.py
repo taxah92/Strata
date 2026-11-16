@@ -637,8 +637,9 @@ class ParentParkingProtocol(StoreCase):
         finally:
             os.close(fd)
         second = self.client("r4", hello=False)
-        second.send_frame(pp.OP_PING, {}, request_id=1)
-        second.send_frame(pp.OP_PING, {}, request_id=2)
+        with self.store._lock:
+            second.send_frame(pp.OP_PING, {}, request_id=1)
+            second.send_frame(pp.OP_PING, {}, request_id=2)
         got, body, _fds = second.recv_frame()
         self.assertEqual((got, body["code"]), (pp.OP_ERROR, "bad_request"))
         self.assertIsNone(second.recv_frame()[0])

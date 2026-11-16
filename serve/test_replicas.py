@@ -11,10 +11,11 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+from types import SimpleNamespace
 from serve.frontend import ChatTemplate
 from serve.replicas import (BLOCK, PullRequest, ReplicaConfigError, ReplicaEngine, Router, cpu_sets, gpu_groups,
-                            pull_choose, pull_config, remove_arena, replica_cfg, shared_arena_plan,
-                            sweep_stale_arenas)
+                            prefer_idle_config, pull_choose, pull_config, remove_arena, replica_cfg,
+                            replica_priorities, shared_arena_plan, sweep_stale_arenas)
 from serve.server import (ByteTokenizer, EngineDied, QueueWaitExpired, Service, StrataEngine, serve)
 from serve.test_parallel import FAKE_BATCH
 
@@ -1127,6 +1128,229 @@ class SharedArena(unittest.TestCase):
             r.__dict__["arena_file"] = str(f)
             r.close()
             self.assertFalse(f.exists())
+
+
+class PriorityAndIdleHandoff(unittest.TestCase):
+    """Priority routing, shared-store vs live affinity in Router, and coordinated PARK handoff (r1 -> r0)."""
+
+    def test_priority_and_prefer_idle_config_validation(self):
+        self.assertIsNone(prefer_idle_config({}))
+        self.assertIsNone(prefer_idle_config({"replica_prefer_idle_s": False}))
+        self.assertEqual(prefer_idle_config({"replica_prefer_idle_s": 45}), 45.0)
+        for bad in (-1, True, "45", float("nan"), 3601):
+            with self.assertRaises(ReplicaConfigError, msg=bad):
+                prefer_idle_config({"replica_prefer_idle_s": bad})
+
+        cfg = {"replicas": [{"gpus": [0], "priority": 10}, {"gpus": [1], "priority": 0}]}
+        self.assertEqual(replica_priorities(cfg), [10.0, 0.0])
+        self.assertEqual(replica_priorities({"gpu": [0, 1], "replicas": 2, "replica_prefer_idle_s": 45}), [1.0, 0.0])
+        self.assertEqual(replica_priorities({"gpu": [0, 1], "replicas": 2, "replica_prefer": 1}), [0.0, 1.0])
+        self.assertEqual(replica_priorities({"gpu": [0, 1, 2], "replicas": 3, "replica_prefer": [2, 0]}), [1.0, 0.0, 2.0])
+
+        for bad_cfg in ({"replicas": [{"gpus": [0], "priority": True}, {"gpus": [1]}]},
+                        {"gpu": [0, 1], "replicas": 2, "replica_prefer": 2},
+                        {"gpu": [0, 1], "replicas": 2, "replica_prefer": [0, 0]},
+                        {"gpu": [0, 1], "replicas": 2, "replica_prefer": True}):
+            with self.assertRaises(ReplicaConfigError, msg=bad_cfg):
+                replica_priorities(bad_cfg)
+
+        pc = pull_config({"replica_pull": True, "replicas": [{"gpus": [0], "priority": 5}, {"gpus": [1]}],
+                          "replica_prefer_idle_s": 30})
+        self.assertEqual((pc.prefer_idle_s, pc.priorities), (30.0, [5.0, 0.0]))
+
+        with self.assertRaises(ReplicaConfigError):
+            ReplicaEngine([GateEngine("r0"), GateEngine("r1")], pull=True, priorities=[1.0])
+        with self.assertRaises(ReplicaConfigError):
+            ReplicaEngine([GateEngine("r0"), GateEngine("r1")], pull=True, prefer_idle_s=-1)
+
+    def test_router_distinguishes_live_from_shared_parking(self):
+        r = Router(2, shared_parking=True, shared_min_tokens=BLOCK * 2)
+        chat_a = [1] * (BLOCK * 4)
+        chat_b = [2] * (BLOCK * 4)
+        short = [3] * BLOCK
+        r.note(1, chat_a)
+        self.assertEqual(r.live_matched(chat_a), [0, BLOCK * 4])
+        self.assertEqual(r.matched(chat_a), [0, BLOCK * 4])
+
+        # Switching away on r1 moves chat_a (>= shared_min_tokens) into the shared bit and clears r1's live bit.
+        r.note(1, chat_b)
+        self.assertEqual(r.live_matched(chat_a), [0, 0])
+        self.assertEqual(r.matched(chat_a), [BLOCK * 3, BLOCK * 3])
+        self.assertEqual(r.live_matched(chat_b), [0, BLOCK * 4])
+
+        # A conversation below shared_min_tokens is not marked shared on switch.
+        r.note(0, short)
+        r.note(0, chat_a)
+        self.assertEqual(r.live_matched(short), [0, 0])
+        self.assertEqual(r.matched(short), [0, 0])
+
+        # demote_live(parked=True) drops r1's live ownership and keeps shared visibility; forget_shared clears it.
+        r.demote_live(1, parked=True)
+        self.assertEqual(r.live_matched(chat_b), [0, 0])
+        self.assertEqual(r.matched(chat_b), [BLOCK * 3, BLOCK * 3])
+        r.forget_shared()
+        self.assertEqual(r.matched(chat_b), [0, 0])
+
+    def test_pull_choose_prefer_idle_and_native_priority(self):
+        chat_r1 = [1] * (BLOCK * 4)
+        chat_r0 = [2] * (BLOCK * 4)
+
+        def matched(ids):
+            return [0, BLOCK * 4] if ids[:4] == chat_r1[:4] else [BLOCK * 4, 0]
+
+        def live_matched(ids):
+            return matched(ids)
+
+        req_r1 = PullRequest()
+        req_r1.seq, req_r1.ids, req_r1.arrive = 1, chat_r1 + [9] * 10, 100.0
+        pending = collections.OrderedDict([(req_r1.seq, req_r1)])
+
+        # r0 idle 10s (< 45s): keep chat_r1 on r1 without migrating.
+        pick = pull_choose(pending, [0, 1], 110.0, 60.0, matched,
+                           priorities=[10.0, 0.0], idle_since=[100.0, 105.0], prefer_idle_s=45.0,
+                           live_matched_of=live_matched)
+        self.assertEqual((pick[0].seq, pick[1], pick[2], pick[0].migrate_from), (1, 1, False, None))
+
+        # r0 idle 45s (>= 45s): migrate chat_r1 from free r1 -> r0.
+        pick = pull_choose(pending, [0, 1], 145.0, 60.0, matched,
+                           priorities=[10.0, 0.0], idle_since=[100.0, 140.0], prefer_idle_s=45.0,
+                           live_matched_of=live_matched)
+        self.assertEqual((pick[0].seq, pick[1], pick[2], pick[0].migrate_from, pick[0].reason),
+                         (1, 0, False, 1, "prefer-idle"))
+
+        # Native request for r0 wins over migrating a request from r1 when both are waiting.
+        req_r0 = PullRequest()
+        req_r0.seq, req_r0.ids, req_r0.arrive = 2, chat_r0 + [9] * 10, 101.0
+        pending[req_r0.seq] = req_r0
+        pick = pull_choose(pending, [0, 1], 145.0, 60.0, matched,
+                           priorities=[10.0, 0.0], idle_since=[100.0, 140.0], prefer_idle_s=45.0,
+                           live_matched_of=live_matched)
+        self.assertEqual((pick[0].seq, pick[1], pick[0].migrate_from), (2, 0, None))
+
+    def _parking_engine(self, park_fn=None, *, prefer_idle_s=0.05):
+        class ParkableGateEngine(GateEngine):
+            def __init__(self, name, park_cb=None):
+                super().__init__(name)
+                self.park_cb = park_cb
+                self.parks = 0
+
+            def park(self):
+                self.parks += 1
+                if self.park_cb is not None:
+                    return self.park_cb()
+                return {"status": "published", "tokens": 256, "bytes": 1024, "ms": 1.0}
+
+        e0 = ParkableGateEngine("r0")
+        e1 = ParkableGateEngine("r1", park_fn)
+        fake_store = SimpleNamespace(_config=SimpleNamespace(min_tokens=BLOCK * 2),
+                                     replica_state=lambda owner: {"state": "connected"})
+        eng = ReplicaEngine([e0, e1], pull=True, poll_s=0.01, beat_s=0.02,
+                            prefer_idle_s=prefer_idle_s, priorities=[10.0, 0.0], parent_parking=fake_store)
+        return eng, e0, e1
+
+    def test_replica_engine_migrates_live_conversation_via_park_and_keeps_on_r0(self):
+        eng, e0, e1 = self._parking_engine(prefer_idle_s=0.04)
+        chat = [1] * (BLOCK * 4)
+
+        # Hold r0 busy so chat lands on r1 first.
+        g0 = eng.generate([9] * (BLOCK * 2), 16, {}, threading.Event())
+        self.assertEqual(next(g0), 7)
+        list(eng.generate(chat, 16, {}, threading.Event()))
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (1, 1, 0))
+        g0.close()
+
+        # Before prefer_idle_s: next turn stays on r1 without PARK.
+        list(eng.generate(chat + [7, 2], 16, {}, threading.Event()))
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (1, 2, 0))
+
+        # Let r0 sit idle >= prefer_idle_s: next turn triggers PARK on r1, migrates to r0, and releases r1.
+        time.sleep(0.05)
+        seen = []
+        cancel = threading.Event()
+        cancel._strata_replica_selected = seen.append
+        list(eng.generate(chat + [7, 2, 7, 3], 16, {}, cancel))
+        self.assertEqual(seen, [0])
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (2, 2, 1))
+        self.assertEqual((eng.inflight, eng.pull_stats["migrated"]), ([0, 0], 1))
+        self.assertEqual(eng.replica_view()[0]["queue"]["reason"], "prefer-idle")
+        self.assertEqual(eng.router.live_matched(chat + [7, 2, 7, 3]), [BLOCK * 4, 0])
+
+        # Subsequent turn naturally stays on r0 with zero further PARKs.
+        list(eng.generate(chat + [7, 2, 7, 3, 7, 4], 16, {}, threading.Event()))
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (3, 2, 1))
+
+    def test_replica_engine_falls_back_to_r1_when_park_refused_for_capacity(self):
+        eng, e0, e1 = self._parking_engine(
+            park_fn=lambda: {"status": "capacity", "tokens": 256, "bytes": 0, "ms": 0.0},
+            prefer_idle_s=0.04,
+        )
+        chat = [5] * (BLOCK * 4)
+        g0 = eng.generate([9] * (BLOCK * 2), 16, {}, threading.Event())
+        self.assertEqual(next(g0), 7)
+        list(eng.generate(chat, 16, {}, threading.Event()))
+        g0.close()
+
+        time.sleep(0.05)
+        seen = []
+        cancel = threading.Event()
+        cancel._strata_replica_selected = seen.append
+        list(eng.generate(chat + [7, 1], 16, {}, cancel))
+        self.assertEqual(seen, [1])
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (1, 2, 1))
+        self.assertEqual((eng.inflight, eng.pull_stats["migrated"], eng.pull_stats["migrate_fallbacks"]),
+                         ([0, 0], 1, 1))
+        self.assertEqual(eng.last_pick["reason"], "migrate-fallback")
+
+    def test_displaced_conversation_routes_to_priority_r0_immediately(self):
+        eng, e0, e1 = self._parking_engine(prefer_idle_s=60.0)
+        chat_a = [3] * (BLOCK * 4)
+        chat_b = [4] * (BLOCK * 4)
+
+        g0 = eng.generate([9] * (BLOCK * 2), 16, {}, threading.Event())
+        self.assertEqual(next(g0), 7)
+        list(eng.generate(chat_a, 16, {}, threading.Event()))     # chat_a runs on r1
+        list(eng.generate(chat_b, 16, {}, threading.Event()))     # chat_b displaces chat_a into shared parking
+        g0.close()                                                # r0 frees just now (idle ~0s << 60s)
+
+        seen = []
+        cancel = threading.Event()
+        cancel._strata_replica_selected = seen.append
+        list(eng.generate(chat_a + [7, 1], 16, {}, cancel))       # chat_a is in shared store -> immediately picks r0!
+        self.assertEqual(seen, [0])
+        self.assertEqual((len(e0.calls), len(e1.calls), e1.parks), (2, 2, 0))
+        self.assertEqual(eng.pull_stats["migrated"], 0)
+
+    def test_strata_engine_park_command_protocol(self):
+        import serve.server as server
+        fake_script = (
+            "import sys\n"
+            "print('READY 4096 stop', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    cmd = line.strip()\n"
+            "    if cmd == 'PARK':\n"
+            "        if getattr(sys, '_fail_next', False):\n"
+            "            print('ERR PARK: not while batch slots are decoding', flush=True)\n"
+            "        else:\n"
+            "            print('PARK status=published tokens=12345 bytes=67890 ms=12.3', flush=True)\n"
+            "            sys._fail_next = True\n"
+            "    elif cmd == 'QUIT':\n"
+            "        break\n"
+        )
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "fake_park.py"
+            p.write_text(fake_script, encoding="utf-8")
+            real_popen = server.subprocess.Popen
+            with mock.patch.object(server.subprocess, "Popen",
+                                   lambda cmd, **kw: real_popen([sys.executable, str(p)], **kw)):
+                eng = StrataEngine("strata", ["--log", str(Path(d) / "fake.log")])
+            try:
+                res = eng.park()
+                self.assertEqual(res, {"status": "published", "tokens": 12345, "bytes": 67890, "ms": 12.3})
+                with self.assertRaises(ValueError) as caught:
+                    eng.park()
+                self.assertIn("batch slots", str(caught.exception))
+            finally:
+                eng.close()
 
 
 if __name__ == "__main__":

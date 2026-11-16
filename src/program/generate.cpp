@@ -13045,6 +13045,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        bool live_parked = false;   // true once `PARK` already published the exact current `live` state to parent store
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -13385,13 +13386,29 @@ int main(int argc, char** argv) {
         // session file is measured and then written straight into a memfd the store handed over, and the store
         // publishes it on COMMIT.  The local cache is not involved (its budget is 0 in this mode), so there is no
         // second K/V copy and no retained K/V: the K/V always comes from the active session, streamed.
-        auto parent_park_source = [&](const ParkSource& src, size_t held) -> bool {
+        struct ParentParkResult {
+            bool published = false;
+            bool dedup = false;
+            int64_t tokens = 0;
+            uint64_t bytes = 0;
+            double ms = 0.0;
+            std::string status = "noop";
+        };
+        auto parent_park_source = [&](const ParkSource& src, size_t held, bool force_gain = false,
+                                      const char* why_tag = "on-park", ParentParkResult* out = nullptr) -> bool {
             (void) held;   // the store's budget is the only one: nothing is held out of a local cache
-            if (!conv_parent.enabled()) return true;
+            if (!conv_parent.enabled()) {
+                if (out) out->status = "off";
+                return true;
+            }
             const size_t n_tokens = src.ids.size();
             auto skip = [&](const std::string& why, const char* kind) {
-                std::fprintf(stderr, "strata serve: conversation parent: not published (on-park, %zu tokens%s): %s [%s]\n",
-                             n_tokens, src.what.c_str(), why.c_str(), kind);
+                if (out) {
+                    out->status = kind;
+                    out->tokens = (int64_t) n_tokens;
+                }
+                std::fprintf(stderr, "strata serve: conversation parent: not published (%s, %zu tokens%s): %s [%s]\n",
+                             why_tag, n_tokens, src.what.c_str(), why.c_str(), kind);
                 return true;
             };
             if (!parking_wants((int64_t) n_tokens))
@@ -13419,8 +13436,11 @@ int main(int argc, char** argv) {
                 parent_note_degraded(e);
                 return skip(e, "advice");
             }
-            if (advice.holding_id != 0) return skip("the store already holds this snapshot", "dedup");
-            if (o.conversation_parent_parking_min_gain > 0 && advice.parked_prefix_tokens > 0 &&
+            if (advice.holding_id != 0) {
+                if (out) { out->dedup = true; out->published = true; }
+                return skip("the store already holds this snapshot", "dedup");
+            }
+            if (!force_gain && o.conversation_parent_parking_min_gain > 0 && advice.parked_prefix_tokens > 0 &&
                 (int64_t) n_tokens < advice.parked_prefix_tokens + o.conversation_parent_parking_min_gain)
                 return skip("the store's copy at " + std::to_string((long long) advice.parked_prefix_tokens) +
                             " tokens is too close behind", "gain");
@@ -13469,7 +13489,10 @@ int main(int argc, char** argv) {
                 parent_note_degraded(e);
                 return skip(e, conv_parent.degraded() ? "degraded" : "capacity");
             }
-            if (dedup) return skip("the store already holds this snapshot", "dedup");
+            if (dedup) {
+                if (out) { out->dedup = true; out->published = true; }
+                return skip("the store already holds this snapshot", "dedup");
+            }
             // write each stage straight into the store's memfd: no temporary file, no rename, no flush
             strata::core::SessionWriteOptions wo;
             wo.durable = false;
@@ -13494,12 +13517,19 @@ int main(int argc, char** argv) {
                 return skip(e, "commit");
             }
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            if (out) {
+                out->status = "published";
+                out->published = true;
+                out->tokens = (int64_t) n_tokens;
+                out->bytes = total;
+                out->ms = ms;
+            }
             strata::core::ParentStats pst;
             std::string se;
             const bool have_stats = conv_parent.stats(pst, se);
-            std::fprintf(stderr, "strata serve: conversation parent: published %zu tokens%s (on-park) in %.1f ms, "
+            std::fprintf(stderr, "strata serve: conversation parent: published %zu tokens%s (%s) in %.1f ms, "
                                  "%.2f GB/s; entries=%zu bytes=%llu dedup=%zu\n",
-                         n_tokens, src.what.c_str(), ms, ms > 0 ? (double) total / ms / 1e6 : 0.0,
+                         n_tokens, src.what.c_str(), why_tag, ms, ms > 0 ? (double) total / ms / 1e6 : 0.0,
                          have_stats ? pst.entries : 0, (unsigned long long) (have_stats ? pst.entry_bytes : 0),
                          have_stats ? pst.deduplicated : 0);
             return true;
@@ -13756,7 +13786,7 @@ int main(int argc, char** argv) {
             return true;
         };
         auto park_current_body = [&](size_t held) -> bool {
-            if (!parking_enabled() || !live_ok || live.empty()) return true;
+            if (!parking_enabled() || !live_ok || live.empty() || (parent_mode && live_parked)) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
@@ -17298,6 +17328,45 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
+            if (line == "PARK" || line.rfind("PARK ", 0) == 0) {
+                if (batch_on()) {
+                    std::printf("ERR PARK: not while batch slots are decoding\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+                strata::core::conversation_checkpoint_join(nullptr);
+                strata::core::conversation_park_join();
+                if (!parking_enabled()) {
+                    std::printf("PARK status=off tokens=0 bytes=0 ms=0.0\n");
+                } else if (!live_ok || live.empty()) {
+                    std::printf("PARK status=empty tokens=0 bytes=0 ms=0.0\n");
+                } else if (parent_mode) {
+                    const size_t n_st = stages.size();
+                    ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
+                                   (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
+                                   use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+                    for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
+                    ParentParkResult res;
+                    parent_park_source(src, 0, /*force_gain=*/true, /*why_tag=*/"handoff", &res);
+                    if (res.published) live_parked = true;
+                    std::printf("PARK status=%s tokens=%lld bytes=%llu ms=%.1f\n",
+                                res.status.c_str(), (long long) res.tokens, (unsigned long long) res.bytes, res.ms);
+                } else {
+                    const auto t0 = Clock::now();
+                    const bool ok = park_current(0);
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    std::printf("PARK status=%s tokens=%lld bytes=%llu ms=%.1f\n",
+                                ok ? "published" : "failed", (long long) live.size(),
+                                (unsigned long long) conversations.bytes(), ms);
+                }
+                std::fflush(stdout);
+                continue;
+            }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
             if (!adapt_tick(true)) {
@@ -17583,6 +17652,7 @@ int main(int argc, char** argv) {
                     }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
+                    live_parked = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
                     if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
@@ -17602,6 +17672,7 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    live_parked = false;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear();
@@ -18026,6 +18097,7 @@ int main(int argc, char** argv) {
                 }
                 const size_t n_checks = checks.size();
                 live_ok = false;
+                live_parked = false;
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
@@ -18775,6 +18847,7 @@ int main(int argc, char** argv) {
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
+                live_parked = false;
                 checks.clear();
                 cvec_cached = want_cvec;
             }
@@ -18789,6 +18862,7 @@ int main(int argc, char** argv) {
             else
                 checks.erase(std::remove_if(checks.begin(), checks.end(), off_path), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            live_parked = false;
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
@@ -21922,6 +21996,7 @@ int main(int argc, char** argv) {
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+                live_parked = false;
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
             } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
@@ -21931,6 +22006,7 @@ int main(int argc, char** argv) {
                 live.assign(cur.begin(), cur.begin() + pp_reached);
                 live_imgs = imgs_below(req_imgs, pp_reached);
                 live_ok = true;
+                live_parked = false;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }

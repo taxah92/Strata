@@ -105,13 +105,14 @@ def _cards(g) -> list[int]:
         raise ReplicaConfigError(f"cards must be numbers, not {g!r}") from None
 
 
-PullSettings = collections.namedtuple("PullSettings", "enabled starve_s queue_timeout_s max_queue",
-                                      defaults=(None, None))
+PullSettings = collections.namedtuple("PullSettings",
+                                      "enabled starve_s queue_timeout_s max_queue prefer_idle_s priorities",
+                                      defaults=(None, None, None, None))
 
 
 class PullRequest:
     """One request in the one shared pending queue.  Its fields change only under ReplicaEngine.cv."""
-    __slots__ = ("seq", "ids", "arrive", "cancel", "deadline", "replica", "matched")
+    __slots__ = ("seq", "ids", "arrive", "cancel", "deadline", "replica", "matched", "migrate_from", "reason")
 
     def __init__(self):
         self.seq = 0                    # the queue's own order: tie-break, and "the oldest" is the first one
@@ -121,33 +122,72 @@ class PullRequest:
         self.deadline = None            # time.monotonic() after which waiting is over (queue_timeout), or None
         self.replica = None             # the replica it was given; None while it still waits
         self.matched = None             # Router.matched(ids) of the last selection round (the reason in the view)
+        self.migrate_from = None        # lower-priority free replica to PARK before starting on self.replica
+        self.reason = None              # assignment reason ("prefer-idle", "starved", etc.)
 
 
-def pull_choose(pending, free, now: float, starve_s: float, matched_of):
+def pull_choose(pending, free, now: float, starve_s: float, matched_of, *,
+                priorities=None, idle_since=None, prefer_idle_s: float | None = None,
+                live_matched_of=None):
     """(the waiting request, the replica, was it the starvation rule) or None: the pull order as one pure function,
     so it can be tested without threads.  `pending` is in arrival order, `free` the living replicas with
     inflight[k] == 0.  Cost = the prompt tokens the replica would read again (len(ids) - Router.matched(ids)[k]) -
-    the first term of route()'s cost, as a free replica has no running request to pay LOAD_TOKENS for."""
+    the first term of route()'s cost, as a free replica has no running request to pay LOAD_TOKENS for.
+
+    When `prefer_idle_s` and `priorities` are provided, a free higher-priority replica that has been idle for at least
+    `prefer_idle_s` seconds can pull a live conversation off a free lower-priority replica (`entry.migrate_from`)."""
     if not free or not pending:
         return None
+    prio = (lambda k: (-float(priorities[k]), k)) if priorities is not None else (lambda k: (0.0, k))
     oldest = next(iter(pending.values()))
     if starve_s is not None and now - oldest.arrive >= starve_s:       # the oldest goes first, whatever its cache says
         got = matched_of(oldest.ids)
         oldest.matched = got
-        k = min(free, key=lambda k: (len(oldest.ids) - got[k], k))
+        k = min(free, key=lambda k: (len(oldest.ids) - got[k], prio(k)))
+        oldest.migrate_from = None
+        oldest.reason = "starved"
         return oldest, k, True
+    can_prefer = prefer_idle_s is not None and idle_since is not None and priorities is not None
+    idle_pref = [k for k in free if can_prefer and now - idle_since[k] >= prefer_idle_s]
     best = None
     for e in pending.values():                  # arrival order; a smaller seq wins an equal cost
         got = matched_of(e.ids)                 # the card's map is read AT THE CHOICE, not when the request arrived
+        live_got = live_matched_of(e.ids) if live_matched_of is not None else got
         e.matched = got
         base = len(e.ids)
+        best_src_for = {}
+        if idle_pref:
+            live_srcs = [s for s in free if live_got[s] > 0]
+            if live_srcs:
+                for kp in idle_pref:
+                    cands = [s for s in live_srcs
+                             if s != kp and float(priorities[kp]) > float(priorities[s]) and live_got[s] > got[kp]]
+                    if cands:
+                        best_src_for[kp] = max(cands, key=lambda s: (live_got[s], float(priorities[s]), -s))
+        migrated_srcs = set(best_src_for.values())
         for k in free:
-            cand = (base - got[k], e.seq, k)    # re-read, then age, then the lower replica index
+            if k in best_src_for:
+                k_src = best_src_for[k]
+                re_read = base - live_got[k_src]
+                mig_rank = 1
+                mig_src = k_src
+            elif k in migrated_srcs:
+                re_read = base - got[k]
+                mig_rank = 2
+                mig_src = None
+            else:
+                re_read = base - got[k]
+                mig_rank = 0
+                mig_src = None
+            cand = (re_read, mig_rank, e.seq, prio(k))
             if best is None or cand < best[0]:
-                best = (cand, e, k)
+                best = (cand, e, k, mig_src)
     if best is None:
         return None
-    return best[1], best[2], False
+    _, chosen_e, chosen_k, chosen_src = best
+    chosen_e.migrate_from = chosen_src
+    chosen_e.reason = "prefer-idle" if chosen_src is not None else None
+    return chosen_e, chosen_k, False
 
 
 def _requested_slots(cfg: dict) -> int:
@@ -175,13 +215,62 @@ def _requested_slots(cfg: dict) -> int:
     return requested if isinstance(requested, int) and not isinstance(requested, bool) and requested > 0 else 1
 
 
+def prefer_idle_config(cfg: dict) -> float | None:
+    """Opt-in idle threshold (seconds) after which a higher-priority free replica pulls a live conversation off
+    a lower-priority free replica via PARK; None when disabled."""
+    val = cfg.get("replica_prefer_idle_s")
+    if val is None or val is False:
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val) or not 0.0 <= val <= 3600.0:
+        raise ReplicaConfigError(f'"replica_prefer_idle_s" must be seconds in 0..3600, not {val!r}')
+    return float(val)
+
+
+def replica_priorities(cfg: dict, n: int | None = None) -> list[float]:
+    """Per-replica routing priorities (higher = preferred when free).  Reads per-entry "priority" in "replicas",
+    optional top-level "replica_prefer" (replica index or list of indices), or defaults r0 above others when
+    "replica_prefer_idle_s" is configured without explicit priorities."""
+    groups = gpu_groups(cfg)
+    if n is None:
+        n = len(groups)
+    if n < 2:
+        return [0.0] * max(0, n)
+    spec = cfg.get("replicas")
+    priorities = [0.0] * n
+    has_explicit = False
+    if isinstance(spec, list):
+        for i, e in enumerate(spec[:n]):
+            if isinstance(e, dict) and e.get("priority") is not None:
+                p = e["priority"]
+                if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p):
+                    raise ReplicaConfigError(f'replicas[{i}]."priority" must be a finite number, not {p!r}')
+                priorities[i] = float(p)
+                has_explicit = True
+    prefer = cfg.get("replica_prefer")
+    if prefer is not None:
+        if isinstance(prefer, bool) or not isinstance(prefer, (int, list)):
+            raise ReplicaConfigError(f'"replica_prefer" must be a replica index or list of indices, not {prefer!r}')
+        order = [prefer] if isinstance(prefer, int) else list(prefer)
+        seen_p = set()
+        for idx in order:
+            if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < n:
+                raise ReplicaConfigError(f'"replica_prefer" index {idx!r} out of range (0..{n - 1})')
+            if idx in seen_p:
+                raise ReplicaConfigError(f'"replica_prefer" has duplicate index {idx}')
+            seen_p.add(idx)
+        if not has_explicit and order:
+            for rank, idx in enumerate(order):
+                priorities[idx] = float(len(order) - rank)
+            has_explicit = True
+    if not has_explicit and prefer_idle_config(cfg) is not None:
+        priorities[0] = 1.0
+    return priorities
+
+
 def pull_config(cfg: dict) -> PullSettings:
     """Opt-in pull scheduler: the run config's ("replica_pull", "replica_starve_s", "replica_queue_timeout_s",
-    "replica_max_queue") as a PullConfig, for serve/server.py's start_replicas:
-    ReplicaEngine(engines, load_tokens=..., pull=pc.enabled, starve_s=pc.starve_s,
-                  queue_timeout_s=pc.queue_timeout_s, max_queue=pc.max_queue).  Raises ReplicaConfigError on a bad
-    value, before any engine has been started.  queue_timeout_s and max_queue are the contract's optional
-    scheduler-level limits (None: the Service's own queue_timeout/max_queue admission is the only limit)."""
+    "replica_max_queue", "replica_prefer_idle_s", "replica_prefer" / replicas[].priority) as a PullSettings, for
+    serve/server.py's start_replicas.  Raises ReplicaConfigError on a bad value, before any engine has been started."""
     want = cfg.get("replica_pull", False)
     if isinstance(want, bool) and not want:
         return PullSettings(False, PULL_STARVE_S)
@@ -207,7 +296,10 @@ def pull_config(cfg: dict) -> PullSettings:
     if max_queue is not None and (isinstance(max_queue, bool) or not isinstance(max_queue, int)
                                   or not 0 <= max_queue <= 4096):
         raise ReplicaConfigError(f'"replica_max_queue" must be a whole number in 0..4096, not {max_queue!r}')
-    return PullSettings(True, float(starve), float(timeout) if timeout is not None else None, max_queue)
+    prefer_idle = prefer_idle_config(cfg)
+    priorities = replica_priorities(cfg)
+    return PullSettings(True, float(starve), float(timeout) if timeout is not None else None, max_queue,
+                        prefer_idle, priorities)
 
 
 ARENA_PREFIX = "strata-replicas-"
@@ -398,11 +490,15 @@ def cpu_sets(n: int, enabled: bool = True):
 
 class Router:
     """Which replica holds the start of a prompt: chained hashes of its 64-token blocks, each with the set of replicas
-    that served it (a bit mask)."""
+    that hold it (bits 0..n-1).  When `shared_parking=True`, bits 0..n-1 track each replica's current LIVE GPU KV only,
+    while bit `n` (`SHARED_BIT`) tracks prefixes displaced into the shared ParentParkingStore (available to all)."""
 
-    def __init__(self, n: int, cap: int = INDEX_MAX):
+    def __init__(self, n: int, cap: int = INDEX_MAX, *, shared_parking: bool = False, shared_min_tokens: int = 0):
         self.n, self.cap = n, cap
+        self.shared_parking = bool(shared_parking)
+        self.shared_min_tokens = max(0, int(shared_min_tokens))
         self.blocks: collections.OrderedDict[int, int] = collections.OrderedDict()
+        self.live_chains: list[list[int]] = [[] for _ in range(n)]
         self.lock = threading.Lock()
 
     @staticmethod
@@ -413,33 +509,111 @@ class Router:
             out.append(h)
         return out
 
-    def matched(self, ids) -> list[int]:
-        """Per replica: how many leading tokens of `ids` it holds (a multiple of BLOCK)."""
-        got = [0] * self.n
-        alive = (1 << self.n) - 1
-        with self.lock:
-            for k, h in enumerate(self.chain(ids)):
-                m = self.blocks.get(h, 0) & alive
-                if not m:
-                    break
-                alive = m
+    def _matched_locked(self, ids) -> tuple[list[int], int]:
+        chains = self.chain(ids)
+        live = [0] * self.n
+        shared = 0
+        alive_live = (1 << self.n) - 1
+        shared_bit = 1 << self.n
+        shared_alive = self.shared_parking
+        for k, h in enumerate(chains):
+            m = self.blocks.get(h, 0)
+            m_live = m & alive_live
+            if m_live:
+                alive_live = m_live
                 for r in range(self.n):
-                    if m >> r & 1:
-                        got[r] = (k + 1) * BLOCK
-        return got
+                    if m_live >> r & 1:
+                        live[r] = (k + 1) * BLOCK
+            else:
+                alive_live = 0
+            if shared_alive and (m & shared_bit):
+                shared = (k + 1) * BLOCK
+            else:
+                shared_alive = False
+            if not alive_live and not shared_alive:
+                break
+        return live, shared
+
+    def live_matched(self, ids) -> list[int]:
+        """Per replica: how many leading tokens of `ids` it currently holds in its live cache."""
+        with self.lock:
+            live, _ = self._matched_locked(ids)
+            return live
+
+    def matched(self, ids) -> list[int]:
+        """Per replica: how many leading tokens of `ids` it holds or can restore from shared parent parking."""
+        with self.lock:
+            live, shared = self._matched_locked(ids)
+        if not self.shared_parking or shared <= 0:
+            return live
+        shared_score = max(0, shared - BLOCK)
+        return [max(x, shared_score) for x in live]
 
     def note(self, r: int, ids) -> None:
+        cur = self.chain(ids)
         with self.lock:
-            for h in self.chain(ids):
-                self.blocks[h] = self.blocks.pop(h, 0) | (1 << r)
+            if self.shared_parking:
+                prev = self.live_chains[r]
+                if prev and (len(prev) > len(cur) or cur[:len(prev)] != prev):
+                    cur_set = set(cur)
+                    keep_bit = ~(1 << r)
+                    share = (1 << self.n) if (len(prev) * BLOCK >= self.shared_min_tokens) else 0
+                    for h in prev:
+                        if h not in self.blocks:
+                            continue
+                        m = self.blocks[h]
+                        if h not in cur_set:
+                            m &= keep_bit
+                        m |= share
+                        if m:
+                            self.blocks[h] = m
+                        else:
+                            del self.blocks[h]
+                self.live_chains[r] = cur
+            r_bit = 1 << r
+            for h in cur:
+                self.blocks[h] = self.blocks.pop(h, 0) | r_bit
             while len(self.blocks) > self.cap:
                 self.blocks.popitem(last=False)
+
+    def demote_live(self, r: int, *, parked: bool = True) -> None:
+        """Replica r handed off its live conversation (e.g. via PARK): drop its live bit and optionally mark
+        those blocks as available in the shared store."""
+        with self.lock:
+            prev = self.live_chains[r]
+            self.live_chains[r] = []
+            if not prev:
+                return
+            keep_bit = ~(1 << r)
+            share = (1 << self.n) if (self.shared_parking and parked and len(prev) * BLOCK >= self.shared_min_tokens) else 0
+            for h in prev:
+                if h not in self.blocks:
+                    continue
+                m = (self.blocks[h] & keep_bit) | share
+                if m:
+                    self.blocks[h] = m
+                else:
+                    del self.blocks[h]
 
     def forget(self, r: int) -> None:
         """Replica r lost its cache (it restarted)."""
         with self.lock:
+            self.live_chains[r] = []
             bit = ~(1 << r)
             for h in [h for h, m in self.blocks.items() if m >> r & 1]:
+                m = self.blocks[h] & bit
+                if m:
+                    self.blocks[h] = m
+                else:
+                    del self.blocks[h]
+
+    def forget_shared(self) -> None:
+        """Clear shared parent-parking bits (on store unload or #879 nonfinite clear)."""
+        if not self.shared_parking:
+            return
+        with self.lock:
+            bit = ~(1 << self.n)
+            for h in [h for h, m in self.blocks.items() if m >> self.n & 1]:
                 m = self.blocks[h] & bit
                 if m:
                     self.blocks[h] = m
@@ -455,11 +629,24 @@ class ReplicaEngine:
 
     def __init__(self, engines: list, load_tokens: int = LOAD_TOKENS, *, pull: bool = False,
                  starve_s: float = PULL_STARVE_S, poll_s: float = PULL_POLL_S, beat_s: float = PULL_BEAT_S,
-                 queue_timeout_s: float | None = None, max_queue: int | None = None, parent_parking=None):
+                 queue_timeout_s: float | None = None, max_queue: int | None = None,
+                 prefer_idle_s: float | None = None, priorities: list[float] | None = None,
+                 parent_parking=None):
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
         if not isinstance(pull, bool):
             raise ReplicaConfigError(f'"replica_pull" must be true or false, not {pull!r}')
+        if prefer_idle_s is not None:
+            if isinstance(prefer_idle_s, bool) or not isinstance(prefer_idle_s, (int, float)) \
+                    or not math.isfinite(prefer_idle_s) or not 0.0 <= prefer_idle_s <= 3600.0:
+                raise ReplicaConfigError(f'"replica_prefer_idle_s" must be seconds in 0..3600, not {prefer_idle_s!r}')
+        if priorities is not None:
+            if len(priorities) != len(engines):
+                raise ReplicaConfigError(
+                    f"priorities length ({len(priorities)}) does not match replicas ({len(engines)})")
+            for i, p in enumerate(priorities):
+                if isinstance(p, bool) or not isinstance(p, (int, float)) or not math.isfinite(p):
+                    raise ReplicaConfigError(f'replicas[{i}]."priority" must be a finite number, not {p!r}')
         if pull:                                    # the MVP pulls one request into one engine, never into a slot
             slots = [int(getattr(e, "batch", 0) or 0) for e in engines]
             if any(slots):
@@ -484,7 +671,9 @@ class ReplicaEngine:
                 raise ReplicaConfigError(f'"replica_max_queue" must be a whole number in 0..4096, not {max_queue!r}')
         d = self.__dict__
         d["engines"] = list(engines)
-        d["router"] = Router(len(engines))
+        park_cfg = getattr(parent_parking, "_config", None)
+        shared_min = getattr(park_cfg, "min_tokens", 0) or 0
+        d["router"] = Router(len(engines), shared_parking=parent_parking is not None, shared_min_tokens=shared_min)
         d["load_tokens"] = load_tokens
         d["inflight"] = [0] * len(engines)
         d["run_locks"] = [threading.Lock() for _ in engines]    # an engine without batch slots: one request at a time
@@ -496,10 +685,18 @@ class ReplicaEngine:
         d["pull_beat_s"] = float(beat_s)
         d["queue_timeout_s"] = float(queue_timeout_s) if queue_timeout_s is not None else None
         d["max_queue"] = max_queue
+        d["prefer_idle_s"] = float(prefer_idle_s) if prefer_idle_s is not None else None
+        if priorities is not None:
+            d["priorities"] = [float(p) for p in priorities]
+        elif prefer_idle_s is not None:
+            d["priorities"] = [1.0 if k == 0 else 0.0 for k in range(len(engines))]
+        else:
+            d["priorities"] = [0.0] * len(engines)
+        d["idle_since"] = [time.monotonic()] * len(engines)
         d["pull_seq"] = 0
         d["pending"] = collections.OrderedDict()    # seq -> PullRequest, order = arrival: the oldest is the first
         d["pull_stats"] = {"submitted": 0, "assigned": 0, "starved": 0, "cancelled": 0, "closed": 0,
-                           "timeouts": 0, "no_replica": 0, "rejected": 0}
+                           "timeouts": 0, "no_replica": 0, "rejected": 0, "migrated": 0, "migrate_fallbacks": 0}
         d["last_pick"] = None                   # {"replica", "reason", "at"} of the last assignment (for /metrics)
         d["tl"] = threading.local()
         d["healing"] = {}
@@ -643,7 +840,9 @@ class ReplicaEngine:
             for row in rows:
                 row["queue"] = {"depth": queue["pending"], "oldest_s": queue["oldest_pending_s"],
                                 "picked": queue["picked"], "reason": queue["reason"],
-                                "max": queue["max_queue"], "timeout_s": queue["queue_timeout_s"]}
+                                "max": queue["max_queue"], "timeout_s": queue["queue_timeout_s"],
+                                "migrated": queue["migrated"], "migrate_fallbacks": queue["migrate_fallbacks"],
+                                "prefer_idle_s": queue["prefer_idle_s"]}
         return rows
 
     def pull_view(self) -> dict:
@@ -659,6 +858,7 @@ class ReplicaEngine:
                 "oldest_pending_s": round(now - oldest.arrive, 3) if oldest is not None else None,
                 "starve_s": self.pull_starve_s, "poll_s": self.pull_poll_s, "beat_s": self.pull_beat_s,
                 "queue_timeout_s": self.queue_timeout_s, "max_queue": self.max_queue,
+                "prefer_idle_s": self.prefer_idle_s,
                 "picked": pick["replica"] if pick else None, "reason": pick["reason"] if pick else None,
                 **stats}
 
@@ -671,6 +871,8 @@ class ReplicaEngine:
             try:
                 self.engines[k].restart(tries)
                 self.router.forget(k)
+                with self.cv:
+                    self.idle_since[k] = time.monotonic()
             except BaseException as e:           # noqa: BLE001
                 errors[k] = e
         ts = [threading.Thread(target=one, args=(k,), daemon=True) for k in dead]
@@ -689,6 +891,7 @@ class ReplicaEngine:
                 e.unload()
             for k in range(len(self.engines)):
                 self.router.forget(k)
+            self.router.forget_shared()
         finally:
             store = self.__dict__.get("parent_parking")
             if store is not None:                   # plan §12.3: the engines are down, so the store's RAM goes too
@@ -721,7 +924,7 @@ class ReplicaEngine:
                 return -1
             cost = {k: (len(ids) - got[k]) + self.load_tokens * self.inflight[k] for k in alive}
             # the least loaded wins a tie of cost (equal cards, nothing cached): spread, do not pile on replica 0
-            k = min(alive, key=lambda k: (cost[k], self.inflight[k], self.routed[k]))
+            k = min(alive, key=lambda k: (cost[k], self.inflight[k], -self.priorities[k], self.routed[k]))
             self.inflight[k] += 1
             self.routed[k] += 1
         if len(alive) < len(self.engines):
@@ -744,6 +947,8 @@ class ReplicaEngine:
                     print(f"[strata] replica {k} had stopped; starting it again", flush=True)
                     self.engines[k].restart()
                     self.router.forget(k)
+                    with self.cv:
+                        self.idle_since[k] = time.monotonic()
                     print(f"[strata] replica {k} is running again", flush=True)
                 except BaseException as x:       # noqa: BLE001
                     print(f"[strata] replica {k} did not start again: {x}", flush=True)
@@ -757,8 +962,8 @@ class ReplicaEngine:
         generator, so the heartbeat goes out on the request's own turn and the server's keep-alive is unchanged.
         A free replica takes it at once (the pump); otherwise it waits in the one shared queue, and every slot that
         frees is given to the waiting request that would re-read the least of its prompt (or to the oldest one, after
-        replica_starve_s).  Returns the replica index, or -1 when the client left (its queue entry removed).  The
-        assignment and inflight + 1 are one step under self.cv; generation happens outside it."""
+        replica_starve_s).  Returns `(replica, migrate_from)`, or `(-1, None)` when the client left (its queue entry
+        removed).  The assignment and inflight + 1 are one step under self.cv; generation happens outside it."""
         from serve.server import EngineDied, QueueWaitExpired
         now = time.monotonic()
         entry = PullRequest()
@@ -782,16 +987,18 @@ class ReplicaEngine:
         heal = self._pull_some_dead()
         beat = time.monotonic()
         taken = False
+        mig_src = None
         try:
             while True:
                 with self.cv:
                     if entry.replica is not None:   # assigned: this request owns a slot from here
                         k = entry.replica
+                        mig_src = entry.migrate_from
                         break
                     now = time.monotonic()
                     if cancel is not None and cancel.is_set():
                         self._pull_drop_locked(entry, "cancelled")
-                        return -1
+                        return -1, None
                     if entry.deadline is not None and now >= entry.deadline:
                         self._pull_drop_locked(entry, "timeouts")
                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
@@ -802,6 +1009,7 @@ class ReplicaEngine:
                     self._pull_pump_locked(now)     # a healed replica, or a request that has waited long enough
                     if entry.replica is not None:
                         k = entry.replica
+                        mig_src = entry.migrate_from
                         break
                     left = None if entry.deadline is None else max(0.0, entry.deadline - now)
                     self.cv.wait(timeout=min(self.pull_poll_s, left) if left is not None else self.pull_poll_s)
@@ -812,12 +1020,19 @@ class ReplicaEngine:
                     beat = time.monotonic()
                     yield None                      # the None the server turns into a keep-alive
             taken = True
-            return k
+            return k, mig_src
         finally:
             with self.cv:
                 if not taken:
                     if entry.replica is not None:   # a slot was given but this waiter leaves before using it
                         self.inflight[entry.replica] -= 1
+                        if self.inflight[entry.replica] == 0:
+                            self.idle_since[entry.replica] = time.monotonic()
+                        if entry.migrate_from is not None:
+                            self.inflight[entry.migrate_from] -= 1
+                            if self.inflight[entry.migrate_from] == 0:
+                                self.idle_since[entry.migrate_from] = time.monotonic()
+                            entry.migrate_from = None
                         self.pull_stats["closed"] += 1
                         entry.replica = None
                         self._pull_pump_locked(time.monotonic())
@@ -834,10 +1049,16 @@ class ReplicaEngine:
             return
         free = [k for k, e in enumerate(self.engines) if e.alive() and not self.inflight[k]]
         while free:
-            pick = pull_choose(self.pending, free, now, self.pull_starve_s, self.router.matched)
+            pick = pull_choose(self.pending, free, now, self.pull_starve_s, self.router.matched,
+                               priorities=self.priorities, idle_since=self.idle_since,
+                               prefer_idle_s=self.prefer_idle_s, live_matched_of=self.router.live_matched)
             if pick is None:
                 break
             entry, k, starved = pick
+            mig_src = entry.migrate_from
+            if mig_src is not None and (mig_src == k or mig_src not in free):
+                mig_src = None
+                entry.migrate_from = None
             self.pending.pop(entry.seq, None)       # the assignment and inflight + 1 are one step under self.cv
             entry.replica = k
             self.inflight[k] += 1
@@ -845,12 +1066,97 @@ class ReplicaEngine:
             self.pull_stats["assigned"] += 1
             if starved:
                 self.pull_stats["starved"] += 1
+            if mig_src is not None:
+                self.inflight[mig_src] += 1
+                self.pull_stats["migrated"] += 1
+                free.remove(mig_src)
+            reason = ("starved" if starved else
+                      ("prefer-idle" if mig_src is not None else
+                       ("reuse" if entry.matched and entry.matched[k] else "min-reread")))
             self.last_pick = {"replica": k,
-                              "reason": "starved" if starved else
-                                        ("reuse" if entry.matched and entry.matched[k] else "min-reread"),
+                              "reason": reason,
+                              **({"from": mig_src} if mig_src is not None else {}),
                               "at": time.monotonic()}
             free.remove(k)
         self.cv.notify_all()
+
+    def _release_migration_src(self, src: int) -> None:
+        with self.cv:
+            self.inflight[src] -= 1
+            if self.inflight[src] == 0:
+                self.idle_since[src] = time.monotonic()
+            self._pull_pump_locked(time.monotonic())
+            self.cv.notify_all()
+
+    def _complete_migration(self, dst: int, src: int, ids, cancel) -> int:
+        """Ask the lower-priority idle replica `src` to PARK its live conversation so `dst` can restore it;
+        returns `dst` on success (or harmless no-op) and falls back to `src` if PARK failed on a long live session."""
+        from serve.server import EngineDied
+        src_lock = self.run_locks[src]
+        acquired = False
+        try:
+            while not acquired:
+                acquired = src_lock.acquire(timeout=0.25)
+                if not acquired and cancel is not None and cancel.is_set():
+                    with self.cv:
+                        for rep in (dst, src):
+                            self.inflight[rep] -= 1
+                            if self.inflight[rep] == 0:
+                                self.idle_since[rep] = time.monotonic()
+                        self.routed[dst] = max(0, self.routed[dst] - 1)
+                        self.pull_stats["cancelled"] += 1
+                        self._pull_pump_locked(time.monotonic())
+                        self.cv.notify_all()
+                    return -1
+            park_fn = getattr(self.engines[src], "park", None)
+            if park_fn is None:
+                res = {"status": "published"}
+            else:
+                try:
+                    res = park_fn()
+                except (ValueError, EngineDied, OSError) as exc:
+                    res = {"status": "error", "error": str(exc)}
+        except BaseException:
+            if acquired:
+                src_lock.release()
+                acquired = False
+            with self.cv:
+                for rep in (dst, src):
+                    self.inflight[rep] -= 1
+                    if self.inflight[rep] == 0:
+                        self.idle_since[rep] = time.monotonic()
+                self._pull_pump_locked(time.monotonic())
+                self.cv.notify_all()
+            raise
+        if acquired:
+            src_lock.release()
+
+        status = res.get("status") if isinstance(res, dict) else None
+        if status in ("published", "dedup", "minimum", "empty", "off"):
+            self.router.demote_live(src, parked=(status in ("published", "dedup")))
+            self._release_migration_src(src)
+            return dst
+
+        src_alive = self.engines[src].alive()
+        live_src = self.router.live_matched(ids)[src]
+        dst_got = self.router.matched(ids)[dst]
+        if src_alive and (live_src - dst_got) >= max(BLOCK, self.router.shared_min_tokens):
+            with self.cv:
+                self.inflight[dst] -= 1
+                if self.inflight[dst] == 0:
+                    self.idle_since[dst] = time.monotonic()
+                self.routed[dst] = max(0, self.routed[dst] - 1)
+                self.routed[src] += 1
+                self.pull_stats["migrate_fallbacks"] += 1
+                self.last_pick = {"replica": src, "reason": "migrate-fallback", "at": time.monotonic()}
+                self._pull_pump_locked(time.monotonic())
+                self.cv.notify_all()
+            return src
+
+        self._release_migration_src(src)
+        if not src_alive:
+            self.heal()
+        return dst
 
     def _pull_drop_locked(self, entry: PullRequest, reason: str) -> None:
         """Take this request out of the queue, if it is still in it; idempotent, so a request that was already
@@ -871,9 +1177,13 @@ class ReplicaEngine:
         # imported here: serve.server imports this module
         from serve.server import EngineDied, EngineNonFinite
         if self.pull_enabled:                                # opt-in: wait in the shared queue for a free replica
-            k = yield from self._pull_wait(ids, cancel)
+            k, mig_src = yield from self._pull_wait(ids, cancel)
             if k < 0:                                        # the client left before a replica was free: nothing to do
                 return
+            if mig_src is not None:
+                k = self._complete_migration(k, mig_src, ids, cancel)
+                if k < 0:
+                    return
         else:                                                # the old order: a replica at once, then run_locks
             k = self.route(ids)
             if k < 0:
@@ -942,20 +1252,28 @@ class ReplicaEngine:
                         # below) must see the fresh map, and the freed control line before it can run (design §5.5)
                         if nonfinite:                   # #879: the engine dropped every cached conversation
                             self.router.forget(k)
+                            if self.__dict__.get("parent_parking") is not None:
+                                self.router.forget_shared()
                         elif produced:
                             self.router.note(k, list(ids) + produced)
                         if held:
                             self.run_locks[k].release()
                         with self.cv:
                             self.inflight[k] -= 1
+                            if self.inflight[k] == 0:
+                                self.idle_since[k] = time.monotonic()
                             self._pull_pump_locked(time.monotonic())
                     else:
                         if held:
                             self.run_locks[k].release()
                         with self.lock:
                             self.inflight[k] -= 1
+                            if self.inflight[k] == 0:
+                                self.idle_since[k] = time.monotonic()
                         if nonfinite:                   # #879: the engine dropped every cached conversation
                             self.router.forget(k)
+                            if self.__dict__.get("parent_parking") is not None:
+                                self.router.forget_shared()
                         elif produced:
                             self.router.note(k, list(ids) + produced)
 

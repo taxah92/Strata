@@ -85,7 +85,9 @@ store evicting more old entries before a restore than a per-replica budget would
 ## Configuration
 
 ```json
+"replicas": [{"gpus": [0], "priority": 10}, {"gpus": [1], "priority": 0}],
 "replica_pull": true,
+"replica_prefer_idle_s": 45,
 "replica_parent_parking": {
   "enabled": true,
   "ram_gib": 40,
@@ -104,6 +106,10 @@ store evicting more old entries before a restore than a per-replica budget would
 | `min_tokens` | optional, default 0: park only conversations of at least this many tokens (independent of `--conversation-cache-min-tokens`) |
 | `min_gain` | default 4096: restore from the store only for at least this many more reused tokens than the live session or a batch slot offers |
 | `ipc_timeout_ms` | default 2000: the bound on every control exchange, not on the K/V transfer |
+| `replicas[].priority` / `replica_prefer` | optional per-replica routing priority (higher wins equal-cost ties and receives idle migrations); `replica_prefer` accepts a replica index or ordered list |
+| `replica_prefer_idle_s` | optional idle threshold in seconds (`0..3600`): when a higher-priority free replica has been idle for at least this long, the pull scheduler sends `PARK` to an idle lower-priority replica holding a live conversation and moves the request onto the higher-priority replica (with safe fallback back to the source replica if `PARK` fails on capacity) |
+
+With `replica_parent_parking` enabled, the router tracks each replica's current live conversation separately from conversations already displaced into the shared RAM store: once a conversation is parked in the shared store, all replicas tie on restore cost and higher-priority replicas win immediately without waiting for `replica_prefer_idle_s` or sending `PARK`.
 
 The server writes the engine flags itself (`--conversation-parent-parking-fd`, `-owner`, `-min-tokens`, `-min-gain`,
 `-timeout-ms`); they are not meant to be written by hand. The engine refuses a start it cannot
