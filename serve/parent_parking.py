@@ -954,6 +954,28 @@ class ParentParkingStore:
                 self._sel.unregister(conn.sock)
         except (KeyError, ValueError, OSError):
             pass
+        # Drain unread rx frames before close() so Linux unix_release_sock does
+        # not raise ECONNRESET on the peer socket ahead of an already-queued OP_ERROR.
+        # Note: Python stdlib socket.recv_fds ignores its `flags` argument, so switch
+        # the closing socket to non-blocking before draining.
+        try:
+            conn.sock.setblocking(False)
+            for _ in range(64):
+                try:
+                    data, fds, _flags, _addr = socket.recv_fds(
+                        conn.sock, HEADER.size + MAX_PAYLOAD + 1, MAX_FDS
+                    )
+                except (BlockingIOError, InterruptedError, OSError):
+                    break
+                for fd in fds:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                if not data:
+                    break
+        except OSError:
+            pass
         try:
             conn.sock.close()
         except OSError:
