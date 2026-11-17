@@ -53,6 +53,38 @@ A restore is three short exchanges and one descriptor handover:
 The lease is held until the materialized image is destroyed, after the GPU restore, so the store's budget counts the
 heap image while the next conversation parks.
 
+### Superseded, and the prefix hashes
+
+Publishing (COMMIT) drops every older snapshot of the same conversation whose deepest checkpoint the new one still
+holds: that snapshot only adds the tail the client rewrote.  A checkpoint counts as held in two ways:
+
+- it is one of the new snapshot's own points (verbatim, as before), or
+- its `(tokens, hash)` pair is in the `prefix_hashes` the client sent: the outgoing ids' hash at exactly that prefix
+  length (seed `STRIDS01`, the same function `MATCH_END` uses), with the same pictures below the checkpoint
+  (`_images_below`).
+
+The second way covers the case the verbatim check misses: a harness evicted the checkpoint from the `--prompt-cache`
+ring between two publishes of one linear conversation, so the new snapshot no longer names it.  The pictures below the
+checkpoint must match too, so two branches that parted before the checkpoint (or the same tokens with other images)
+are never dropped.
+
+`PARK_ADVICE` drives this in one pass.  Besides `parked_prefix_tokens` the answer carries `prefix_lengths`: the sorted
+unique lengths of the deepest checkpoints the outgoing state does not hold (at most 4096, none past the outgoing live
+point, pictures below matching).  The engine hashes its ids at exactly those lengths and sends them as the optional
+`prefix_hashes` of `PARK_BEGIN` (and, when `min_gain` is on and an advised length is close enough to cancel the park,
+of a second `PARK_ADVICE`, which re-counts `parked_prefix_tokens` before the measure).  When `prefix_lengths` is empty
+no hashing happens at all.
+
+The keys are optional on both sides and the order of deployment does not matter.  An old client never sends
+`prefix_hashes` and ignores the extra answer key: it parks exactly as before.  An old store never answers
+`prefix_lengths`: the client reads that as none and sends no hashes.  A malformed `prefix_hashes` list is a
+`bad_request` that leaves the channel open — the keys are a supersede hint, not part of the snapshot's identity, so a
+retried BEGIN with the same `publish_id` never fails on them.
+
+A superseded entry with an active lease is **retired, not freed**: it leaves the index but its bytes stay charged
+(`retired_lease_bytes`) until the last reader releases the lease.  This is deliberate and unlike eviction, which keeps
+a leased entry in the index.
+
 ## What it replaces
 
 The local heap cache is **replaced, not duplicated**: in this mode the engine creates its `ConversationCache` with a

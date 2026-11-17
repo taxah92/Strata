@@ -13440,6 +13440,25 @@ int main(int argc, char** argv) {
                 if (out) { out->dedup = true; out->published = true; }
                 return skip("the store already holds this snapshot", "dedup");
             }
+            // the deepest checkpoints the outgoing state does not hold but may supersede by a prefix hash: one pass
+            // over the ids, as the restore path hashes them (parent_hashes, seed STRIDS01).  The store validates the
+            // lengths, so a length past the live end cannot come back.
+            std::vector<std::pair<int64_t, uint64_t>> prefix_hashes;
+            if (!advice.prefix_lengths.empty()) {
+                prefix_hashes = strata::core::parent_hashes(src.ids, advice.prefix_lengths);
+                // a parked copy this snapshot would supersede can still cancel the park when min_gain is on; the first
+                // answer counted only the held checkpoints, so ask again with the hashes (not under force_gain: a
+                // handoff parks regardless of the gain)
+                const int64_t min_gain = o.conversation_parent_parking_min_gain;
+                const bool near = std::any_of(prefix_hashes.begin(), prefix_hashes.end(), [&](const auto& h) {
+                    return h.first > (int64_t) n_tokens - min_gain;
+                });
+                if (!force_gain && min_gain > 0 && near &&
+                    !conv_parent.advice(points, src.cvec, advice, e, prefix_hashes)) {
+                    parent_note_degraded(e);
+                    return skip(e, "advice");
+                }
+            }
             if (!force_gain && o.conversation_parent_parking_min_gain > 0 && advice.parked_prefix_tokens > 0 &&
                 (int64_t) n_tokens < advice.parked_prefix_tokens + o.conversation_parent_parking_min_gain)
                 return skip("the store's copy at " + std::to_string((long long) advice.parked_prefix_tokens) +
@@ -13485,7 +13504,7 @@ int main(int argc, char** argv) {
             const std::string publish_id = strata::core::parent_publish_id();
             strata::core::ParentPending pending;
             bool dedup = false;
-            if (!conv_parent.begin(publish_id, points, src.cvec, stage_bytes, pending, dedup, e)) {
+            if (!conv_parent.begin(publish_id, points, src.cvec, stage_bytes, pending, dedup, e, prefix_hashes)) {
                 parent_note_degraded(e);
                 return skip(e, conv_parent.degraded() ? "degraded" : "capacity");
             }

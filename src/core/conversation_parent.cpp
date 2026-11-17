@@ -494,6 +494,19 @@ bool checked_sum(const std::vector<uint64_t>& values, uint64_t& out) {
     return true;
 }
 
+void put_hashes(JsonOut& j, const std::vector<std::pair<int64_t, uint64_t>>& hashes) {
+    j.array_begin();
+    for (const auto& h : hashes) {
+        j.object_begin();
+        j.key("tokens");
+        j.i64(h.first);
+        j.key("hash");
+        j.u64(h.second);
+        j.object_end();
+    }
+    j.array_end();
+}
+
 void put_points(JsonOut& j, const std::vector<ParentPoint>& points) {
     j.array_begin();
     for (const auto& p : points) {
@@ -1268,7 +1281,7 @@ bool ConversationParentClient::request(uint16_t op, const std::string& payload, 
 }
 
 bool ConversationParentClient::advice(const std::vector<ParentPoint>& points, bool cvec, ParentAdvice& out,
-                                      std::string& error) {
+                                      std::string& error, const std::vector<std::pair<int64_t, uint64_t>>& prefix_hashes) {
     out = {};
     if (points.size() > kMaxPoints) {
         error = "parent parking: bad_request: too many resume points";
@@ -1280,6 +1293,10 @@ bool ConversationParentClient::advice(const std::vector<ParentPoint>& points, bo
     j.boolean(cvec);
     j.key("points");
     put_points(j, points);
+    if (!prefix_hashes.empty()) {
+        j.key("prefix_hashes");
+        put_hashes(j, prefix_hashes);
+    }
     j.object_end();
     std::string response;
     std::vector<int> fds;
@@ -1298,6 +1315,27 @@ bool ConversationParentClient::advice(const std::vector<ParentPoint>& points, bo
         error = last_error_;
         return false;
     }
+    const std::vector<Json>* items = nullptr;
+    if (r.get_array("prefix_lengths", items)) {
+        // an old store does not send the key: nothing the snapshot could supersede by a hash
+        const int64_t live_tokens = !points.empty() && points[0].live ? points[0].tokens : 0;
+        int64_t previous = 0;
+        for (const auto& v : *items) {
+            int64_t length = 0;
+            if (!v.as_i64(length)) {
+                degrade("parent parking: protocol: a prefix length is not an integer");
+                error = last_error_;
+                return false;
+            }
+            if (length <= previous || length < 1 || length > live_tokens) {
+                degrade("parent parking: protocol: the prefix lengths are not sorted, unique and inside the live point");
+                error = last_error_;
+                return false;
+            }
+            previous = length;
+            parsed.prefix_lengths.push_back(length);
+        }
+    }
     uint64_t epoch = 0;
     if (r.get_u64("epoch", epoch)) epoch_ = epoch;
     out = parsed;
@@ -1306,7 +1344,7 @@ bool ConversationParentClient::advice(const std::vector<ParentPoint>& points, bo
 
 bool ConversationParentClient::begin(const std::string& publish_id, const std::vector<ParentPoint>& points, bool cvec,
                                      const std::vector<uint64_t>& stage_bytes, ParentPending& out, bool& dedup,
-                                     std::string& error) {
+                                     std::string& error, const std::vector<std::pair<int64_t, uint64_t>>& prefix_hashes) {
     out.reset();
     dedup = false;
     if (!valid_publish_id(publish_id)) {
@@ -1356,6 +1394,10 @@ bool ConversationParentClient::begin(const std::string& publish_id, const std::v
     j.boolean(cvec);
     j.key("points");
     put_points(j, points);
+    if (!prefix_hashes.empty()) {
+        j.key("prefix_hashes");
+        put_hashes(j, prefix_hashes);
+    }
     j.key("stage_bytes");
     j.array_begin();
     for (uint64_t n : stage_bytes) j.u64(n);
@@ -1625,16 +1667,7 @@ bool ConversationParentClient::match_end(uint64_t cookie, const std::vector<std:
     j.key("cookie");
     j.u64(cookie);
     j.key("hashes");
-    j.array_begin();
-    for (const auto& h : hashes) {
-        j.object_begin();
-        j.key("tokens");
-        j.i64(h.first);
-        j.key("hash");
-        j.u64(h.second);
-        j.object_end();
-    }
-    j.array_end();
+    put_hashes(j, hashes);
     j.object_end();
     std::string response;
     std::vector<int> fds;
