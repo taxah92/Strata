@@ -112,20 +112,27 @@ class Client:
         self.epoch = body["epoch"]
         return body
 
-    def advice(self, points, cvec=False):
-        body, _ = self.call_ok(pp.OP_PARK_ADVICE, {"cvec": cvec, "points": list(points)})
+    def advice(self, points, cvec=False, *, prefix_hashes=None):
+        payload = {"cvec": cvec, "points": list(points)}
+        if prefix_hashes is not None:
+            payload["prefix_hashes"] = [{"tokens": tokens, "hash": h} for tokens, h in prefix_hashes]
+        body, _ = self.call_ok(pp.OP_PARK_ADVICE, payload)
         return body
 
-    def begin_payload(self, points, sizes, *, publish_id=None, cvec=False, epoch=None, owner=None):
-        return {"publish_id": publish_id or new_publish_id(), "owner": owner or self.owner,
-                "model": IDENTITY.model, "config": IDENTITY.config, "layout_key": IDENTITY.layout_key,
-                "stages": [list(stage) for stage in IDENTITY.stages], "cvec": cvec, "points": list(points),
-                "stage_bytes": list(sizes), "epoch": self.epoch if epoch is None else epoch}
+    def begin_payload(self, points, sizes, *, publish_id=None, cvec=False, epoch=None, owner=None, prefix_hashes=None):
+        payload = {"publish_id": publish_id or new_publish_id(), "owner": owner or self.owner,
+                   "model": IDENTITY.model, "config": IDENTITY.config, "layout_key": IDENTITY.layout_key,
+                   "stages": [list(stage) for stage in IDENTITY.stages], "cvec": cvec, "points": list(points),
+                   "stage_bytes": list(sizes), "epoch": self.epoch if epoch is None else epoch}
+        if prefix_hashes is not None:
+            payload["prefix_hashes"] = [{"tokens": tokens, "hash": h} for tokens, h in prefix_hashes]
+        return payload
 
-    def begin(self, points, sizes, *, publish_id=None, cvec=False, epoch=None):
+    def begin(self, points, sizes, *, publish_id=None, cvec=False, epoch=None, prefix_hashes=None):
         publish_id = publish_id or new_publish_id()
         body, fds = self.call_ok(pp.OP_PARK_BEGIN,
-                                 self.begin_payload(points, sizes, publish_id=publish_id, cvec=cvec, epoch=epoch))
+                                 self.begin_payload(points, sizes, publish_id=publish_id, cvec=cvec, epoch=epoch,
+                                                    prefix_hashes=prefix_hashes))
         return publish_id, body, fds
 
     def commit(self, publish_id, pending_id, sizes, *, epoch=None):
@@ -134,8 +141,9 @@ class Client:
                                 "written_bytes": list(sizes), "epoch": self.epoch if epoch is None else epoch})
         return body
 
-    def publish(self, points, sizes, *, publish_id=None, cvec=False, data=None, write=True):
-        publish_id, begin, fds = self.begin(points, sizes, publish_id=publish_id, cvec=cvec)
+    def publish(self, points, sizes, *, publish_id=None, cvec=False, data=None, write=True, prefix_hashes=None):
+        publish_id, begin, fds = self.begin(points, sizes, publish_id=publish_id, cvec=cvec,
+                                            prefix_hashes=prefix_hashes)
         if begin["dedup"]:
             for fd in fds:
                 os.close(fd)
@@ -466,6 +474,103 @@ class ParentParkingProtocol(StoreCase):
         stats = self.store.snapshot()
         self.assertEqual((stats["entries"], stats["superseded"]), (1, 1))
         self.assertEqual(stats["longest_tokens"], 120)
+
+    def test_supersede_when_deepest_checkpoint_evicted_from_ring(self):
+        """The 100-token checkpoint left the client's cache ring before the second publish: the store cannot see it in
+        the new points, so the engine's prefix hash at 100 is what marks the old snapshot superseded."""
+        self.make_store()
+        r0 = self.client("r0")
+        _pid, e1 = r0.publish([point(120, 0x120, live=True), point(100, 0x100), point(20, 0x20)], [100])
+        a2 = [point(250, 0x250, live=True), point(200, 0x200), point(20, 0x20)]
+        advice = r0.advice(a2)
+        self.assertEqual((advice["holding_id"], advice["parked_prefix_tokens"]), (0, 0))
+        self.assertEqual(advice["prefix_lengths"], [100])
+        _pid, e2 = r0.publish(a2, [100], prefix_hashes=[(100, 0x100)])
+        stats = self.store.snapshot()
+        self.assertEqual((stats["entries"], stats["superseded"]), (1, 1))
+        self.assertNotEqual(e2["id"], e1["id"])
+
+    def test_branch_with_different_hash_at_deepest_is_not_superseded(self):
+        """Two branches that parted before the deepest checkpoint: a wrong hash at 100 tokens keeps both snapshots."""
+        self.make_store()
+        r0 = self.client("r0")
+        _pid, _e1 = r0.publish([point(120, 0x120, live=True), point(100, 0x100), point(20, 0x20)], [100])
+        branch = [point(250, 0x250, live=True), point(200, 0x200), point(20, 0x20)]
+        advice = r0.advice(branch)
+        self.assertEqual(advice["prefix_lengths"], [100])
+        _pid, _e2 = r0.publish(branch, [100], prefix_hashes=[(100, 0x999)])
+        stats = self.store.snapshot()
+        self.assertEqual((stats["entries"], stats["superseded"]), (2, 0))
+
+    def test_same_hash_different_images_is_not_superseded(self):
+        """Tokens and hash match at the deepest checkpoint but the pictures below it differ: not the same prefix."""
+        self.make_store()
+        r0 = self.client("r0")
+        _pid, _e1 = r0.publish([point(120, 0x120, imgs=[(5, 0x55)], live=True),
+                                point(100, 0x100, imgs=[(5, 0x55)])], [100])
+        a2 = [point(250, 0x250, live=True), point(200, 0x200)]
+        advice = r0.advice(a2)
+        self.assertEqual(advice["prefix_lengths"], [])          # the pictures below 100 do not match
+        _pid, _e2 = r0.publish(a2, [100], prefix_hashes=[(100, 0x100)])
+        stats = self.store.snapshot()
+        self.assertEqual((stats["entries"], stats["superseded"]), (2, 0))
+
+    def test_advice_min_gain_with_evicted_checkpoint_prefix(self):
+        """The first advice cannot see the evicted checkpoint; with the prefix hashes the second one counts it."""
+        self.make_store()
+        r0 = self.client("r0")
+        _pid, _e1 = r0.publish([point(120, 0x120, live=True), point(100, 0x100), point(20, 0x20)], [100])
+        a2 = [point(250, 0x250, live=True), point(200, 0x200), point(20, 0x20)]
+        first = r0.advice(a2)
+        self.assertEqual((first["parked_prefix_tokens"], first["prefix_lengths"]), (0, [100]))
+        second = r0.advice(a2, prefix_hashes=[(100, 0x100)])
+        self.assertEqual(second["parked_prefix_tokens"], 100)
+
+    def test_prefix_hashes_validation_errors(self):
+        """Unsorted, duplicate or past-the-live prefix hashes are a bad_request that leaves the channel open."""
+        self.make_store()
+        r0 = self.client("r0")
+        points = [point(200, 0x200, live=True), point(50, 0x50)]
+        for prefix_hashes in ([(100, 0x1), (50, 0x2)], [(100, 0x1), (100, 0x2)], [(300, 0x3)]):
+            with self.subTest(prefix_hashes=prefix_hashes):
+                payload = {"cvec": False, "points": list(points),
+                           "prefix_hashes": [{"tokens": tokens, "hash": h} for tokens, h in prefix_hashes]}
+                self.assert_error(r0, pp.OP_PARK_ADVICE, payload, "bad_request")
+                self.assertEqual(r0.ping()["epoch"], 1)         # the channel stays open
+        payload = r0.begin_payload(points, [100], prefix_hashes=[(100, 0x1), (50, 0x2)])
+        self.assert_error(r0, pp.OP_PARK_BEGIN, payload, "bad_request")
+        self.assertEqual(r0.ping()["epoch"], 1)
+
+    def test_old_client_without_prefix_keys_still_parks(self):
+        """A client that never sends prefix_hashes parks exactly as before, and the supersede rule on held points is
+        unchanged; the new answer key is simply ignored on the wire."""
+        self.make_store()
+        r0, r1 = self.client("r0"), self.client("r1")
+        _pid, e1 = r0.publish([point(120, 0x120, live=True), point(100, 0x100), point(50, HASH_CP)], [100])
+        a2 = [point(150, 0x150, live=True), point(100, 0x100), point(50, HASH_CP)]
+        advice = r1.advice(a2)
+        self.assertEqual((advice["parked_prefix_tokens"], advice["prefix_lengths"]), (100, []))
+        _pid, e2 = r1.publish(a2, [100])
+        stats = self.store.snapshot()
+        self.assertEqual((stats["entries"], stats["superseded"]), (1, 1))
+        self.assertNotEqual(e2["id"], e1["id"])
+
+    def test_supersede_leased_entry_is_retired_not_freed(self):
+        """A superseded entry with an active lease is retired (its bytes stay charged) until the reader releases it;
+        eviction would have kept it in the index instead."""
+        self.make_store(capacity_bytes=64 << 20)
+        r0, r1 = self.client("r0"), self.client("r1")
+        _pid, e1 = r0.publish([point(120, 0x120, live=True), point(100, 0x100), point(20, 0x20)], [100])
+        lease, fds = r1.acquire(e1["id"], e1["generation"])
+        os.close(fds[0])
+        _pid, e2 = r0.publish([point(250, 0x250, live=True), point(200, 0x200), point(20, 0x20)], [100],
+                              prefix_hashes=[(100, 0x100)])
+        self.assertEqual(e2["superseded"], 1)
+        stats = self.store.snapshot()
+        self.assertEqual((stats["entries"], stats["retired_lease_bytes"]), (1, 100))   # e2 stays, e1 is retired
+        r1.release(lease["lease_id"])
+        stats = self.store.snapshot()
+        self.assertEqual((stats["retired_lease_bytes"], stats["charged_bytes"]), (0, 100))
 
     def test_borrow_rule_and_pinned_donor(self):
         self.make_store()

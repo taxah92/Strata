@@ -378,6 +378,7 @@ class _Pending:
     bytes: int
     epoch: int
     meta: tuple
+    prefix_hashes: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -628,6 +629,25 @@ def _hashes(value) -> list:
     return out
 
 
+def _prefix_hashes(value, live_tokens: int) -> dict:
+    """The optional "prefix_hashes" of OP_PARK_ADVICE and OP_PARK_BEGIN: the outgoing ids' hashes at chosen prefix
+    lengths, sorted by strictly increasing lengths none of which passes the outgoing live point.  A bad list is a
+    bad_request that does not close the channel (the keys are an optional hint, not the snapshot's identity)."""
+    if value is None:
+        return {}
+    pairs = _hashes(value)
+    out = {}
+    previous = 0
+    for tokens, hash in pairs:
+        if tokens <= previous:
+            raise _bad('"prefix_hashes" must be sorted by unique token counts', close=False)
+        if tokens > live_tokens:
+            raise _bad('"prefix_hashes" cannot reach past the outgoing live point', close=False)
+        previous = tokens
+        out[tokens] = hash
+    return out
+
+
 def _images_below(images: tuple, tokens: int) -> tuple:
     return tuple(image for image in images if image[0] < tokens)
 
@@ -645,6 +665,21 @@ def _deepest_checkpoint(points: tuple) -> _Point | None:
         if deepest is None or point.tokens > deepest.tokens:
             deepest = point
     return deepest
+
+
+def _matches_deepest(entry: _Entry, cvec: bool, live_imgs: tuple, held_fn, prefix_map: dict) -> bool:
+    """Whether the outgoing state supersedes `entry` (ConversationDiskTier::drop_superseded's rule, prefix-extended):
+    the entry's deepest checkpoint is either held verbatim by the outgoing points, or its (tokens, hash) pair is in
+    `prefix_map` with the same pictures below it.  `prefix_map` is the outgoing ids' hashes at chosen prefix lengths."""
+    if entry.cvec != cvec:
+        return False
+    deepest = _deepest_checkpoint(entry.points)
+    if deepest is None or deepest.tokens <= 0:
+        return False
+    if held_fn(deepest):
+        return True
+    return (prefix_map.get(deepest.tokens) == deepest.hash and
+            _images_below(live_imgs, deepest.tokens) == deepest.imgs)
 
 
 def _deepest_point(entry: _Entry) -> _Point | None:
@@ -1163,21 +1198,25 @@ class ParentParkingStore:
 
     def _op_advice(self, conn: _Connection, req: dict) -> tuple:
         self._need_hello(conn)
-        _keys(req, ("cvec", "points"))
+        _keys(req, ("cvec", "points"), optional=("prefix_hashes",))
         cvec = _bool(req, "cvec")
         points = _points(req["points"])
+        live = next((point for point in points if point.live), None)
+        prefix_hashes = _prefix_hashes(req.get("prefix_hashes"), live.tokens if live is not None else 0)
         holding = self._holding(cvec, points)
         if holding is not None:
             self._touch(holding)
+        parked_prefix_tokens, prefix_lengths = self._parked_prefix(cvec, points, prefix_hashes)
         return OP_PARK_ADVICE, {"holding_id": holding.id if holding is not None else 0,
-                                "parked_prefix_tokens": self._parked_prefix(cvec, points),
+                                "parked_prefix_tokens": parked_prefix_tokens,
+                                "prefix_lengths": prefix_lengths,
                                 "entries": len(self._entries), "bytes": self._entry_bytes,
                                 "epoch": self._store_epoch}, []
 
     def _op_begin(self, conn: _Connection, req: dict) -> tuple:
         self._need_hello(conn)
         _keys(req, ("publish_id", "owner", "model", "config", "layout_key", "stages", "cvec", "points",
-                    "stage_bytes", "epoch"))
+                    "stage_bytes", "epoch"), optional=("prefix_hashes",))
         publish_id = _publish_id(req["publish_id"])
         owner = _owner_field(req)
         if owner != conn.owner:
@@ -1190,6 +1229,8 @@ class ParentParkingStore:
             raise _RequestError("identity", "identity does not match the store")
         cvec = _bool(req, "cvec")
         points = _points(req["points"])
+        live = next((point for point in points if point.live), None)
+        prefix_hashes = _prefix_hashes(req.get("prefix_hashes"), live.tokens if live is not None else 0)
         stage_bytes = _u64_list(req["stage_bytes"], "stage_bytes", max_len=MAX_STAGES)
         if len(stage_bytes) != len(stages):
             raise _bad("stage_bytes must name one size per stage")
@@ -1239,7 +1280,7 @@ class ParentParkingStore:
             raise _RequestError("internal", "cannot create a stage snapshot") from None
         self._next_pending_id += 1
         pending = _Pending(self._next_pending_id, publish_id, conn, owner, model, config, layout_key, stages, cvec,
-                           points, tuple(stage_bytes), fds, incoming, epoch, meta)
+                           points, tuple(stage_bytes), fds, incoming, epoch, meta, prefix_hashes)
         self._pending[pending.id] = pending
         self._pending_by_publish[publish_id] = pending.id
         self._pending_bytes += incoming
@@ -1315,7 +1356,7 @@ class ParentParkingStore:
         self._committed_by_publish[publish_id] = (entry.id, entry.generation, entry.bytes)
         while len(self._committed_by_publish) > COMMITTED_MEMORY:
             self._committed_by_publish.popitem(last=False)
-        superseded = self._drop_superseded(entry)
+        superseded = self._drop_superseded(entry, pending.prefix_hashes)
         return OP_PARK_COMMIT, {"id": entry.id, "generation": entry.generation, "entry_bytes": entry.bytes,
                                 "dedup": False, "entries": len(self._entries), "bytes": self._entry_bytes,
                                 "evictions": 0, "superseded": superseded}, []
@@ -1497,9 +1538,12 @@ class ParentParkingStore:
                 return entry
         return None
 
-    def _parked_prefix(self, cvec: bool, points: tuple) -> int:
-        """The deepest checkpoint of a committed snapshot that this outgoing state holds (parked_prefix_tokens)."""
+    def _parked_prefix(self, cvec: bool, points: tuple, prefix_map: dict | None = None) -> tuple:
+        """The deepest checkpoint of a committed snapshot that this outgoing state holds (parked_prefix_tokens), and
+        the sorted unique lengths of the deepest checkpoints it does not hold but may supersede by a prefix hash:
+        at most MAX_POINTS, not past the outgoing live point, pictures below the checkpoint matching."""
         live = next((point for point in points if point.live), None)
+        live_imgs = live.imgs if live is not None else ()
         checkpoints = [point for point in points if not point.live]
 
         def held(point: _Point) -> bool:
@@ -1508,15 +1552,21 @@ class ParentParkingStore:
             return any(_same_point(point, other) for other in checkpoints)
 
         longest = 0
+        lengths: set = set()
         for entry in self._entries.values():
             if entry.cvec != cvec:
                 continue
             deepest = _deepest_checkpoint(entry.points)
             if deepest is None or deepest.tokens <= 0:
                 continue
-            if held(deepest):
+            if held(deepest) or (prefix_map is not None and prefix_map.get(deepest.tokens) == deepest.hash and
+                                 _images_below(live_imgs, deepest.tokens) == deepest.imgs):
                 longest = max(longest, deepest.tokens)
-        return longest
+                continue
+            if live is not None and deepest.tokens <= live.tokens and \
+                    _images_below(live_imgs, deepest.tokens) == deepest.imgs:
+                lengths.add(deepest.tokens)
+        return longest, sorted(lengths)[:MAX_POINTS]
 
     def _borrows(self, entry: _Entry, tokens: int, live: bool) -> bool:
         """ConversationCache::borrows: not live, shallower than the deepest checkpoint, no pinned checkpoint at or
@@ -1532,10 +1582,13 @@ class ParentParkingStore:
             deepest = max(deepest, point.tokens)
         return tokens < deepest
 
-    def _drop_superseded(self, new_entry: _Entry) -> int:
+    def _drop_superseded(self, new_entry: _Entry, prefix_hashes: dict | None = None) -> int:
         """ConversationDiskTier::drop_superseded: an older snapshot whose deepest checkpoint the new one still holds
-        only adds the tail the client rewrote, so it goes (a leased one is retired, not freed)."""
+        only adds the tail the client rewrote, so it goes (a leased one is retired, not freed).  The deepest checkpoint
+        counts as held also when the new snapshot's prefix hash matches it (the checkpoint left the client's cache ring
+        between the two publishes)."""
         live = next((point for point in new_entry.points if point.live), None)
+        live_imgs = live.imgs if live is not None else ()
         checkpoints = [point for point in new_entry.points if not point.live]
 
         def held(point: _Point) -> bool:
@@ -1545,12 +1598,9 @@ class ParentParkingStore:
 
         dropped = 0
         for entry in list(self._entries.values()):
-            if entry.id == new_entry.id or entry.cvec != new_entry.cvec:
+            if entry.id == new_entry.id:
                 continue
-            deepest = _deepest_checkpoint(entry.points)
-            if deepest is None or deepest.tokens <= 0:
-                continue
-            if held(deepest):
+            if _matches_deepest(entry, new_entry.cvec, live_imgs, held, prefix_hashes or {}):
                 self._remove_entry(entry)
                 dropped += 1
         self._superseded += dropped
