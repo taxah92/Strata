@@ -44,10 +44,13 @@ struct ParentPoint {
 
 // The store's answer to "does anything already hold this conversation": the identical entry (dedup: nothing to write)
 // and the longest parked entry this conversation's outgoing state supersedes (ConversationCache::parked_prefix_tokens'
-// rule: parking now would only rewrite what a turn from now drops).
+// rule: parking now would only rewrite what a turn from now drops).  prefix_lengths are the deepest checkpoints of
+// parked entries the outgoing state does not hold but may supersede by a prefix hash (seed STRIDS01): the engine
+// hashes its ids at exactly those lengths and sends them back as prefix_hashes.
 struct ParentAdvice {
     uint64_t holding_id = 0;
     int64_t parked_prefix_tokens = 0;
+    std::vector<int64_t> prefix_lengths;
 };
 
 // A candidate the store offers for a prompt: what to acquire, and how much RAM the restore will be charged.
@@ -161,11 +164,16 @@ public:
     const std::string& last_error_code() const { return last_error_code_; }
 
     // PARK_ADVICE: the identical entry already in the store (dedup) and the longest entry this conversation supersedes.
-    bool advice(const std::vector<ParentPoint>& points, bool cvec, ParentAdvice& out, std::string& error);
+    // `prefix_hashes` (optional) are this conversation's ids hashed at the answer's prefix_lengths: the store counts
+    // them into parked_prefix_tokens.
+    bool advice(const std::vector<ParentPoint>& points, bool cvec, ParentAdvice& out, std::string& error,
+                const std::vector<std::pair<int64_t, uint64_t>>& prefix_hashes = {});
     // PARK_BEGIN: the store's memfds for this snapshot, one per stage, each sized to `stage_bytes[k]`.  A dedup answer
-    // leaves `out` invalid and sets `dedup` (nothing to write, no commit).
+    // leaves `out` invalid and sets `dedup` (nothing to write, no commit).  `prefix_hashes` (optional) let COMMIT drop
+    // an entry whose deepest checkpoint the new snapshot supersedes by a prefix hash.
     bool begin(const std::string& publish_id, const std::vector<ParentPoint>& points, bool cvec,
-               const std::vector<uint64_t>& stage_bytes, ParentPending& out, bool& dedup, std::string& error);
+               const std::vector<uint64_t>& stage_bytes, ParentPending& out, bool& dedup, std::string& error,
+               const std::vector<std::pair<int64_t, uint64_t>>& prefix_hashes = {});
     // PARK_COMMIT: seals the memfds and publishes.  Idempotent by publish_id (a lost ACK costs nothing).
     bool commit(const std::string& publish_id, const ParentPending& pending, uint64_t& id, uint64_t& generation,
                 std::string& error);

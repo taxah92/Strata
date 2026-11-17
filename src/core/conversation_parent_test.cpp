@@ -141,6 +141,26 @@ std::vector<uint64_t> field_u64_array(const std::string& json, const char* key) 
     }
     return out;
 }
+// The client's {"tokens":N,"hash":N} pairs (prefix_hashes in PARK_ADVICE and PARK_BEGIN); empty when the key is absent.
+std::vector<std::pair<int64_t, uint64_t>> field_hash_array(const std::string& json, const char* key) {
+    std::vector<std::pair<int64_t, uint64_t>> out;
+    const std::string needle = std::string("\"") + key + "\":[";
+    const size_t at = json.find(needle);
+    if (at == std::string::npos) return out;
+    const char* p = json.c_str() + at + needle.size();
+    while (*p != ']' && *p != '\0') {
+        if (*p == '{') {
+            long long tokens = 0;
+            unsigned long long hash = 0;
+            if (std::sscanf(p, "{\"tokens\":%lld,\"hash\":%llu}", &tokens, &hash) == 2)
+                out.emplace_back((int64_t) tokens, (uint64_t) hash);
+        }
+        while (*p != '\0' && *p != '}' && *p != ']') ++p;
+        if (*p == '}') ++p;
+        if (*p == ',') ++p;
+    }
+    return out;
+}
 
 int memfd_of(size_t size) {
     const int fd = ::memfd_create("strata-parent-test", MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -165,6 +185,8 @@ struct Broker {
     bool commit_without_answer = false;// drop the PARK_COMMIT answer (the client times out)
     bool acquire_stale = false;        // answer ACQUIRE with ERROR stale_generation
     bool match_empty = false;          // answer MATCH_BEGIN with no lengths
+    bool advice_prefixes = false;      // answer PARK_ADVICE with prefix_lengths [2]
+    bool advice_bad_prefixes = false;  // answer PARK_ADVICE with unsorted prefix_lengths [3,2]
 
     // state
     uint64_t epoch = 1;
@@ -172,6 +194,8 @@ struct Broker {
     uint64_t pending_id = 0;
     std::vector<int> pending_fds;
     std::vector<uint64_t> pending_bytes;
+    std::vector<std::pair<int64_t, uint64_t>> last_advice_hashes;
+    std::vector<std::pair<int64_t, uint64_t>> last_begin_hashes;
     uint64_t committed_id = 0, committed_generation = 0;
     std::vector<int> committed_fds;
     std::vector<uint64_t> committed_bytes;
@@ -263,12 +287,18 @@ struct Broker {
                         if (channels[i] == fd) { channels.erase(channels.begin() + (std::ptrdiff_t) i); break; }
                 }
                 return;
-            case kAdvice:
-                answer(fd, kAdvice, request_id,
-                       "{\"holding_id\":0,\"parked_prefix_tokens\":0,\"entries\":0,\"bytes\":0,\"epoch\":" +
-                           std::to_string(epoch) + "}");
+            case kAdvice: {
+                last_advice_hashes = field_hash_array(payload, "prefix_hashes");
+                std::string body = "{\"holding_id\":0,\"parked_prefix_tokens\":0,\"entries\":0,\"bytes\":0,\"epoch\":" +
+                                   std::to_string(epoch);
+                if (advice_prefixes) body += ",\"prefix_lengths\":[2]";
+                if (advice_bad_prefixes) body += ",\"prefix_lengths\":[3,2]";
+                body += "}";
+                answer(fd, kAdvice, request_id, body);
                 return;
+            }
             case kBegin: {
+                last_begin_hashes = field_hash_array(payload, "prefix_hashes");
                 pending_bytes = field_u64_array(payload, "stage_bytes");
                 pending_id = next_pending++;
                 for (int old : pending_fds) ::close(old);
@@ -700,6 +730,59 @@ int main() {
         ParentAdvice advice;
         check(!client.advice(parent_points(original), false, advice, error), "hash: a bad payload hash is refused");
         check(client.degraded(), "hash: and degrades the channel");
+    }
+
+    // ---- PARK_ADVICE's prefix_lengths: the client parses them, sends the hashes back in the second advice and in begin
+    {
+        Broker broker;
+        broker.advice_prefixes = true;
+        broker.start();
+        ConversationParentClient client;
+        std::string error;
+        const int fd = connect_pair(broker);
+        check(client.connect(fd, identity(), 2000, error), "prefix: connect");
+        const std::vector<ParentPoint> points = parent_points(original);
+        const std::vector<std::pair<int64_t, uint64_t>> hashes = {{2, 0x1234ull}};
+        ParentAdvice advice;
+        check(client.advice(points, false, advice, error, hashes), "prefix: advice with the hashes");
+        check(advice.prefix_lengths.size() == 1 && advice.prefix_lengths[0] == 2,
+              "prefix: the store's prefix lengths parse");
+        check(broker.last_advice_hashes == hashes, "prefix: the advice carried the hashes");
+        uint64_t measured = 0;
+        check(session_file_measure(meta, sources, measured, error), "prefix: measure");
+        const std::string pid = parent_publish_id();
+        ParentPending pending;
+        bool dedup = false;
+        check(client.begin(pid, points, false, {measured}, pending, dedup, error, hashes),
+              "prefix: begin with the hashes");
+        check(broker.last_begin_hashes == hashes, "prefix: the begin carried the hashes");
+        check(client.abort(pid, pending.id(), error), "prefix: abort");
+    }
+
+    // ---- prefix_lengths an old store does not send read as none; unsorted ones are refused
+    {
+        Broker broker;   // the answer carries no prefix_lengths
+        broker.start();
+        ConversationParentClient client;
+        std::string error;
+        const int fd = connect_pair(broker);
+        check(client.connect(fd, identity(), 2000, error), "noprefix: connect");
+        ParentAdvice advice;
+        check(client.advice(parent_points(original), false, advice, error), "noprefix: advice");
+        check(advice.prefix_lengths.empty(), "noprefix: an absent key is an empty list");
+    }
+    {
+        Broker broker;
+        broker.advice_bad_prefixes = true;
+        broker.start();
+        ConversationParentClient client;
+        std::string error;
+        const int fd = connect_pair(broker);
+        check(client.connect(fd, identity(), 2000, error), "badprefix: connect");
+        ParentAdvice advice;
+        check(!client.advice(parent_points(original), false, advice, error),
+              "badprefix: unsorted prefix lengths are refused");
+        check(client.degraded(), "badprefix: and degrade the channel");
     }
 
     // ---- a PARK_BEGIN answer without its descriptor is a protocol violation
