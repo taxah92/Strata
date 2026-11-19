@@ -5390,9 +5390,6 @@ class Service:
         parking = getattr(self.engine, "parent_parking", None)
         if parking is not None:                          # stage 5: the server's one RAM store, when it is on
             rows += parent_parking_prometheus(parking.snapshot())
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
-                       for name, kind, help_, value in rows)
-        # #6081: the conversation cache from the engine's log: parks, restores, evictions and the refused parks by reason
         # #6081: the conversation cache from the engine's log: parks, restores, evictions and the refused parks by reason
         cc = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         rows += [

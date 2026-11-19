@@ -265,7 +265,7 @@ int main() {
     {   // the RAM cache hands evicted entries to the hook, and the idle writer's marks
         ConversationCache cache(1ull << 30, 2);
         size_t seen = 0;
-        cache.on_evict([&](const SavedConversation& s) { seen += s.live.ids.size(); });
+        cache.set_evict_sink([&](SavedConversation&& s) { seen += s.live.ids.size(); });
         check(cache.put(stage_image(a_ids, 10, 0, 48, 1)) && cache.put(stage_image(b_ids, 10, 0, 48, 2)), "two parked");
         check(cache.unpersisted() == 0, "both unwritten, the oldest first");
         cache.mark_persisted(0, 77);

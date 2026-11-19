@@ -13614,6 +13614,7 @@ int main(int argc, char** argv) {
                 for (auto& d : spill_writer->take_done()) n += d.serial == 0 ? 1 : 0;   // (a written one is counted below)
             }
             return n + spill.clear();
+        };
         // What a park captures: the main session's conversation (park_current) or an idle batch slot's (park_slot:
         // the reply it decoded, before an admission overwrites it).  One budget / admission / snapshot path for both.
         struct ParkSource {
@@ -14279,7 +14280,7 @@ int main(int argc, char** argv) {
                             return disk_spill(image, why);
                         };
                         // RAM evicts for room: the disk keeps the conversation (no write when the idle writer did it already)
-                        conversations.on_evict([&](const strata::core::SavedConversation& image) {
+                        conversations.set_evict_sink([&](strata::core::SavedConversation&& image) {
                             (void) disk_spill(image, "evicted");   // spill finds a copy it already holds (holding): no rewrite
                         });
                         if (o.conversation_cache_disk_idle_s > 0)
