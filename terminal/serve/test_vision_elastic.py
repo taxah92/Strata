@@ -53,9 +53,7 @@ class Elastic(unittest.TestCase):
         self.addCleanup(self.drop_embeddings)
 
     def drop_embeddings(self):
-        path = getattr(getattr(self.svc, "embeddings", None), "path", None)
-        if path is not None:
-            path.unlink(missing_ok=True)
+        self.svc.drop_embeddings()
 
     def picture(self):
         self.svc.prepare([{"role": "user", "content": [{"type": "text", "text": "what is it"}, IMAGE]}], None, {})
@@ -427,9 +425,8 @@ class ReplicaElasticVision(unittest.TestCase):
         ]}]
 
     def tearDown(self):
-        emb = getattr(getattr(self, "svc", None), "embeddings", None)
-        if getattr(emb, "path", None):
-            Path(emb.path).unlink(missing_ok=True)
+        if getattr(self, "svc", None) is not None:
+            self.svc.drop_embeddings()
         if getattr(self, "tmp", None):
             self.tmp.cleanup()
 

@@ -71,6 +71,37 @@ def write_temporary(path: Path, parts: list) -> None:
             f.write(Path(part).read_bytes())
 
 
+def write_memfd_temporary(parts: list) -> tuple[Path, int] | None:
+    """Write `parts` into an anonymous Linux memfd exposed at `/proc/<pid>/fd/<fd>`.
+
+    Unlike `/dev/shm` files, a memfd has no path entry for `systemd-logind`
+    (`RemoveIPC=yes`) to unlink mid-request while still staying in RAM and
+    readable by same-UID child engine processes via `/proc/<pid>/fd/<fd>`."""
+    if os.name == "nt" or not hasattr(os, "memfd_create"):
+        return None
+    proc_fd_dir = Path(f"/proc/{os.getpid()}/fd")
+    if not proc_fd_dir.is_dir():
+        return None
+    fd = None
+    try:
+        fd = os.memfd_create("strata-vision-req")
+        for part in parts:
+            data = Path(part).read_bytes()
+            view = memoryview(data)
+            written = 0
+            while written < len(view):
+                written += os.write(fd, view[written:])
+        os.lseek(fd, 0, os.SEEK_SET)
+        return proc_fd_dir / str(fd), fd
+    except OSError:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        return None
+
+
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"

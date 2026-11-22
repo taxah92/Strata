@@ -393,7 +393,7 @@ class ImageMarkers(unittest.TestCase):
                     ids, _, _ = svc.prepare(msgs, None, {})
                     self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
 
     def test_pictures_are_keyed_by_their_bytes_for_the_engine(self):
         """#2228: each picture's key (its normalized bytes' hash: the encoder's file name) goes to the engine as
@@ -413,7 +413,7 @@ class ImageMarkers(unittest.TestCase):
                                                  {"type": "image", "source": "a.png"}]}]
             svc.prepare(msgs, None, {})
             self.assertEqual(svc.embeddings.keys, ["fedcba9876543210", "0123456789abcdef"])
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
         keys = StrataEngine.sampling_keys({"strata_img_keys": ["fedcba9876543210", "0123456789abcdef"]})
         self.assertEqual(keys, " img_keys=fedcba9876543210,0123456789abcdef")
         for bad in ([], ["XYZ"], ["ab cd"], "abc", [3]):   # never sent malformed: the engine falls back to the embeddings
@@ -444,7 +444,7 @@ class ImageMarkers(unittest.TestCase):
                     inside = prompt.split("<tool_response>", 1)[1].split("</tool_response>", 1)[0]
                     self.assertEqual("<|vision_start|>" in inside, not isinstance(result, str))
                     self.assertEqual("<|vision_start|>" in prompt.split("</tool_response>", 1)[1], bool(extra))
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
         # a tool's picture the server cannot read is a note, not a 400 (the client resends it every turn); the user's
         # own picture still fails
         class Refusing(self.FakeVision):
@@ -467,7 +467,7 @@ class ImageMarkers(unittest.TestCase):
                     self.assertEqual(ids.count(pad), n)
                     self.assertIn(note, tok.decode(ids))
                     if svc.embeddings.path:
-                        svc.embeddings.path.unlink(missing_ok=True)
+                        svc.drop_embeddings()
             # a tool's picture at a URL is downloaded once (the check and the prompt share the bytes), and one that
             # cannot be fetched is a note too
             import serve.server as server
@@ -480,7 +480,7 @@ class ImageMarkers(unittest.TestCase):
             with mock.patch.object(server.Vision, "download", return_value=b"the picture") as dl:
                 ids, _, _ = svc.prepare(m, None, {})
             self.assertEqual((dl.call_count, ids.count(pad)), (1, 3))
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
             m, _, _ = anthropic_to_messages({"messages": url_msgs})
             with mock.patch.object(server.Vision, "download", side_effect=ValueError("the image URL could not be read")):
                 ids, _, _ = svc.prepare(m, None, {})
@@ -617,6 +617,26 @@ class VisionTempFiles(unittest.TestCase):
                 return
             with mock.patch("serve.server.shutil.disk_usage", return_value=SimpleNamespace(free=1 << 20)):
                 self.assertEqual(combined_embeddings_path(Path(d), 1 << 20).parent, Path(d))
+
+    def test_memfd_combined_embeddings_read_and_close(self):
+        from serve.server import Service, write_memfd_temporary
+        with tempfile.TemporaryDirectory() as d:
+            a, b = Path(d) / "a.sve", Path(d) / "b.sve"
+            a.write_bytes(b"SVE1-part1")
+            b.write_bytes(b"-part2")
+            res = write_memfd_temporary([a, b])
+            if os.name == "nt" or not hasattr(os, "memfd_create"):
+                self.assertIsNone(res)
+                return
+            self.assertIsNotNone(res)
+            path, fd = res
+            try:
+                self.assertTrue(str(path).startswith(f"/proc/{os.getpid()}/fd/"))
+                self.assertEqual(path.read_bytes(), b"SVE1-part1-part2")
+            finally:
+                Service._release_embeddings(path, fd)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
 
     def test_smart_app_control_is_said_in_words(self):
         import subprocess
@@ -6407,7 +6427,7 @@ class ImageSources(unittest.TestCase):
                 svc.prepare(msgs, None, {})
             self.assertEqual(held, [False])                         # not while every other request waits
             self.assertEqual(vision.got, [b"the picture", "x.png"])
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
 
     def test_a_page_of_another_site_cannot_name_a_file(self):
         tok = ByteTokenizer()
@@ -7353,7 +7373,7 @@ class PrepareCancelled(unittest.TestCase):
             svc = self.make(d, ImageMarkers.FakeVision)
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
-            svc.embeddings.path.unlink(missing_ok=True)
+            svc.drop_embeddings()
 
 
 

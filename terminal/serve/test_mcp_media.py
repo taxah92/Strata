@@ -191,8 +191,7 @@ class HistoryReferences(unittest.TestCase):
                 self.assertEqual(images_of(messages), [source])
                 self.assertEqual(ids.count(tok.encode('<|image_pad|>', parse_special=True)[0]), 3)
             finally:
-                if svc.embeddings.path:
-                    svc.embeddings.path.unlink(missing_ok=True)
+                svc.drop_embeddings()
 
     def test_bad_reference_cannot_read_other_files(self):
         tok = ByteTokenizer()

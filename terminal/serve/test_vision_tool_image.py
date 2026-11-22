@@ -57,7 +57,7 @@ class ToolImage(unittest.TestCase):
     def test_prepare_survives_a_tool_picture_with_an_elastic_encoder(self):
         vision = ElasticVision(tempfile.mkdtemp())
         svc = self.service(vision)
-        self.addCleanup(lambda: getattr(svc.embeddings, "path", None) and svc.embeddings.path.unlink(missing_ok=True))
+        self.addCleanup(svc.drop_embeddings)
         svc.prepare(tool_turn(), None, {})
         self.assertEqual(vision.starts, 1)
 

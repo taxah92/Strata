@@ -119,6 +119,7 @@ from serve.server_parts.base import (  # noqa: F401  (moved unchanged, file spli
     listen_problem,
     reasoning_repeat_coverage,
     rttime_limit_note,
+    write_memfd_temporary,
     write_temporary,
 )
 from serve.server_parts.core import (  # noqa: F401  (moved unchanged, file split)
@@ -5684,6 +5685,8 @@ class Service:
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
+        self._close_embeddings_fd(getattr(self.embeddings, "fd", None))
+        self.embeddings.fd = None
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -5795,14 +5798,20 @@ class Service:
         if images:
             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
-            # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
-            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
-            self.embeddings.path = combined             # first, so a half-written one is found as well
+            # one more for every retry of a 503.  run() closes/deletes it; drop_embeddings() if run() never starts.
+            parts = [p for p, _ in encoded]
+            memfd = write_memfd_temporary(parts)
             # #2228: each picture's key is its normalized bytes' hash (the encoder's file name), so the engine's
             # conversation cache matches a picture by what it is, not by its embedding floats: a picture encoded again
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
-            write_temporary(combined, [p for p, _ in encoded])
+            if memfd is not None:
+                self.embeddings.path, self.embeddings.fd = memfd
+            else:
+                combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p in parts))
+                self.embeddings.fd = None
+                self.embeddings.path = combined         # first, so a half-written one is found as well
+                write_temporary(combined, parts)
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -5881,13 +5890,28 @@ class Service:
             return {}
         return {"tokens": n}
 
+    @staticmethod
+    def _close_embeddings_fd(fd) -> None:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    @classmethod
+    def _release_embeddings(cls, path, fd) -> None:
+        if fd is not None:
+            cls._close_embeddings_fd(fd)
+        elif path is not None:
+            Path(path).unlink(missing_ok=True)
+
     def drop_embeddings(self) -> None:
         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
         then nothing else would.  The handler calls this when a request is done."""
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
-        if path is not None:
-            Path(path).unlink(missing_ok=True)
+        fd, self.embeddings.fd = getattr(self.embeddings, "fd", None), None
+        self._release_embeddings(path, fd)
         self.embeddings.hy4 = self._drop_hy4_images(getattr(self.embeddings, "hy4", None))
         self.embeddings.inkling = self._drop_hy4_images(getattr(self.embeddings, "inkling", None))
 
@@ -6036,6 +6060,7 @@ class Service:
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         admission_rejected = False                      # #3040: the engine's batch slots refused it before it read anything
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+        emb_fd, self.embeddings.fd = getattr(self.embeddings, "fd", None), None
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
             sampling = {**(sampling or {}), "strata_img_keys": img_keys}   # #2228: sent beside the embeddings file
@@ -6561,8 +6586,7 @@ class Service:
                 event = {"stop": "finished", "length": "finished", "cancel": "cancelled",
                          "disconnect": "disconnected", "timeout": "timeout", "error": "error"}.get(finish, "error")
                 self._terminal_event_locked(request_id, event, finish)
-            if emb:
-                Path(emb).unlink(missing_ok=True)
+            self._release_embeddings(emb, emb_fd)
         if not parser_done:
             for ev in cut(parser.finish(finish)):
                 yield "event", ev
