@@ -180,6 +180,36 @@ struct NumaSplitPlan {
 /// pool exists or the split is off.
 const NumaSplitPlan& active_numa_split();
 
+/// Dynamic worker-count control shared between the parent server and child engine via memfd (PR 1.1).
+/// Aligned to 64 bytes so each replica's slot sits on its own cache line.
+struct alignas(64) PoolBudgetSlot {
+    std::atomic<uint32_t> target_workers{0};   ///< 0 = full pool (n_), else clamped to [1, n_]
+    std::atomic<uint32_t> applied_workers{0};  ///< telemetry: last active_limit_ applied by begin_batch()
+    std::atomic<uint64_t> changes{0};          ///< telemetry: transitions of active_limit_
+    uint8_t pad[48]{};
+};
+static_assert(sizeof(PoolBudgetSlot) == 64, "PoolBudgetSlot must be 64 bytes");
+
+/// RAII mapping of one PoolBudgetSlot inside a shared memfd / regular file (Linux/POSIX).
+class PoolBudgetMapping {
+public:
+    PoolBudgetMapping() = default;
+    ~PoolBudgetMapping();
+    PoolBudgetMapping(const PoolBudgetMapping&) = delete;
+    PoolBudgetMapping& operator=(const PoolBudgetMapping&) = delete;
+    PoolBudgetMapping(PoolBudgetMapping&& other) noexcept;
+    PoolBudgetMapping& operator=(PoolBudgetMapping&& other) noexcept;
+
+    bool open(const std::string& path, int slot, std::string& error);
+    void close();
+    PoolBudgetSlot* slot() const { return slot_; }
+
+private:
+    void* base_ = nullptr;
+    size_t map_len_ = 0;
+    PoolBudgetSlot* slot_ = nullptr;
+};
+
 class ExpertPool {
 public:
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
@@ -197,7 +227,8 @@ public:
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
-                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
+                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0,
+                        PoolBudgetSlot* budget_slot = nullptr);
     /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
@@ -207,6 +238,7 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    int active_workers() const { return active_limit_.load(std::memory_order_acquire); }
     /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
     /// and logical processors counted - for the start-up line.
     const char* plan_limit() const { return plan_limit_; }
@@ -289,6 +321,8 @@ public:
 
 private:
     int phase_tasks(int64_t rows) const;
+    int read_budget_target() const;
+    void plan_budget();
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
@@ -334,8 +368,8 @@ private:
     // - so it is deleted rather than amortised.  `alignas(64)` then stops the remaining four sharing.
     // issue #31 diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's
     // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
-    static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
-                             kWaitDone = -12;
+    static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kBudgetParked = -4,
+                             kIdle = -10, kWaitParked = -11, kWaitDone = -12;
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
     std::atomic<int64_t> hstate_ms_{0};
@@ -344,6 +378,15 @@ private:
     alignas(64) std::atomic<uint32_t> parked_{0};
     alignas(64) std::atomic<uint32_t> epoch_{0};
     alignas(64) std::atomic<bool> stop_{false};
+    // Dynamic worker budget (PR 1.1): borrow workers parked below active_limit_ sleep on budget_cv_
+    // so steady-state publish() never wakes them.
+    PoolBudgetSlot* budget_slot_ = nullptr;
+    alignas(64) std::atomic<int> active_limit_{0};
+    int planned_limit_ = 0;
+    int last_applied_ = 0;
+    alignas(64) std::atomic<uint32_t> budget_sleepers_{0};
+    std::mutex budget_mu_;
+    std::condition_variable budget_cv_;
     // The sleep after `kSpinBeforeSleep`.  `sleepers_` is how `publish` knows whether anyone needs waking, so the
     // token path pays one uncontended load per publish and never takes the mutex while the workers spin.
     alignas(64) std::atomic<uint32_t> sleepers_{0};

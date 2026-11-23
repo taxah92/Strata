@@ -2,6 +2,7 @@
 engines (the fake of test_parallel.py) behind a ReplicaEngine."""
 import collections
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -13,9 +14,10 @@ from unittest import mock
 
 from types import SimpleNamespace
 from serve.frontend import ChatTemplate
-from serve.replicas import (BLOCK, PullRequest, ReplicaConfigError, ReplicaEngine, Router, cpu_sets, gpu_groups,
-                            prefer_idle_config, pull_choose, pull_config, remove_arena, replica_cfg,
-                            replica_priorities, shared_arena_plan, sweep_stale_arenas)
+from serve.replicas import (BLOCK, PoolBudgetControl, PullRequest, ReplicaConfigError, ReplicaEngine, Router,
+                            cpu_sets, dynamic_pool_plan, gpu_groups, prefer_idle_config, pull_choose, pull_config,
+                            remove_arena, replica_cfg, replica_dynamic_pool_enabled, replica_priorities,
+                            shared_arena_plan, sweep_stale_arenas)
 from serve.server import (ByteTokenizer, EngineDied, QueueWaitExpired, Service, StrataEngine, serve)
 from serve.test_parallel import FAKE_BATCH
 
@@ -1701,6 +1703,175 @@ class ReplicaVramResize(unittest.TestCase):
                 self.assertFalse(st["vram"]["replicas"][1]["standby"])
                 self.tearDown()
                 self.httpd = None
+
+
+class DynamicPoolBudgetTests(unittest.TestCase):
+    @staticmethod
+    def _make_sysfs(root: Path, entries: list[tuple[int, int, int]]) -> Path:
+        for cpu, pkg, core in entries:
+            topo = root / "devices/system/cpu" / f"cpu{cpu}" / "topology"
+            topo.mkdir(parents=True, exist_ok=True)
+            (topo / "physical_package_id").write_text(f"{pkg}\n")
+            (topo / "core_id").write_text(f"{core}\n")
+        return root
+
+    def test_replica_dynamic_pool_enabled_and_kill_switch(self):
+        self.assertFalse(replica_dynamic_pool_enabled({}, environ={}))
+        self.assertTrue(replica_dynamic_pool_enabled({"replica_dynamic_pool": True}, environ={}))
+        self.assertFalse(replica_dynamic_pool_enabled({"replica_dynamic_pool": False}, environ={}))
+        self.assertFalse(
+            replica_dynamic_pool_enabled({"replica_dynamic_pool": True}, environ={"STRATA_REPLICA_DYNAMIC_POOL": "0"}))
+        self.assertTrue(replica_dynamic_pool_enabled({}, environ={"STRATA_REPLICA_DYNAMIC_POOL": "1"}))
+        for bad in (1, "yes", []):
+            with self.assertRaises(ReplicaConfigError):
+                replica_dynamic_pool_enabled({"replica_dynamic_pool": bad}, environ={})
+            with self.assertRaises(ReplicaConfigError):
+                replica_dynamic_pool_enabled({"replica_dynamic_pool": bad},
+                                             environ={"STRATA_REPLICA_DYNAMIC_POOL": "0"})
+
+    def test_dynamic_pool_plan_synthetic_32core_smt_and_rejects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sys32 = self._make_sysfs(Path(tmp) / "c32", [(c, 0, c) for c in range(32)])
+            plan = dynamic_pool_plan(2, allowed=set(range(32)), sys_root=sys32)
+            self.assertIsNotNone(plan)
+            self.assertEqual(len(plan), 2)
+            r0, r1 = plan
+            self.assertEqual(r0["host_core"], "first")
+            self.assertEqual(r0["host_cpu"], 0)
+            self.assertEqual(r0["primary"], list(range(1, 16)))
+            self.assertEqual(r0["borrow"], list(range(16, 30)))
+            self.assertEqual(r0["pool_cores"], list(range(1, 30)))
+            self.assertEqual((r0["primary_count"], r0["max_count"]), (15, 29))
+
+            self.assertEqual(r1["host_core"], "last")
+            self.assertEqual(r1["host_cpu"], 31)
+            self.assertEqual(r1["primary"], list(range(16, 31)))
+            self.assertEqual(r1["borrow"], list(range(1, 16)))
+            self.assertEqual(r1["pool_cores"], list(range(16, 31)) + list(range(1, 16)))
+            self.assertEqual((r1["primary_count"], r1["max_count"]), (15, 30))
+
+            # SMT: 8 physical cores with 2 siblings each -> deduplicated to 1 CPU per core
+            smt_entries = [(c, 0, c) for c in range(8)] + [(c + 8, 0, c) for c in range(8)]
+            sys_smt = self._make_sysfs(Path(tmp) / "smt", smt_entries)
+            smt_plan = dynamic_pool_plan(2, allowed=set(range(16)), sys_root=sys_smt)
+            self.assertIsNotNone(smt_plan)
+            self.assertEqual(smt_plan[0]["primary"], [1, 2, 3])
+            self.assertEqual(smt_plan[0]["borrow"], [4, 5])
+            self.assertEqual(smt_plan[1]["primary"], [4, 5, 6])
+            self.assertEqual(smt_plan[1]["borrow"], [1, 2, 3])
+
+            # Dual-socket, n != 2, and too-small topologies return None
+            dual = [(c, c // 16, c % 16) for c in range(32)]
+            sys_dual = self._make_sysfs(Path(tmp) / "dual", dual)
+            self.assertIsNone(dynamic_pool_plan(2, allowed=set(range(32)), sys_root=sys_dual))
+            self.assertIsNone(dynamic_pool_plan(1, allowed=set(range(32)), sys_root=sys32))
+            self.assertIsNone(dynamic_pool_plan(4, allowed=set(range(32)), sys_root=sys32))
+            self.assertIsNone(dynamic_pool_plan(2, allowed={0, 1, 2, 3}, sys_root=sys32))
+
+    def test_pool_budget_control_memfd_and_close(self):
+        ctrl = PoolBudgetControl([15, 15], [29, 30])
+        try:
+            self.assertTrue(ctrl.path.startswith(f"/proc/{os.getpid()}/fd/"))
+            snap = ctrl.snapshot()
+            self.assertEqual([s["target"] for s in snap], [15, 15])
+            self.assertEqual([s["primary"] for s in snap], [15, 15])
+            self.assertEqual([s["max"] for s in snap], [29, 30])
+            ctrl.set_target(0, 99)
+            ctrl.set_target(1, 0)
+            snap = ctrl.snapshot()
+            self.assertEqual([s["target"] for s in snap], [29, 1])
+            ctrl.set_all_targets([15, 30])
+            snap = ctrl.snapshot()
+            self.assertEqual([s["target"] for s in snap], [15, 30])
+        finally:
+            fd = ctrl.fd
+            ctrl.close()
+            ctrl.close()  # idempotent
+        with self.assertRaises(OSError):
+            os.fstat(fd)
+
+    def test_replica_engine_dynamic_pool_rebalancing(self):
+        class GateEngine:
+            def __init__(self, idx: int):
+                self.idx = idx
+                self.batch = 0
+                self.gen = 1
+                self.silence_s = 120.0
+                self.gpu_busy = 0.0
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.reserves = []
+                self.last = {}
+
+            def alive(self):
+                return True
+
+            def vram(self, reserve_mib=None):
+                self.reserves.append(reserve_mib)
+                return {"vram_free_mib": 1000, "reserve_mib": reserve_mib}
+
+            def generate(self, ids, n_max, params, cancel):
+                self.entered.set()
+                yield self.idx
+                while not self.release.is_set() and not cancel.is_set():
+                    self.release.wait(0.01)
+                self.last = {"replica": self.idx}
+                yield None
+
+            def close(self):
+                self.release.set()
+
+        for pull in (False, True):
+            with self.subTest(pull=pull):
+                e0, e1 = GateEngine(0), GateEngine(1)
+                budget = PoolBudgetControl([15, 15], [29, 30])
+                eng = ReplicaEngine([e0, e1], pull=pull, pool_budget=budget)
+                try:
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [15, 15])
+
+                    # 1) Solo r0 active -> [29, 15]
+                    g0 = eng.generate([1, 2, 3], 4, {}, threading.Event())
+                    tok0 = next(t for t in g0 if t is not None)
+                    self.assertEqual(tok0, 0)
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [29, 15])
+                    rows = eng.replica_view()
+                    self.assertIn("pool_budget", rows[0])
+                    self.assertEqual(rows[0]["pool_budget"]["target"], 29)
+                    self.assertEqual(rows[1]["pool_budget"]["target"], 15)
+
+                    # 2) Concurrent r1 starts while r0 still running -> [15, 15]
+                    g1 = eng.generate([4, 5, 6], 4, {}, threading.Event())
+                    tok1 = next(t for t in g1 if t is not None)
+                    self.assertEqual(tok1, 1)
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [15, 15])
+
+                    # 3) r0 finishes while r1 still running -> [15, 30]
+                    e0.release.set()
+                    list(g0)
+                    g0.close()
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [15, 30])
+
+                    # 4) r1 finishes -> idle [15, 15]
+                    e1.release.set()
+                    list(g1)
+                    g1.close()
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [15, 15])
+
+                    # 5) Standby r1 + solo r0 -> [29, 15] -> idle [15, 15]
+                    eng.vram(3500, replica=1, standby=True)
+                    e0.release.clear()
+                    g2 = eng.generate([7, 8], 4, {}, threading.Event())
+                    tok2 = next(t for t in g2 if t is not None)
+                    self.assertEqual(tok2, 0)
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [29, 15])
+                    e0.release.set()
+                    list(g2)
+                    g2.close()
+                    self.assertEqual([s["target"] for s in budget.snapshot()], [15, 15])
+                    eng.vram(0, replica=1, standby=False)
+                finally:
+                    eng.close()
+                self.assertTrue(budget._closed)
 
 
 if __name__ == "__main__":

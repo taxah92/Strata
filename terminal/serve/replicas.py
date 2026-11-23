@@ -45,8 +45,11 @@ from __future__ import annotations
 import collections
 import contextlib
 import copy
+import ctypes
 import math
+import mmap
 import os
+from pathlib import Path
 import sys
 import threading
 import time
@@ -303,6 +306,26 @@ def pull_config(cfg: dict) -> PullSettings:
                         prefer_idle, priorities)
 
 
+def replica_dynamic_pool_enabled(cfg: dict, *, environ=None) -> bool:
+    """Opt-in dynamic CPU ExpertPool worker borrowing between 2 replicas ("replica_dynamic_pool": true).
+
+    Kill-switch: STRATA_REPLICA_DYNAMIC_POOL=0 forces this off even when the config sets it true.
+    """
+    environ = os.environ if environ is None else environ
+    env = str(environ.get("STRATA_REPLICA_DYNAMIC_POOL", "")).strip().lower()
+    if env in ("0", "false", "off", "no"):
+        want = cfg.get("replica_dynamic_pool", False)
+        if want is not None and not isinstance(want, bool):
+            raise ReplicaConfigError(f'"replica_dynamic_pool" must be true or false, not {want!r}')
+        return False
+    want = cfg.get("replica_dynamic_pool")
+    if want is None:
+        return env in ("1", "true", "on", "yes")
+    if not isinstance(want, bool):
+        raise ReplicaConfigError(f'"replica_dynamic_pool" must be true or false, not {want!r}')
+    return want
+
+
 ARENA_PREFIX = "strata-replicas-"
 _MEMFDS: dict = {}                   # the memfds this server created: path (/proc/<pid>/fd/<n>) -> fd
 ARENA_MIN_RAM = 8 << 30              # a memfd arena: at least this much free RAM to try (the engine reserves the real size)
@@ -489,6 +512,169 @@ def cpu_sets(n: int, enabled: bool = True):
         return None
 
 
+def dynamic_pool_plan(n: int, allowed: set[int] | None = None,
+                      sys_root: Path = Path("/sys")) -> list[dict] | None:
+    """Compute per-replica host-core and primary+borrow physical-core layout for dynamic CPU ExpertPool sizing.
+
+    Supports 2 replicas on a single-socket Linux topology with enough physical cores for primary + borrowable workers
+    on each side while leaving both host cores and one reserve core untouched during solo borrowing.  Returns None
+    when dynamic sizing is inapplicable so callers can fall back to static `cpu_sets(n)`.
+    """
+    if n != 2:
+        return None
+    if allowed is None:
+        if not hasattr(os, "sched_getaffinity"):
+            return None
+        allowed_set = set(os.sched_getaffinity(0))
+    else:
+        allowed_set = set(allowed)
+    if not allowed_set:
+        return None
+    root = Path(sys_root)
+    try:
+        from serve.cpu_affinity import partition_cpu_sets
+        sets = partition_cpu_sets(n, allowed_set, sys_root=root)
+        pkgs: set[int] = set()
+        phys: list[list[int]] = []
+        for group in sets:
+            by_core: dict[tuple[int, int], int] = {}
+            for cpu in sorted(group):
+                topo = root / "devices/system/cpu" / f"cpu{cpu}" / "topology"
+                pkg = int((topo / "physical_package_id").read_text())
+                cid = int((topo / "core_id").read_text())
+                pkgs.add(pkg)
+                key = (pkg, cid)
+                if key not in by_core or cpu < by_core[key]:
+                    by_core[key] = cpu
+            phys.append(sorted(by_core.values()))
+    except (ValueError, OSError, ImportError):
+        return None
+    if len(pkgs) != 1:
+        return None
+    c0, c1 = phys[0], phys[1]
+    if len(c0) < 2 or len(c1) < 3:
+        return None
+    r0_primary = list(c0[1:])
+    r0_borrow = list(c1[:-2])
+    r1_primary = list(c1[:-1])
+    r1_borrow = list(c0[1:])
+    return [
+        {
+            "replica": 0,
+            "host_core": "first",
+            "host_cpu": c0[0],
+            "primary": r0_primary,
+            "borrow": r0_borrow,
+            "pool_cores": r0_primary + r0_borrow,
+            "primary_count": len(r0_primary),
+            "max_count": len(r0_primary) + len(r0_borrow),
+        },
+        {
+            "replica": 1,
+            "host_core": "last",
+            "host_cpu": c1[-1],
+            "primary": r1_primary,
+            "borrow": r1_borrow,
+            "pool_cores": r1_primary + r1_borrow,
+            "primary_count": len(r1_primary),
+            "max_count": len(r1_primary) + len(r1_borrow),
+        },
+    ]
+
+
+class PoolBudgetControl:
+    """Shared memfd page holding one 64-byte PoolBudgetSlot per replica (up to 64 slots)."""
+
+    SLOT_BYTES = 64
+    PAGE_BYTES = 4096
+    MAX_SLOTS = PAGE_BYTES // SLOT_BYTES
+
+    def __init__(self, primary_counts: list[int], max_counts: list[int] | None = None, *,
+                 name: str = "strata-pool-budget"):
+        if not hasattr(os, "memfd_create"):
+            raise RuntimeError("PoolBudgetControl requires Linux os.memfd_create")
+        if not primary_counts or len(primary_counts) > self.MAX_SLOTS:
+            raise ValueError(f"primary_counts must have 1..{self.MAX_SLOTS} entries")
+        if max_counts is None:
+            max_counts = list(primary_counts)
+        if len(max_counts) != len(primary_counts):
+            raise ValueError("max_counts length must match primary_counts")
+        for idx, (p, m) in enumerate(zip(primary_counts, max_counts)):
+            if p <= 0 or m < p:
+                raise ValueError(f"invalid worker counts for slot {idx}: primary={p}, max={m}")
+        self.n = len(primary_counts)
+        self.primary_counts = [int(p) for p in primary_counts]
+        self.max_counts = [int(m) for m in max_counts]
+        self._lock = threading.Lock()
+        self._closed = False
+        fd = os.memfd_create(name, os.MFD_CLOEXEC)
+        try:
+            os.ftruncate(fd, self.PAGE_BYTES)
+            buf = mmap.mmap(fd, self.PAGE_BYTES, access=mmap.ACCESS_WRITE)
+        except BaseException:
+            os.close(fd)
+            raise
+        self.fd = fd
+        self.path = f"/proc/{os.getpid()}/fd/{fd}"
+        self._mmap = buf
+        self._targets = [ctypes.c_uint32.from_buffer(buf, k * self.SLOT_BYTES) for k in range(self.n)]
+        self._applied = [ctypes.c_uint32.from_buffer(buf, k * self.SLOT_BYTES + 4) for k in range(self.n)]
+        self._changes = [ctypes.c_uint64.from_buffer(buf, k * self.SLOT_BYTES + 8) for k in range(self.n)]
+        for k in range(self.n):
+            self._targets[k].value = self.primary_counts[k]
+            self._applied[k].value = 0
+            self._changes[k].value = 0
+
+    def set_target(self, slot: int, workers: int) -> None:
+        if not 0 <= slot < self.n:
+            raise IndexError(f"slot {slot} out of range 0..{self.n - 1}")
+        want = max(1, min(int(workers), self.max_counts[slot]))
+        with self._lock:
+            if self._closed:
+                return
+            self._targets[slot].value = want
+
+    def set_all_targets(self, workers_by_slot: list[int]) -> None:
+        if len(workers_by_slot) != self.n:
+            raise ValueError(f"expected {self.n} targets, got {len(workers_by_slot)}")
+        with self._lock:
+            if self._closed:
+                return
+            for slot, raw in enumerate(workers_by_slot):
+                self._targets[slot].value = max(1, min(int(raw), self.max_counts[slot]))
+
+    def snapshot(self) -> list[dict]:
+        with self._lock:
+            if self._closed:
+                return [{"target": self.primary_counts[k], "applied": 0, "primary": self.primary_counts[k],
+                         "max": self.max_counts[k], "changes": 0} for k in range(self.n)]
+            return [
+                {
+                    "target": int(self._targets[k].value),
+                    "applied": int(self._applied[k].value),
+                    "primary": self.primary_counts[k],
+                    "max": self.max_counts[k],
+                    "changes": int(self._changes[k].value),
+                }
+                for k in range(self.n)
+            ]
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._targets.clear()
+            self._applied.clear()
+            self._changes.clear()
+            buf, self._mmap = self._mmap, None
+            fd, self.fd = self.fd, -1
+        if buf is not None:
+            buf.close()
+        if fd >= 0:
+            os.close(fd)
+
+
 class Router:
     """Which replica holds the start of a prompt: chained hashes of its 64-token blocks, each with the set of replicas
     that hold it (bits 0..n-1).  When `shared_parking=True`, bits 0..n-1 track each replica's current LIVE GPU KV only,
@@ -632,9 +818,11 @@ class ReplicaEngine:
                  starve_s: float = PULL_STARVE_S, poll_s: float = PULL_POLL_S, beat_s: float = PULL_BEAT_S,
                  queue_timeout_s: float | None = None, max_queue: int | None = None,
                  prefer_idle_s: float | None = None, priorities: list[float] | None = None,
-                 parent_parking=None):
+                 parent_parking=None, pool_budget: PoolBudgetControl | None = None):
         if len(engines) < 2:
             raise ValueError("ReplicaEngine needs two or more engines")
+        if pool_budget is not None and pool_budget.n != len(engines):
+            raise ValueError(f"pool_budget slots ({pool_budget.n}) do not match replicas ({len(engines)})")
         if not isinstance(pull, bool):
             raise ReplicaConfigError(f'"replica_pull" must be true or false, not {pull!r}')
         if prefer_idle_s is not None:
@@ -712,6 +900,8 @@ class ReplicaEngine:
         # the server's one parent parking store (serve/parent_parking.py, plan §12.3): in __dict__, never through
         # __getattr__, so the store is this object's own and not one engine's.  None when the mode is off.
         d["parent_parking"] = parent_parking
+        d["pool_budget"] = pool_budget
+        self._rebalance_cpu_budgets_locked()
 
     # ---- attribute plumbing
     @property
@@ -857,6 +1047,10 @@ class ReplicaEngine:
         if store is not None:
             for row in rows:
                 row["parent_parking"] = store.replica_state(f"r{row['replica']}")
+        budget = self.__dict__.get("pool_budget")
+        if budget is not None:
+            for row, snap in zip(rows, budget.snapshot()):
+                row["pool_budget"] = snap
         if self.pull_enabled:
             queue = self.pull_view()
             for row in rows:
@@ -999,6 +1193,19 @@ class ReplicaEngine:
         except Exception as err:                 # noqa: BLE001
             print(f"[strata] replica {k}: the VRAM reserve ({self.reserves[k]} MiB) was not applied: {err}", flush=True)
 
+    def _rebalance_cpu_budgets_locked(self) -> None:
+        """Give a solo busy replica its full primary+borrow core budget; keep 0 or >=2 active replicas on primary."""
+        budget = self.__dict__.get("pool_budget")
+        if budget is None:
+            return
+        active = [k for k in range(len(self.engines)) if self.inflight[k] > 0]
+        if len(active) == 1:
+            solo = active[0]
+            targets = [budget.max_counts[k] if k == solo else budget.primary_counts[k] for k in range(budget.n)]
+        else:
+            targets = list(budget.primary_counts)
+        budget.set_all_targets(targets)
+
     def _park_for_standby(self, k: int) -> None:
         """Park any live conversation on replica `k` into parent parking before putting it in standby."""
         from serve.server import EngineDied
@@ -1048,10 +1255,12 @@ class ReplicaEngine:
                     raise ValueError("standby: at least one alive replica must remain active")
 
             if not any(e.alive() for e in self.engines):
-                if standby is True:
-                    self.standby.update(targets)
-                elif standby is False or clear_global:
-                    self.standby.difference_update(targets)
+                with self.cv:
+                    if standby is True:
+                        self.standby.update(targets)
+                    elif standby is False or clear_global:
+                        self.standby.difference_update(targets)
+                    self._rebalance_cpu_budgets_locked()
                 rows = []
                 for k in targets:
                     r_k = target_reserve(k)
@@ -1101,10 +1310,12 @@ class ReplicaEngine:
                     self.reserves_asked[pk] = prev_asked
                 raise
 
-            if standby is True:
-                self.standby.update(targets)
-            elif standby is False or clear_global:
-                self.standby.difference_update(targets)
+            with self.cv:
+                if standby is True:
+                    self.standby.update(targets)
+                elif standby is False or clear_global:
+                    self.standby.difference_update(targets)
+                self._rebalance_cpu_budgets_locked()
             for row in rows:
                 row["standby"] = row["replica"] in self.standby
 
@@ -1147,6 +1358,7 @@ class ReplicaEngine:
         finally:
             with self.cv:
                 self.standby.clear()
+                self._rebalance_cpu_budgets_locked()
             store = self.__dict__.get("parent_parking")
             if store is not None:                   # plan §12.3: the engines are down, so the store's RAM goes too
                 store.clear("unload")               # (even when an engine would not unload: the RAM is the point)
@@ -1163,6 +1375,12 @@ class ReplicaEngine:
         if store is not None:                       # plan §12.3: the engines first, then the broker and its memfds
             try:
                 store.close()
+            except BaseException as x:           # noqa: BLE001
+                err = err or x
+        budget = self.__dict__.get("pool_budget")
+        if budget is not None:
+            try:
+                budget.close()
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         if err:
@@ -1186,6 +1404,7 @@ class ReplicaEngine:
                 k = min(avail, key=lambda k: (cost[k], self.inflight[k], -self.priorities[k], self.routed[k]))
                 self.inflight[k] += 1
                 self.routed[k] += 1
+                self._rebalance_cpu_budgets_locked()
             if len(alive) < len(self.engines):
                 self.heal()
             return k
@@ -1298,6 +1517,7 @@ class ReplicaEngine:
                         self.pull_stats["closed"] += 1
                         entry.replica = None
                         self._pull_pump_locked(time.monotonic())
+                        self._rebalance_cpu_budgets_locked()
                     else:
                         self._pull_drop_locked(entry, "closed")
                 self.cv.notify_all()
@@ -1341,6 +1561,7 @@ class ReplicaEngine:
                               **({"from": mig_src} if mig_src is not None else {}),
                               "at": time.monotonic()}
             free.remove(k)
+        self._rebalance_cpu_budgets_locked()
         self.cv.notify_all()
 
     def _release_migration_src(self, src: int) -> None:
@@ -1349,6 +1570,7 @@ class ReplicaEngine:
             if self.inflight[src] == 0:
                 self.idle_since[src] = time.monotonic()
             self._pull_pump_locked(time.monotonic())
+            self._rebalance_cpu_budgets_locked()
             self.cv.notify_all()
 
     def _complete_migration(self, dst: int, src: int, ids, cancel) -> int:
@@ -1369,6 +1591,7 @@ class ReplicaEngine:
                         self.routed[dst] = max(0, self.routed[dst] - 1)
                         self.pull_stats["cancelled"] += 1
                         self._pull_pump_locked(time.monotonic())
+                        self._rebalance_cpu_budgets_locked()
                         self.cv.notify_all()
                     return -1
             park_fn = getattr(self.engines[src], "park", None)
@@ -1389,6 +1612,7 @@ class ReplicaEngine:
                     if self.inflight[rep] == 0:
                         self.idle_since[rep] = time.monotonic()
                 self._pull_pump_locked(time.monotonic())
+                self._rebalance_cpu_budgets_locked()
                 self.cv.notify_all()
             raise
         if acquired:
@@ -1413,6 +1637,7 @@ class ReplicaEngine:
                 self.pull_stats["migrate_fallbacks"] += 1
                 self.last_pick = {"replica": src, "reason": "migrate-fallback", "at": time.monotonic()}
                 self._pull_pump_locked(time.monotonic())
+                self._rebalance_cpu_budgets_locked()
                 self.cv.notify_all()
             return src
 
@@ -1526,6 +1751,7 @@ class ReplicaEngine:
                             if self.inflight[k] == 0:
                                 self.idle_since[k] = time.monotonic()
                             self._pull_pump_locked(time.monotonic())
+                            self._rebalance_cpu_budgets_locked()
                             self.cv.notify_all()
                     else:
                         if held:
@@ -1534,6 +1760,7 @@ class ReplicaEngine:
                             self.inflight[k] -= 1
                             if self.inflight[k] == 0:
                                 self.idle_since[k] = time.monotonic()
+                            self._rebalance_cpu_budgets_locked()
                             self.cv.notify_all()
                         if nonfinite:                   # #879: the engine dropped every cached conversation
                             self.router.forget(k)

@@ -9051,9 +9051,43 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         from serve import parent_parking as pp
         parking_store = pp.ParentParkingStore(parking)
         print(f"[strata] {parent_parking_note(parking, n)}", flush=True)
+    dyn_enabled = rp.replica_dynamic_pool_enabled(cfg)
+    dyn_plan = None
+    pool_budget = None
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
+    if dyn_enabled and cfg.get("replica_cpus") is not False:
+        has_override = bool(os.environ.get("STRATA_POOL_CORES") or os.environ.get("STRATA_HOST_CORE"))
+        if not has_override:
+            for i in range(n):
+                r_args = replica_engine_args(cfg, i)
+                if any(_flag_value(r_args, fl) is not None
+                       for fl in ("--pool-cores", "--host-core", "--pool-workers", "--pool-budget-fd")):
+                    has_override = True
+                    break
+                r_env = rp.replica_cfg(cfg, i, groups[i]).get("env") or {}
+                if r_env.get("STRATA_POOL_CORES") or r_env.get("STRATA_HOST_CORE"):
+                    has_override = True
+                    break
+        if has_override:
+            print("[strata] dynamic CPU pool skipped (explicit CPU/pool override); using static CPU sets", flush=True)
+        else:
+            dyn_plan = rp.dynamic_pool_plan(n)
+            if dyn_plan is not None:
+                try:
+                    pool_budget = rp.PoolBudgetControl([p["primary_count"] for p in dyn_plan],
+                                                       [p["max_count"] for p in dyn_plan])
+                except BaseException as e:       # noqa: BLE001
+                    print(f"[strata] dynamic CPU pool skipped ({e}); using static CPU sets", flush=True)
+                    dyn_plan = None
+                else:
+                    cpus = None
+                    r_desc = ", ".join(
+                        f"r{p['replica']}: host={p['host_core']} primary={p['primary_count']} max={p['max_count']}"
+                        for p in dyn_plan)
+                    print(f"[strata] dynamic CPU pool: {r_desc}", flush=True)
+    cpu_note = " (dynamic CPU pool)" if pool_budget is not None else (" (own CPU cores each)" if cpus else "")
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(map(str, g)) for g in groups)}"
-          f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, a conversation back to its own",
+          f"{cpu_note}: requests go to the least busy one, a conversation back to its own",
           flush=True)
     engines: list = [None] * n
     errors: list = []
@@ -9063,6 +9097,13 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
+        if dyn_plan is not None and pool_budget is not None:
+            rc["args"] = list(rc["args"]) + [
+                "--host-core", dyn_plan[i]["host_core"],
+                "--pool-cores", ",".join(map(str, dyn_plan[i]["pool_cores"])),
+                "--pool-budget-fd", pool_budget.path,
+                "--pool-budget-slot", str(i),
+            ]
         if plan is not None:                         # stage 3: this replica's writer dir, its peers, its budgets
             rc["args"] = list(rc["args"]) + replica_handoff_args(plan, i, n)
         if parking is not None:                      # stage 5: the thresholds; the fd and the owner go in per spawn
@@ -9106,6 +9147,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
         rp.remove_arena(arena)
+        if pool_budget is not None:
+            pool_budget.close()
         if parking_store is not None:    # the store's broker and its memfds go with the start that failed
             parking_store.close()
         i, e = errors[0]
@@ -9127,6 +9170,8 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
                 except Exception:        # noqa: BLE001
                     pass
             rp.remove_arena(arena)
+            if pool_budget is not None:
+                pool_budget.close()
             if parking_store is not None:
                 parking_store.close()
             k, n = busy[0]
@@ -9143,16 +9188,19 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         eng = rp.ReplicaEngine(engines, load_tokens=load, pull=True, starve_s=pull.starve_s,
                                queue_timeout_s=pull.queue_timeout_s, max_queue=pull.max_queue,
                                prefer_idle_s=pull.prefer_idle_s, priorities=pull.priorities,
-                               parent_parking=parking_store)
+                               parent_parking=parking_store, pool_budget=pool_budget)
     else:
         eng = rp.ReplicaEngine(engines, load_tokens=load,
                                prefer_idle_s=rp.prefer_idle_config(cfg),
                                priorities=rp.replica_priorities(cfg, n),
-                               parent_parking=parking_store)
+                               parent_parking=parking_store, pool_budget=pool_budget)
     if arena:
         eng.__dict__["arena_file"] = arena
         import atexit
         atexit.register(rp.remove_arena, arena)             # (a killed server leaves the file: the next start sweeps it)
+    if pool_budget is not None:
+        import atexit
+        atexit.register(pool_budget.close)
     return eng
 
 
@@ -9607,6 +9655,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             raise SystemExit(f"[strata] config {e}")
         try:                                            # the pull scheduler's own config is checked by its module
             pull = rp.pull_config(cfg)
+            rp.replica_dynamic_pool_enabled(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
         try:                                            # stage 5: one RAM store for every replica, said before the start
