@@ -247,6 +247,30 @@ bool on_device(const void* p) {
     return at.type == cudaMemoryTypeDevice;
 #endif
 }
+
+const uint8_t* host_readable_ptr(const void* p) {
+    if (p == nullptr) return nullptr;
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    (void) p;
+    return nullptr;
+#else
+    cudaPointerAttributes at{};
+    const cudaError_t e = cudaPointerGetAttributes(&at, p);
+    if (e != cudaSuccess) {
+        cudaGetLastError();
+        return static_cast<const uint8_t*>(p);   // unregistered host pointer (malloc / std::vector)
+    }
+    if (at.type == cudaMemoryTypeHost && at.hostPointer != nullptr)
+        return static_cast<const uint8_t*>(at.hostPointer);
+    if (at.type == cudaMemoryTypeUnregistered)
+        return static_cast<const uint8_t*>(p);
+    return nullptr;
+#endif
+}
+
+uint8_t* host_writable_ptr(void* p) {
+    return const_cast<uint8_t*>(host_readable_ptr(p));
+}
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
 struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; long resize_faults = 0; };
@@ -564,6 +588,99 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     return refresh_residency(st, g, upto, error);
 }
 
+bool conversation_kv_restore_batch(const std::vector<ConversationKv>& images,
+                                   const std::vector<const QsaState*>& targets, const ModelGeometry& g,
+                                   int64_t captured, int64_t upto, bool has_draft,
+                                   const SessionParallelFor& parallel_for, std::string& error) {
+    if (images.size() != targets.size()) {
+        error = "conversation snapshot: batch layer count mismatch";
+        return false;
+    }
+    const bool has_slots = vram_kv_find(images.empty() ? 0 : images[0].dev_tag) != nullptr;
+    if (!has_slots) conversation_park_join();
+    struct HostChunk {
+        uint8_t* dst = nullptr;
+        const uint8_t* src = nullptr;
+        size_t bytes = 0;
+    };
+    std::vector<HostChunk> host_chunks;
+    std::vector<bool> used_slot(images.size(), false);
+    const bool prefix = upto < captured;
+
+    for (size_t k = 0; k < images.size(); ++k) {
+        const ConversationKv& image = images[k];
+        const QsaState& st = *targets[k];
+        const bool index = !(has_draft && k + 1 == images.size());
+        const VramKvSlot* slot = vram_kv_find(image.dev_tag);
+        if (slot == nullptr && has_slots) conversation_park_join();
+
+        std::array<size_t, 5> sizes{};
+        if (!prefix) {
+            if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+            sizes = {image.k.size(), image.v.size(), image.k_scale.size(), image.v_scale.size(), image.pooled.size()};
+        } else {
+            if (upto < 0 || upto > captured) {
+                error = "conversation snapshot: prefix beyond the captured K/V";
+                return false;
+            }
+            if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
+            Layout l{};
+            if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+            sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+        }
+
+        const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+        for (size_t i = 0; i < src.size(); ++i)
+            if (sizes[i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
+
+        const auto dst = pools(st);
+        std::array<size_t, 5> off{};
+        if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) {
+            slot = nullptr;
+            conversation_park_join();
+        }
+        if (slot != nullptr) {
+            used_slot[k] = true;
+            for (size_t i = 0; i < src.size(); ++i)
+                if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+            if (!refresh_residency(st, g, upto, error)) return false;
+            continue;
+        }
+        for (size_t i = 0; i < src.size(); ++i) {
+            if (sizes[i] == 0) continue;
+            uint8_t* hd = host_writable_ptr(dst[i]);
+            if (hd != nullptr) {
+                if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                        constexpr size_t kChunk = 4u << 20;
+                        for (size_t sub = 0; sub < n; sub += kChunk) {
+                            host_chunks.push_back({hd + at + sub, p + sub, std::min(kChunk, n - sub)});
+                        }
+                        return true;
+                    })) return false;
+            } else {
+                if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
+                        return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                    })) return false;
+            }
+        }
+    }
+    if (!host_chunks.empty()) {
+        if (parallel_for && host_chunks.size() > 1) {
+            parallel_for(host_chunks.size(), [&](size_t idx) {
+                const auto& c = host_chunks[idx];
+                std::memcpy(c.dst, c.src, c.bytes);
+            });
+        } else {
+            for (const auto& c : host_chunks) std::memcpy(c.dst, c.src, c.bytes);
+        }
+    }
+    for (size_t k = 0; k < images.size(); ++k) {
+        if (used_slot[k]) continue;
+        if (!refresh_residency(*targets[k], g, upto, error)) return false;
+    }
+    return true;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
@@ -582,6 +699,9 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const auto src = pools(st);
     const auto sizes = s.sizes;
+    for (size_t part = 0; part < 5; ++part) {
+        if (src[part] != nullptr && sizes[part] > 0) s.host_ptrs[part] = host_readable_ptr(src[part]);
+    }
     auto why = std::make_shared<std::string>();
     s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }

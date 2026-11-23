@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <new>
 #include <utility>
 #include <vector>
@@ -992,6 +993,121 @@ int main() {
             check(!session_file_read_fd(wo, id, back, read, error, {}, &st) && st.error == SessionError::io,
                   "fd: a write-only descriptor refuses the read");
             ::close(wo);
+        }
+        // PR 1.2: trusted_memfd zero-copy mmap + host_ptrs + parallel_for + immediate F_ADD_SEALS
+        {
+            const int tfd = ::memfd_create("strata-test-trusted", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+            check(tfd >= 0, "trusted_memfd: sealable memfd created");
+            auto meta_t = original;
+            meta_t.kv.clear();
+            // Back big layer K buffer by contiguous host_ptrs so parallel 4 MiB slice copy is exercised
+            std::vector<uint8_t> big_k(original.kv[0].k.size());
+            check(original.kv[0].k.read(big_k.data(), 0, big_k.size()), "trusted_memfd: capture host K");
+            auto sources_t = sources_of(original);
+            sources_t[0].host_ptrs[0] = big_k.data();
+
+            uint64_t measured_t = 0;
+            check(session_file_measure(meta_t, sources_t, measured_t, error), "trusted_memfd: measure");
+            check(::ftruncate(tfd, (off_t) measured_t) == 0, "trusted_memfd: pre-size memfd");
+
+            size_t pfor_calls = 0;
+            SessionWriteOptions two = fd_options();
+            two.trusted_memfd = true;
+            two.parallel_for = [&](size_t count, const std::function<void(size_t)>& fn) {
+                ++pfor_calls;
+                std::vector<std::thread> ts;
+                ts.reserve(count);
+                for (size_t i = 0; i < count; ++i) ts.emplace_back(fn, i);
+                for (auto& t : ts) t.join();
+            };
+            size_t twritten = 0;
+            SessionStatus tst;
+            check(session_file_write_fd(tfd, meta_t, sources_t, id, twritten, error, two, &tst),
+                  "trusted_memfd: mmap write succeeds");
+            check(twritten == measured_t && pfor_calls == 1,
+                  "trusted_memfd: exact byte count and parallel_for invoked");
+            // Critical ParentParkingStore invariant: writable mmap must be unmapped before F_SEAL_WRITE
+            const int seals = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+            check(::fcntl(tfd, F_ADD_SEALS, seals) == 0,
+                  "trusted_memfd: F_ADD_SEALS(F_SEAL_WRITE) succeeds immediately after write_fd");
+
+            // Untrusted reader (default trusted_memfd=false) MUST reject kFlagTrustedNoHash
+            {
+                SavedConversation bad_back;
+                size_t bread = 0;
+                SessionStatus bst;
+                check(!session_file_read_fd(tfd, id, bad_back, bread, error, {}, &bst) &&
+                      bst.error == SessionError::invalid,
+                      "trusted_memfd: untrusted read rejects kFlagTrustedNoHash");
+            }
+            // Also verify metadata-only admit peak (< full file size because KV is > 17 MiB)
+            {
+                uint64_t asked = 0;
+                SessionReadLimits gated;
+                gated.trusted_memfd = true;
+                gated.admit = [&](uint64_t need, std::string& why) {
+                    asked = need;
+                    why = "refused for admit inspection";
+                    return false;
+                };
+                SavedConversation untouched;
+                size_t bread = 0;
+                SessionStatus bst;
+                check(!session_file_read_fd(tfd, id, untouched, bread, error, gated, &bst) &&
+                      bst.error == SessionError::memory,
+                      "trusted_memfd: refused admit returns memory error");
+                check(asked > 0 && asked < (uint64_t) original.kv[0].k.size(),
+                      "trusted_memfd: admit charges metadata+checkpoints rather than mapped KV");
+            }
+            // Zero-copy mmap read succeeds and produces view-backed KV buffers equal to original
+            {
+                SavedConversation back_view;
+                size_t zread = 0;
+                SessionReadLimits rlim;
+                rlim.trusted_memfd = true;
+                check(session_file_read_fd(tfd, id, back_view, zread, error, rlim, &tst),
+                      "trusted_memfd: zero-copy mmap read succeeds");
+                check(zread == twritten && same(original, back_view),
+                      "trusted_memfd: zero-copy image equals original byte-for-byte");
+                check(back_view.kv[0].k.is_view(),
+                      "trusted_memfd: non-empty KV buffer uses zero-copy mmap view");
+            }
+            // Truncation / bad end marker rejection on read_fd_mmap
+            {
+                std::vector<char> sealed_copy = slurp_fd(tfd);
+                sealed_copy.back() ^= 0xff;
+                const int bad_end_fd = memfd_with("strata-test-badend", sealed_copy);
+                SessionReadLimits rlim;
+                rlim.trusted_memfd = true;
+                SavedConversation dummy;
+                size_t dummy_b = 0;
+                SessionStatus dummy_st;
+                check(bad_end_fd >= 0 &&
+                      !session_file_read_fd(bad_end_fd, id, dummy, dummy_b, error, rlim, &dummy_st) &&
+                      dummy_st.error == SessionError::invalid,
+                      "trusted_memfd: bad end marker rejected");
+                ::close(bad_end_fd);
+            }
+            // STRATA_PARENT_FAST_MMAP=0 falls back to streaming cleanly
+            {
+                ::setenv("STRATA_PARENT_FAST_MMAP", "0", 1);
+                check(!session_parent_fast_mmap_enabled(), "trusted_memfd: env=0 disables fast mmap");
+                const int sfd = memfd("strata-test-fallback", (size_t) measured_t);
+                size_t swritten = 0;
+                check(session_file_write_fd(sfd, meta_t, sources_t, id, swritten, error, two, &tst),
+                      "trusted_memfd: streaming fallback write succeeds");
+                SavedConversation back_s;
+                size_t sread = 0;
+                SessionReadLimits rlim;
+                rlim.trusted_memfd = true;
+                check(session_file_read_fd(sfd, id, back_s, sread, error, rlim, &tst),
+                      "trusted_memfd: streaming fallback read succeeds");
+                check(same(original, back_s) && !back_s.kv[0].k.is_view(),
+                      "trusted_memfd: env=0 read matches original without mmap view");
+                ::close(sfd);
+                ::unsetenv("STRATA_PARENT_FAST_MMAP");
+            }
+            ::close(tfd);
         }
     }
 #endif

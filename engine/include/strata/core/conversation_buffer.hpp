@@ -48,17 +48,34 @@ public:
     ConversationBuffer(const ConversationBuffer&) = default;
     ConversationBuffer& operator=(const ConversationBuffer&) = default;
     ConversationBuffer(ConversationBuffer&& other) noexcept
-        : segments_(std::move(other.segments_)), size_(std::exchange(other.size_, 0)) {}
+        : segments_(std::move(other.segments_)),
+          size_(std::exchange(other.size_, 0)),
+          view_owner_(std::move(other.view_owner_)),
+          view_data_(std::exchange(other.view_data_, nullptr)) {}
     ConversationBuffer& operator=(ConversationBuffer&& other) noexcept {
         if (this == &other) return *this;
         segments_ = std::move(other.segments_);
         size_ = std::exchange(other.size_, 0);
+        view_owner_ = std::move(other.view_owner_);
+        view_data_ = std::exchange(other.view_data_, nullptr);
         return *this;
     }
+
+    /// Zero-copy read-only backing (e.g. a sealed memfd mmap); materializes automatically on mutation.
+    static ConversationBuffer from_view(std::shared_ptr<const void> owner, const uint8_t* ptr, size_t n) {
+        ConversationBuffer buf;
+        if (n == 0 || ptr == nullptr) return buf;
+        buf.view_owner_ = std::move(owner);
+        buf.view_data_ = ptr;
+        buf.size_ = n;
+        return buf;
+    }
+    bool is_view() const { return view_data_ != nullptr; }
 
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
     size_t bytes() const {
+        if (view_data_ != nullptr) return size_;
         size_t n = segments_.capacity() * sizeof(Segment);
         for (const auto& segment : segments_) n += segment.capacity();
         return n;
@@ -66,6 +83,15 @@ public:
     // Includes the old directory while reserve allocates its replacement.
     // Saturation makes an overflowing estimate fail admission before resize.
     size_t allocation_peak(size_t n) const {
+        if (view_data_ != nullptr) {
+            if (n == 0) return 0;
+            const size_t need = std::max(size_, n);
+            size_t total = size_;
+            if (!add(total, need)) return SIZE_MAX;
+            const size_t count = need / segment_bytes + (need % segment_bytes != 0);
+            if (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment))) return SIZE_MAX;
+            return total;
+        }
         size_t total = bytes();
         if (n <= size_) return total;
         const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
@@ -82,6 +108,15 @@ public:
     }
     void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
     void resize_impl(size_t n, const uint8_t* value) {
+        if (view_data_ != nullptr) {
+            if (n == 0) {
+                view_owner_.reset();
+                view_data_ = nullptr;
+                size_ = 0;
+                return;
+            }
+            materialize();
+        }
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
@@ -121,9 +156,14 @@ public:
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
+        materialize();
         return visit_impl(*this, offset, count, fn);
     }
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) const {
+        if (view_data_ != nullptr) {
+            if (offset > size_ || count > size_ - offset) return false;
+            return count == 0 || fn(view_data_ + offset, count, offset);
+        }
         return visit_impl(*this, offset, count, fn);
     }
     bool read(void* target, size_t offset, size_t count) const {
@@ -134,6 +174,20 @@ public:
     }
     bool operator==(const ConversationBuffer& other) const {
         if (size_ != other.size_) return false;
+        if (size_ == 0) return true;
+        if (view_data_ != nullptr && other.view_data_ != nullptr) {
+            return view_data_ == other.view_data_ || std::memcmp(view_data_, other.view_data_, size_) == 0;
+        }
+        if (view_data_ != nullptr) {
+            return other.visit(0, size_, [&](const uint8_t* p, size_t n, size_t at) {
+                return std::memcmp(view_data_ + at, p, n) == 0;
+            });
+        }
+        if (other.view_data_ != nullptr) {
+            return visit(0, size_, [&](const uint8_t* p, size_t n, size_t at) {
+                return std::memcmp(p, other.view_data_ + at, n) == 0;
+            });
+        }
         size_t a = 0, b = 0, x = 0, y = 0;
         while (a < segments_.size() && b < other.segments_.size()) {
             const auto& left = segments_[a];
@@ -191,8 +245,25 @@ private:
         }
         return count == 0;
     }
+    void materialize() {
+        if (view_data_ == nullptr) return;
+        const uint8_t* src = view_data_;
+        const size_t n = size_;
+        std::shared_ptr<const void> owner = std::move(view_owner_);
+        view_data_ = nullptr;
+        size_ = 0;
+        segments_.clear();
+        resize_impl(n, nullptr);
+        size_t at = 0;
+        for (auto& seg : segments_) {
+            std::memcpy(seg.data(), src + at, seg.size());
+            at += seg.size();
+        }
+    }
     std::vector<Segment> segments_;
     size_t size_ = 0;
+    std::shared_ptr<const void> view_owner_;
+    const uint8_t* view_data_ = nullptr;
 };
 
 } // namespace strata::core

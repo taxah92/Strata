@@ -8902,6 +8902,25 @@ int main(int argc, char** argv) {
     }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
                                         o.pool_affinity, o.pool_tasks, budget_map.slot());
+    strata::core::SessionParallelFor pool_pfor = [&pool](size_t count, const std::function<void(size_t)>& fn) {
+        if (count <= 1 || pool.active_workers() <= 1) {
+            for (size_t i = 0; i < count; ++i) fn(i);
+            return;
+        }
+        struct RangeWrap {
+            const std::function<void(size_t)>* fn;
+            size_t base;
+        };
+        for (size_t base = 0; base < count;) {
+            const size_t chunk = std::min<size_t>(count - base, 60000);
+            RangeWrap w{&fn, base};
+            pool.run_range((int) chunk, [](void* p, int idx) {
+                const auto* ctx = static_cast<const RangeWrap*>(p);
+                (*ctx->fn)(ctx->base + (size_t) idx);
+            }, &w);
+            base += chunk;
+        }
+    };
     if (budget_map.slot() != nullptr) {
         std::fprintf(stderr, "strata generate: dynamic CPU pool budget attached (slot %d, initial %d/%d workers)\n",
                      o.pool_budget_slot >= 0 ? o.pool_budget_slot : 0, pool.active_workers(), pool.workers());
@@ -14096,6 +14115,8 @@ int main(int argc, char** argv) {
             strata::core::SessionWriteOptions wo;
             wo.durable = false;
             wo.min_free_bytes = 0;
+            wo.trusted_memfd = true;
+            wo.parallel_for = pool_pfor;
             for (size_t k = 0; k < stage_bytes.size(); ++k) {
                 size_t written = 0;
                 strata::core::SessionStatus st;
@@ -19599,6 +19620,8 @@ int main(int argc, char** argv) {
                     const uint64_t floor = (uint64_t) floor_mib << 20;
                     for (size_t k = 0; k < out.size(); ++k) {
                         auto& l = out[k];
+                        l.trusted_memfd = true;
+                        l.parallel_for = pool_pfor;
                         l.progress = [](uint64_t, uint64_t) { strata::core::progress_allow(0); };
                         l.admit = [&, floor, floor_mib](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
@@ -20109,7 +20132,8 @@ int main(int argc, char** argv) {
                 const strata::core::SavedConversation* donor = parent_mode ? &*incoming : conversations.find(parked.serial);
                 if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
-                                                                       use_mtp ? &mtp.kv_state() : nullptr, err) !=
+                                                                       use_mtp ? &mtp.kv_state() : nullptr, err,
+                                                                       pool_pfor) !=
                         strata::core::ConversationRestore::restored) {
                     // validated above and guarded while parking: a failure here is fatal, as for a whole restore
                     std::printf("ERR restoring a borrowed conversation prefix: %s\n",
@@ -20146,7 +20170,8 @@ int main(int argc, char** argv) {
             if (incoming) {
                 const auto t0 = Clock::now();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err,
+                        pool_pfor) !=
                     strata::core::ConversationRestore::restored) {
                     // Already prevalidated above: a failure here is fatal, never
                     // permission to decode from a partially restored session.
@@ -20156,7 +20181,8 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
                     const strata::core::OnDevice on(stages[i]->dev);
                     if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err,
+                            pool_pfor) !=
                         strata::core::ConversationRestore::restored) {
                         std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
                                     err.c_str());

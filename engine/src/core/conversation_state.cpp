@@ -768,17 +768,20 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const SessionParallelFor& parallel_for) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
     conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
-            return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
+    const size_t layers = owned_qsa(ss);
+    std::vector<const QsaState*> targets;
+    targets.reserve(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j) targets.push_back(&owned(ss, j));
+    if (draft) targets.push_back(draft);
+    if (!conversation_kv_restore_batch(image.kv, targets, g, upto, upto, draft != nullptr, parallel_for, error) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
@@ -816,23 +819,26 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     return conversation_snapshot_validate(image, ss, g, &draft, error);
 }
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState& draft, std::string& error) {
+                                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                                   const SessionParallelFor& parallel_for) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
     conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
-    return conversation_snapshot_restore(image, ss, g, &draft, error);
+    return conversation_snapshot_restore(image, ss, g, &draft, error, parallel_for);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
-                                                          const QsaState& draft, std::string& error) {
+                                                          const QsaState& draft, std::string& error,
+                                                          const SessionParallelFor& parallel_for) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
     conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
-    return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error);
+    return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error, parallel_for);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
-                                                          const QsaState* draft, std::string& error) {
+                                                          const QsaState* draft, std::string& error,
+                                                          const SessionParallelFor& parallel_for) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
     conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
@@ -848,10 +854,12 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
         return ConversationRestore::invalid;
     }
     if (!sync(error)) return ConversationRestore::transfer_failed;
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error))
-            return ConversationRestore::transfer_failed;
-    if (draft && !conversation_kv_restore_prefix(image.kv.back(), *draft, g, captured, upto, false, error))
+    const size_t layers = owned_qsa(ss);
+    std::vector<const QsaState*> targets;
+    targets.reserve(layers + (draft ? 1 : 0));
+    for (size_t j = 0; j < layers; ++j) targets.push_back(&owned(ss, j));
+    if (draft) targets.push_back(draft);
+    if (!conversation_kv_restore_batch(image.kv, targets, g, captured, upto, draft != nullptr, parallel_for, error))
         return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }

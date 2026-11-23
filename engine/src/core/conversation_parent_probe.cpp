@@ -174,6 +174,7 @@ int main(int argc, char** argv) {
         size_t written = 0;
         SessionWriteOptions wo;
         wo.durable = false;
+        wo.trusted_memfd = true;
         SessionStatus st;
         if (!session_file_write_fd(pending.fd(0), meta, sources, sid, written, error, wo, &st))
             return fail("write: " + error);
@@ -200,6 +201,7 @@ int main(int argc, char** argv) {
     if (!client.acquire(*candidate, lease, error)) return fail("acquire: " + error);
     SavedConversation back;
     std::vector<SessionReadLimits> limits(1);
+    limits[0].trusted_memfd = true;
     SessionStatus st;
     if (!parent_load(lease, limits, back, error, &st)) return fail("load: " + error);
     if (!same(original, back)) return fail("the image read back differs from the one published");

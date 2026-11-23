@@ -883,6 +883,49 @@ int main() {
               "share: the entry stays after a read");
     }
 
+    // ---- PR 1.2: trusted_memfd fast mmap round-trip via parent_load produces zero-copy views
+    {
+        Broker broker;
+        broker.start();
+        ConversationParentClient a, b;
+        std::string error;
+        const int fa = connect_pair(broker);
+        const int fb = connect_pair(broker);
+        check(a.connect(fa, identity("r0"), 2000, error) && b.connect(fb, identity("r1"), 2000, error), "trusted: connect");
+        uint64_t measured = 0;
+        check(session_file_measure(meta, sources, measured, error), "trusted: measure");
+        const std::string tpub = parent_publish_id();
+        ParentPending tpending;
+        bool tdedup = false;
+        check(a.begin(tpub, parent_points(original), false, {measured}, tpending, tdedup, error) && !tdedup, "trusted: begin");
+        SessionWriteOptions two;
+        two.durable = false;
+        two.trusted_memfd = true;
+        size_t tw = 0;
+        SessionStatus tst;
+        check(session_file_write_fd(tpending.fd(0), meta, sources, sid, tw, error, two, &tst), "trusted: write_fd");
+        check(tw == measured, "trusted: written equals measured");
+        tpending.close_fds();
+        uint64_t tid = 0, tgen = 0;
+        check(a.commit(tpub, tpending, tid, tgen, error), "trusted: commit");
+        uint64_t tcookie = 0;
+        std::vector<int64_t> tlengths;
+        check(b.match_begin(8, false, {}, {}, tcookie, tlengths, error) && !tlengths.empty(), "trusted: match_begin");
+        std::optional<ParentCandidate> tcand;
+        check(b.match_end(tcookie, parent_hashes(original.live.ids, tlengths), tcand, error) && tcand, "trusted: match_end");
+        ParentLease tlease;
+        check(b.acquire(*tcand, tlease, error), "trusted: acquire");
+        SavedConversation tback;
+        SessionReadLimits tlim;
+        tlim.trusted_memfd = true;
+        std::vector<SessionReadLimits> tlimits(1, tlim);
+        check(parent_load(tlease, tlimits, tback, error, &tst) && same(original, tback),
+              "trusted: parent_load reads zero-copy image");
+        check(!tback.kv.empty() && tback.kv[0].k.is_view(), "trusted: KV buffer is zero-copy view");
+        tlease.close_fds();
+        check(tlease.release("ok", error), "trusted: release");
+    }
+
     // ---- SIGKILL of a client leaves the broker's state clean (it sees EOF and drops the channel)
     {
         Broker broker;
