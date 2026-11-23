@@ -860,6 +860,9 @@ struct Options {
     std::string host_core;
     /// --pool-cores LIST (STRATA_POOL_CORES; experimental, off by default): the logical processors the pool's workers are pinned to
     std::string pool_cores;
+    /// --pool-budget-fd PATH / --pool-budget-slot N (PR 1.1): shared memfd slot controlling active ExpertPool workers
+    std::string pool_budget_fd;
+    int pool_budget_slot = -1;
     /// --aux-cpus off|auto|LIST (STRATA_AUX_CPUS): where the non-pool, non-host threads run (strata/platform/aux_cpus.hpp)
     std::string aux_cpus;
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
@@ -1511,6 +1514,8 @@ void usage() {
                  "                       process may not use are left out.  The worker count is the list's length unless\n"
                  "                       --pool-workers says otherwise.  Moves threads only, never a result.\n"
                  "                       STRATA_POOL_CORES sets it too.\n"
+                 "  --pool-budget-fd P   Shared memfd/file path holding PoolBudgetSlot records for dynamic pool sizing.\n"
+                 "  --pool-budget-slot N Zero-based slot index inside --pool-budget-fd (0..63).\n"
                  "  --aux-cpus SET       Where the threads that are neither pool workers nor the host thread run (the\n"
                  "                       adaptive tier's job thread, the prefill helpers, the CUDA driver's threads, ...):\n"
                  "                       off (the default: wherever they were created), auto (the SMT siblings of the host's\n"
@@ -3950,6 +3955,17 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--pool-cores") o.pool_cores = next("--pool-cores");
+        else if (a == "--pool-budget-fd") o.pool_budget_fd = next("--pool-budget-fd");
+        else if (a == "--pool-budget-slot") {
+            const char* v = next("--pool-budget-slot");
+            char* end = nullptr;
+            const long slot = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || slot < 0 || slot >= 64) {
+                std::fprintf(stderr, "strata generate: --pool-budget-slot expects an integer in 0..63\n");
+                return 2;
+            }
+            o.pool_budget_slot = (int) slot;
+        }
         else if (a == "--aux-cpus") {
             o.aux_cpus = next("--aux-cpus");
             std::string aerr;
@@ -8876,8 +8892,20 @@ int main(int argc, char** argv) {
 #endif
     if (o.pool_measure)
         o.pool_affinity = measure_pool_affinity(srcp, o.pool_workers, !o.no_host_worker, o.pool_tasks);
+    strata::kernels::cpu::PoolBudgetMapping budget_map;
+    if (!o.pool_budget_fd.empty()) {
+        const int slot_idx = o.pool_budget_slot >= 0 ? o.pool_budget_slot : 0;
+        std::string berr;
+        if (!budget_map.open(o.pool_budget_fd, slot_idx, berr)) {
+            std::fprintf(stderr, "strata generate: --pool-budget-fd ignored (%s); using full static pool\n", berr.c_str());
+        }
+    }
     strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker,
-                                        o.pool_affinity, o.pool_tasks);
+                                        o.pool_affinity, o.pool_tasks, budget_map.slot());
+    if (budget_map.slot() != nullptr) {
+        std::fprintf(stderr, "strata generate: dynamic CPU pool budget attached (slot %d, initial %d/%d workers)\n",
+                     o.pool_budget_slot >= 0 ? o.pool_budget_slot : 0, pool.active_workers(), pool.workers());
+    }
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
                  o.pool_tasks ? " (capped by rows)" : " (automatic)",

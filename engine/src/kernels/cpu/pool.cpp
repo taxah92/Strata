@@ -27,13 +27,95 @@
 #include <windows.h>
 #include "pool_affinity_win.hpp"
 #else
+#include <cerrno>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "pool_affinity_linux.hpp"
 #endif
 
 namespace strata::kernels::cpu {
+
+PoolBudgetMapping::~PoolBudgetMapping() { close(); }
+
+PoolBudgetMapping::PoolBudgetMapping(PoolBudgetMapping&& other) noexcept
+    : base_(other.base_), map_len_(other.map_len_), slot_(other.slot_) {
+    other.base_ = nullptr;
+    other.map_len_ = 0;
+    other.slot_ = nullptr;
+}
+
+PoolBudgetMapping& PoolBudgetMapping::operator=(PoolBudgetMapping&& other) noexcept {
+    if (this == &other) return *this;
+    close();
+    base_ = other.base_;
+    map_len_ = other.map_len_;
+    slot_ = other.slot_;
+    other.base_ = nullptr;
+    other.map_len_ = 0;
+    other.slot_ = nullptr;
+    return *this;
+}
+
+void PoolBudgetMapping::close() {
+#if !defined(_WIN32)
+    if (base_ != nullptr && map_len_ > 0) ::munmap(base_, map_len_);
+#endif
+    base_ = nullptr;
+    map_len_ = 0;
+    slot_ = nullptr;
+}
+
+bool PoolBudgetMapping::open(const std::string& path, int slot, std::string& error) {
+    close();
+    error.clear();
+#if defined(_WIN32)
+    (void) path;
+    (void) slot;
+    error = "pool budget mapping is only supported on POSIX";
+    return false;
+#else
+    if (path.empty()) {
+        error = "empty pool budget path";
+        return false;
+    }
+    if (slot < 0 || slot >= 64) {
+        error = "pool budget slot out of range (expected 0..63)";
+        return false;
+    }
+    const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+        error = std::string("open ") + path + ": " + std::strerror(errno);
+        return false;
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0) {
+        error = std::string("fstat ") + path + ": " + std::strerror(errno);
+        ::close(fd);
+        return false;
+    }
+    const size_t need = (size_t) (slot + 1) * sizeof(PoolBudgetSlot);
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t) st.st_size < need) {
+        error = "pool budget backing file is not a regular file of sufficient size";
+        ::close(fd);
+        return false;
+    }
+    const size_t map_len = (size_t) st.st_size;
+    void* p = ::mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (p == MAP_FAILED) {
+        error = std::string("mmap ") + path + ": " + std::strerror(errno);
+        return false;
+    }
+    base_ = p;
+    map_len_ = map_len;
+    slot_ = reinterpret_cast<PoolBudgetSlot*>(static_cast<uint8_t*>(p) + (size_t) slot * sizeof(PoolBudgetSlot));
+    return true;
+#endif
+}
 
 namespace {
 // STRATA_POOL_UMWAIT=<TSC cycles> (experimental, x86 WAITPKG only): a parked worker waits with UMONITOR/UMWAIT on the
@@ -718,12 +800,18 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, "  expert pool: epoch %u, batch epoch %u: %u of %u jobs claimed, %u done; %u of %d workers parked, "
                     "%u sleeping; mode %d\n", epoch_.load(), batch, claimed, total, done, parked_count(), n_,
                  sleepers_.load(), mode_);
+    if (budget_slot_ != nullptr)
+        std::fprintf(f, "  expert pool budget: active_limit %d / %d, budget_sleepers %u, changes %llu\n",
+                     active_limit_.load(std::memory_order_relaxed), n_,
+                     budget_sleepers_.load(std::memory_order_relaxed),
+                     (unsigned long long) budget_slot_->changes.load(std::memory_order_relaxed));
     if (numa_n_ > 0) std::fprintf(f, "  expert pool NUMA slices:%s\n", numa_counters().c_str());
     std::fprintf(f, "  expert pool threads:");
     for (int i = 0; i < n_; ++i) {
         const int32_t s = wstate_[(size_t) i].load();
         if (s == kParked) std::fprintf(f, " w%d=parked", i);
         else if (s == kSleeping) std::fprintf(f, " w%d=sleeping", i);
+        else if (s == kBudgetParked) std::fprintf(f, " w%d=budget", i);
         else if (s == kBetween) std::fprintf(f, " w%d=draining", i);
         else std::fprintf(f, " w%d=job%d", i, s);
     }
@@ -735,7 +823,8 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks,
+                       PoolBudgetSlot* budget_slot)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     pinned_ = pin;
@@ -919,6 +1008,19 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     }
     g_numa_plan = std::move(plan);
     g_numa_owner = this;
+    if (budget_slot != nullptr && numa_n_ > 0) {
+        std::fprintf(stderr, "strata cpu pool: dynamic pool budget disabled under NUMA split\n");
+        budget_slot_ = nullptr;
+    } else {
+        budget_slot_ = budget_slot;
+    }
+    const int init_lim = read_budget_target();
+    active_limit_.store(init_lim, std::memory_order_relaxed);
+    planned_limit_ = init_lim;
+    last_applied_ = init_lim;
+    if (budget_slot_ != nullptr) {
+        budget_slot_->applied_workers.store((uint32_t) init_lim, std::memory_order_relaxed);
+    }
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
@@ -971,9 +1073,13 @@ ExpertPool::~ExpertPool() {
         g_numa_plan = NumaSplitPlan{};
         g_numa_owner = nullptr;
     }
-    stop_.store(true, std::memory_order_release);
+    stop_.store(true, std::memory_order_seq_cst);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
+    {
+        std::lock_guard<std::mutex> lk(budget_mu_);
+        budget_cv_.notify_all();
+    }
     for (auto& t : threads_) t.join();
 }
 
@@ -998,6 +1104,17 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_of(id).fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
+        if (id >= active_limit_.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> lk(budget_mu_);
+            wstate_[(size_t) id].store(kBudgetParked, std::memory_order_relaxed);
+            budget_sleepers_.fetch_add(1, std::memory_order_seq_cst);
+            budget_cv_.wait(lk, [&] {
+                return stop_.load(std::memory_order_seq_cst) || id < active_limit_.load(std::memory_order_seq_cst);
+            });
+            budget_sleepers_.fetch_sub(1, std::memory_order_relaxed);
+            wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_acquire)) return;
+        }
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
         // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
         // iterations are spent here with nothing to do.
@@ -1018,6 +1135,7 @@ void ExpertPool::worker(int id) {
 #endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
+            if (id >= active_limit_.load(std::memory_order_acquire)) break;
 #if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
             if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
                 _umonitor((void*) &epoch_);
@@ -1037,12 +1155,14 @@ void ExpertPool::worker(int id) {
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
             sleep_cv_.wait(lk, [&] {
-                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
+                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_seq_cst) ||
+                       id >= active_limit_.load(std::memory_order_seq_cst);
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
             wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
+        if (id >= active_limit_.load(std::memory_order_acquire)) continue;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
         if (diag_pool_on() && mode_ >= 5)
@@ -1120,10 +1240,30 @@ int ExpertPool::numa_plan_phase(int per, int nb) {
     return base;
 }
 
+int ExpertPool::read_budget_target() const {
+    if (budget_slot_ == nullptr) return n_;
+    const uint32_t raw = budget_slot_->target_workers.load(std::memory_order_relaxed);
+    if (raw == 0) return n_;
+    return (std::max)(1, (std::min)(n_, (int) raw));
+}
+
+void ExpertPool::plan_budget() { planned_limit_ = read_budget_target(); }
+
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
         std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
         std::abort();
+    }
+    const int want = read_budget_target();
+    const int prev = last_applied_;
+    if (want != prev) {
+        active_limit_.store(want, std::memory_order_seq_cst);
+        if (budget_slot_ != nullptr) {
+            budget_slot_->applied_workers.store((uint32_t) want, std::memory_order_relaxed);
+            budget_slot_->changes.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_applied_ = want;
+        planned_limit_ = want;
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
     // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
@@ -1143,6 +1283,10 @@ uint32_t ExpertPool::begin_batch(int n) {
         head_.store(pack_head(e, (uint32_t) n, 0), std::memory_order_release);
     }
     publish();
+    if (want > prev && budget_sleepers_.load(std::memory_order_seq_cst) != 0) {
+        std::lock_guard<std::mutex> lk(budget_mu_);
+        budget_cv_.notify_all();
+    }
     return e;
 }
 
@@ -1197,6 +1341,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
     for (;;) {
+        if (id >= 0 && id >= active_limit_.load(std::memory_order_acquire)) break;
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
         // other family's claim fail, so `mode_` is never read before a claim has succeeded (pool.hpp)
         int ci = numa_n_ > 0 ? claim_slice(epoch, s) : -1;
@@ -1405,19 +1550,22 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
+    plan_budget();
+    const int threads = planned_limit_ + (host_works_ ? 1 : 0);
     // about three tasks per thread in each phase, so the tail is short
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
     run_phase(1, n * parts_a_);
     for (int e = 0; e < n; ++e) act_quant_q8_1(split_[(size_t) e].ff, FF, split_[(size_t) e].a2);
+    plan_budget();
     run_phase(2, n * parts_b_);
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 int ExpertPool::phase_tasks(int64_t rows) const {
-    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
+    const int active = budget_slot_ != nullptr ? planned_limit_ : n_;
+    return tasks_ == 0 ? 3 * (active + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
@@ -1438,6 +1586,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    plan_budget();
     mjobs_ = jobs;
     mrows_ = (int64_t) n * FF;
     mtasks_ = phase_tasks(mrows_);
@@ -1447,6 +1596,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
         for (int t = 0; t < jobs[e].nt; ++t)
             act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
+    plan_budget();
     mrows_ = (int64_t) n * H;
     mtasks_ = phase_tasks(mrows_);
     run_phase(4, mtasks_);
@@ -1468,6 +1618,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
+        plan_budget();
         if (dep_on_ && numa_n_ == 0 && n_ > 1 && !q2_native_kernels(f.gu_type) && !q2_native_kernels(f.d_type)) {
             // BW-G (STRATA_POOL_DEP=1): the whole layer call as one batch, no barrier between the phases (DepExpert, pool.hpp)
             const int per_phase = phase_tasks((int64_t) nb * f.n_ff);
@@ -1495,6 +1646,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
+        plan_budget();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
         run_phase(6, mtasks_);
