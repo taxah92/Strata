@@ -2018,6 +2018,9 @@ static_assert(LR % (WARPS * 4) == 0, "fused_gr Q8_0 read: hc_lr must be a multip
 constexpr int Q8_CPS = N / Q8_KC;                   // chunks per stream
 constexpr int Q8_UPS = (LR + 127) / 128;            // steps of 128 values along an up row: 3 up to hc_lr 384 (Flash-Next 320), 4 for 512 (a fixed 3 dropped columns 384-511)
 constexpr int Q8_SPB = Q8_KC / 128;                 // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
+// PR 2.1 test/bench hook (fused_gr_set_q8_parallel): -1 = env/card default, else force ts / pfs for every later read.
+static int g_q8_ts = -1;
+static int g_q8_pfs = -1;
 __device__ __forceinline__ uint32_t q8_ld16(const uint8_t* p) { return *(const uint16_t*) p; }
 __device__ __forceinline__ float q8_half(uint32_t h) { return __half2float(__ushort_as_half((unsigned short) h)); }
 __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
@@ -3263,6 +3266,19 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_tc_kernel(GrMulti m, const f
 #endif
 }
 
+// The compute capability major of the current device (cached per device; -1 when it cannot be read).
+static int hc_dev_cc_major() {
+    static int ok[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return -1; }
+    if (ok[dev] == 0) {
+        int ma = 0;
+        ok[dev] = cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess ? (ma > 0 ? ma : -1) : -1;
+        if (ok[dev] < 0) (void) cudaGetLastError();
+    }
+    return ok[dev];
+}
+
 static int hc_q8_tc_mode() {
 #if defined(__HIPCC__)
     return 0;
@@ -3273,34 +3289,18 @@ static int hc_q8_tc_mode() {
         return std::atoi(v);
     }();
     if (env == 0) return 0;
-    static int ok[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return 0; }
-    if (ok[dev] == 0) {
-        int ma = 0;
-        const bool good = cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && ma >= 8;
-        if (!good) (void) cudaGetLastError();
-        ok[dev] = good ? 1 : -1;
-    }
-    if (ok[dev] <= 0) return 0;
+    if (hc_dev_cc_major() < 8) return 0;
     return env > 0 ? env : 1;   // default 1 (exact gr_down_q8_fast + 320-CTA uint4 INT8 TC gr_up_q8_tc) on sm_80+ CUDA (STRATA_HC_Q8_TC=0 disables)
 #endif
 }
 
+// The exact Q8_0 read's fast kernels are bitwise the plain read (S26 ws4 harness) and use nothing beyond warp shuffles
+// and fmaf, so they are the card default from sm_70: on Volta too. STRATA_TSUM=0 / STRATA_GR_Q8_PFS=0 force the plain path.
 static bool hc_q8_sm80_fast() {
 #if defined(__HIPCC__)
     return false;
 #else
-    static int ok[64] = {};
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { (void) cudaGetLastError(); return false; }
-    if (ok[dev] == 0) {
-        int ma = 0;
-        const bool good = cudaDeviceGetAttribute(&ma, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && ma >= 8;
-        if (!good) (void) cudaGetLastError();
-        ok[dev] = good ? 1 : -1;
-    }
-    return ok[dev] > 0;
+    return hc_dev_cc_major() >= 7;
 #endif
 }
 
@@ -3314,6 +3314,7 @@ static int hc_q8_bf16tc_mode() {
         return std::atoi(v);
     }();
     if (env == 0) return 0;
+    if (hc_dev_cc_major() < 8) return 0;   // its kernels compile to stubs below sm_80: never select them on Volta
     if (!hc_q8_sm80_fast()) return 0;
     return env > 0 ? env : 1;   // fallback when STRATA_HC_Q8_TC=0
 #endif
@@ -3350,12 +3351,12 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
         gr_up_q8_bf16tc_kernel<T><<<UPM_BLOCKS, THREADS, 0, st>>>(m, part, ssg);
         return;
     }
-    // On CUDA sm_80+, default to the exact-FP32-activation gr_down_q8_fast_kernel<T, 4, true> + gr_up_q8_fast_kernel
+    // On CUDA sm_70+ (Volta too), default to the exact-FP32-activation gr_down_q8_fast_kernel<T, 4, true> + gr_up_q8_fast_kernel
     // (transposed butterfly + prefetched Q8_0 weights; beats BF16 HC across T=1..8 with 0 KLD loss on force_check.py).
     static const int ts_env = [] { const char* v = std::getenv("STRATA_TSUM"); return v ? std::atoi(v) : -1; }();
     static const int pfs_env = [] { const char* v = std::getenv("STRATA_GR_Q8_PFS"); return v ? std::atoi(v) : -1; }();
-    const bool ts = (ts_env >= 0) ? (ts_env != 0) : hc_q8_sm80_fast();
-    const bool pfs = (pfs_env >= 0) ? (pfs_env != 0) : hc_q8_sm80_fast();
+    const bool ts  = g_q8_ts  >= 0 ? g_q8_ts  != 0 : (ts_env  >= 0 ? ts_env  != 0 : hc_q8_sm80_fast());
+    const bool pfs = g_q8_pfs >= 0 ? g_q8_pfs != 0 : (pfs_env >= 0 ? pfs_env != 0 : hc_q8_sm80_fast());
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     if (ts && pfs) gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
     else if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
@@ -3407,6 +3408,7 @@ static bool gr_fast() {
 int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
+void fused_gr_set_q8_parallel(int ts, int pfs) { g_q8_ts = ts; g_q8_pfs = pfs; }
 
 // STRATA_GR_V3: the stream-split hyper-connection read (gr_down_v3_kernel / gr_up_v3_kernel).  Another summation order than the default
 // read (~1e-7; a greedy tie can flip, so the answers are not byte-identical to 0.2.6's).  0.2.7: ON by default on a compute capability 12.0

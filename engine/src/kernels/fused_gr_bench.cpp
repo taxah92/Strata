@@ -209,6 +209,48 @@ int main(int argc, char** argv) {
             }
             std::printf("Q8 vs bf16 T %d apply %d | rel rms lo %.4f mixed %.4f | max |dR,dinject| %.3g | q8_1 image vs mixed rel rms %.4f | hash %016llx\n", T, apply,
                         std::sqrt(num / den), std::sqrt(nm / dm), rn, std::sqrt(qn / qd2), hq);
+            // PR 2.1: the three arms of the Q8_0 fast read, timed and compared bit for bit.  launch_q8_t latches
+            // STRATA_TSUM once per process, so the env cannot A/B them in one run; the hook can.
+            std::vector<float> oa[3];
+            std::vector<uint8_t> iqa[3];
+            unsigned long long ha[3];
+            for (int arm = 0; arm < 3; ++arm) {
+                K::fused_gr_set_q8_parallel(arm >= 1 ? 1 : 0, arm >= 2 ? 1 : 0);
+                cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
+                cudaMemset(dqm, 0, (size_t) TM * (N / 32) * 36);
+                K::fused_gr_read_multi(a, T, dxn, s);
+                cudaStreamSynchronize(s);
+                oa[arm].resize((size_t) T * (LR + N + D + HC));
+                float* p = oa[arm].data();
+                cudaMemcpy(p, dlo, (size_t) T * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) T * LR;
+                cudaMemcpy(p, dmix, (size_t) T * N * 4, cudaMemcpyDeviceToHost); p += (size_t) T * N;
+                cudaMemcpy(p, dR, (size_t) T * D * 4, cudaMemcpyDeviceToHost); p += (size_t) T * D;
+                cudaMemcpy(p, dio, (size_t) T * HC * 4, cudaMemcpyDeviceToHost);
+                iqa[arm].resize((size_t) T * (N / 32) * 36);
+                cudaMemcpy(iqa[arm].data(), dqm, iqa[arm].size(), cudaMemcpyDeviceToHost);
+                ha[arm] = 1469598103934665603ull;   // FNV-1a of the outputs and the q8_1 image
+                for (size_t b = 0; b < oa[arm].size() * 4; ++b) ha[arm] = (ha[arm] ^ ((const unsigned char*) oa[arm].data())[b]) * 1099511628211ull;
+                for (size_t b = 0; b < iqa[arm].size(); ++b) ha[arm] = (ha[arm] ^ iqa[arm][b]) * 1099511628211ull;
+            }
+            double us[3] = {1e30, 1e30, 1e30};
+            for (int round = 0; round < 3; ++round)
+                for (int arm = 0; arm < 3; ++arm) {
+                    K::fused_gr_set_q8_parallel(arm >= 1 ? 1 : 0, arm >= 2 ? 1 : 0);
+                    for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                    cudaEventRecord(e0, s);
+                    for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                    cudaEventRecord(e1, s);
+                    cudaEventSynchronize(e1);
+                    float ms = 0;
+                    cudaEventElapsedTime(&ms, e0, e1);
+                    us[arm] = std::fmin(us[arm], 1e3 * ms / iters);
+                }
+            K::fused_gr_set_q8_parallel(-1, -1);
+            const bool same3 = ha[0] == ha[1] && ha[0] == ha[2];
+            std::printf("Q8 T %d apply %d | plain %6.1f us  tsum %6.1f us (%+5.1f%%)  pf %6.1f us (%+5.1f%%) | %s | hashes %016llx/%016llx/%016llx\n",
+                        T, apply, us[0], us[1], 1e2 * (us[1] / us[0] - 1.0), us[2], 1e2 * (us[2] / us[0] - 1.0),
+                        same3 ? "bitwise equal" : "DIFFERS", ha[0], ha[1], ha[2]);
+            if (!same3) ++failures;
         }
     }
     if (cold_sets > 1) {
