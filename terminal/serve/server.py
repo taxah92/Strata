@@ -5026,12 +5026,14 @@ class Service:
         """The VRAM reserve to keep outside an elastic encoder's turn for one replica (None: start's, 0: full)."""
         return self.vram_reserve_by_replica[replica] if replica in self.vram_reserve_by_replica else 0
 
-    def vram(self, reserve_mib: int | None, replica=None) -> dict:
+    def vram(self, reserve_mib: int | None, replica=None, standby: bool | None = None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  Under replicas, `replica` selects one index, a list, or all
-        (None).  -> {"status": ..., and the engine's figures}."""
+        (None), and `standby` (true/false) keeps target replicas out of routing while their VRAM is lent out.  -> {"status": ..., and the engine's figures}."""
+        if standby is not None and not isinstance(standby, bool):
+            raise ValueError("standby: must be true or false")
         if not hasattr(self.engine, "vram") or (self.loaded() and not self._engine_has_vram_command()):
             raise ValueError("this engine cannot resize its VRAM use")
         if self._is_replica_engine():
@@ -5044,7 +5046,7 @@ class Service:
             if not self.fifo.acquire(timeout=self.vram_wait_s):
                 raise ModelBusy("a request is still running; try again when it has finished")
             try:
-                out = self.engine.vram(eff, replica=targets, wait_s=self.vram_wait_s)
+                out = self.engine.vram(eff, replica=targets, wait_s=self.vram_wait_s, standby=standby)
                 for k in targets:
                     self.vram_reserve_by_replica[k] = reserve_mib
                 if out.get("status") == "ok":
@@ -5059,6 +5061,8 @@ class Service:
 
         if replica is not None:
             raise ValueError("replica: this server is not running with replicas")
+        if standby is not None:
+            raise ValueError("standby: this server is not running with replicas")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
@@ -7844,8 +7848,12 @@ def make_handler(svc: Service):
                     r = req.get("reserve_mib")
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
+                    standby = req.get("standby")
+                    if "standby" in req and not isinstance(standby, bool):
+                        raise ValueError("standby: must be true or false")
+                    kw = {"standby": standby} if "standby" in req else {}
                     try:
-                        out = svc.vram(r, replica=req["replica"]) if "replica" in req else svc.vram(r)
+                        out = svc.vram(r, replica=req["replica"], **kw) if "replica" in req else svc.vram(r, **kw)
                         self._json(200, out)
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})

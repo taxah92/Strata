@@ -706,6 +706,7 @@ class ReplicaEngine:
         d["gen_seen"] = [getattr(e, "gen", 0) for e in engines]
         d["paused"] = {}                            # replica index -> owner thread ident while paused
         d["pause_depth"] = {}                       # replica index -> re-entrant pause depth
+        d["standby"] = set()                        # replicas kept out of routing (e.g. VRAM parked for external GPU work)
         d["reserves"] = [None] * len(engines)       # last VRAM reserve asked per replica (None = start's)
         d["reserves_asked"] = [False] * len(engines)
         # the server's one parent parking store (serve/parent_parking.py, plan §12.3): in __dict__, never through
@@ -893,7 +894,8 @@ class ReplicaEngine:
                 if key not in vram and key in info:
                     vram[key] = info[key]
             row = {"replica": k, "alive": e.alive(), **vram,
-                   "elastic": bool(info.get("vram_elastic"))}
+                   "elastic": bool(info.get("vram_elastic")),
+                   "standby": k in self.standby}
             if "reserve_mib" not in row and self.reserves_asked[k]:
                 row["reserve_mib"] = self.reserves[k]
             rows.append(row)
@@ -997,13 +999,36 @@ class ReplicaEngine:
         except Exception as err:                 # noqa: BLE001
             print(f"[strata] replica {k}: the VRAM reserve ({self.reserves[k]} MiB) was not applied: {err}", flush=True)
 
-    def vram(self, reserve_mib: int | None | dict[int, int | None], replica=None, wait_s: float = 300.0) -> dict:
+    def _park_for_standby(self, k: int) -> None:
+        """Park any live conversation on replica `k` into parent parking before putting it in standby."""
+        from serve.server import EngineDied
+        e = self.engines[k]
+        if not e.alive():
+            self.router.demote_live(k, parked=False)
+            return
+        park_fn = getattr(e, "park", None)
+        if park_fn is None:
+            self.router.demote_live(k, parked=False)
+            return
+        try:
+            res = park_fn()
+            status = res.get("status") if isinstance(res, dict) else None
+            self.router.demote_live(k, parked=(status in ("published", "dedup")))
+        except (ValueError, EngineDied, OSError):
+            self.router.demote_live(k, parked=False)
+
+    def vram(self, reserve_mib: int | None | dict[int, int | None], replica=None, wait_s: float = 300.0,
+             standby: bool | None = None) -> dict:
         """Apply a VRAM reserve to selected replicas (None = all), pausing and draining them first.
 
+        When `standby=True`, parks any live conversations on the target replicas, applies the reserve, and keeps
+        them out of routing until cleared (`standby=False`, or a global grow to 0/None).
         If one replica fails after earlier ones succeeded, already-resized replicas are rolled back to their
         previous reserves before raising.
         """
         from serve.server import EngineDied
+        if standby is not None and not isinstance(standby, bool):
+            raise ValueError("standby: must be true or false")
         targets = self.normalize_replicas(replica)
         for k in targets:
             if not hasattr(self.engines[k], "vram"):
@@ -1012,14 +1037,28 @@ class ReplicaEngine:
         def target_reserve(k: int) -> int | None:
             return reserve_mib[k] if isinstance(reserve_mib, dict) else reserve_mib
 
+        clear_global = (standby is None and len(targets) == len(self.engines)
+                        and all(target_reserve(k) in (0, None) for k in targets))
+
         with self.pause(targets, wait_s=wait_s):
+            if standby is True:
+                alive_set = {k for k, e in enumerate(self.engines) if e.alive()}
+                check_pool = alive_set if alive_set else set(range(len(self.engines)))
+                if check_pool.issubset(self.standby | set(targets)):
+                    raise ValueError("standby: at least one alive replica must remain active")
+
             if not any(e.alive() for e in self.engines):
+                if standby is True:
+                    self.standby.update(targets)
+                elif standby is False or clear_global:
+                    self.standby.difference_update(targets)
                 rows = []
                 for k in targets:
                     r_k = target_reserve(k)
                     self.reserves[k] = r_k
                     self.reserves_asked[k] = True
                     rows.append({"replica": k, "status": "not loaded", "reserve_mib": r_k,
+                                 "standby": k in self.standby,
                                  "note": "applied when the model loads"})
                 if len(targets) == 1:
                     return {**rows[0], "replicas": rows}
@@ -1043,6 +1082,8 @@ class ReplicaEngine:
                                          "note": "applied when the model loads"})
                             continue
                         raise EngineDied(f"replica {k} is not running")
+                    if standby is True:
+                        self._park_for_standby(k)
                     prev = (k, self.reserves[k], self.reserves_asked[k])
                     out = e.vram(r_k)
                     self.reserves[k] = r_k
@@ -1059,6 +1100,13 @@ class ReplicaEngine:
                     self.reserves[pk] = prev_res
                     self.reserves_asked[pk] = prev_asked
                 raise
+
+            if standby is True:
+                self.standby.update(targets)
+            elif standby is False or clear_global:
+                self.standby.difference_update(targets)
+            for row in rows:
+                row["standby"] = row["replica"] in self.standby
 
         status = "ok" if any(r.get("status") == "ok" for r in rows) else "not loaded"
         if len(targets) == 1:
@@ -1097,6 +1145,8 @@ class ReplicaEngine:
                 self.router.forget(k)
             self.router.forget_shared()
         finally:
+            with self.cv:
+                self.standby.clear()
             store = self.__dict__.get("parent_parking")
             if store is not None:                   # plan §12.3: the engines are down, so the store's RAM goes too
                 store.clear("unload")               # (even when an engine would not unload: the RAM is the point)
@@ -1127,7 +1177,7 @@ class ReplicaEngine:
                 alive = [k for k, e in enumerate(self.engines) if e.alive()]
                 if not alive:
                     return -1
-                avail = [k for k in alive if k not in self.paused]
+                avail = [k for k in alive if k not in self.paused and k not in self.standby]
                 if not avail:
                     self.cv.wait(timeout=0.5)
                     continue
@@ -1260,7 +1310,7 @@ class ReplicaEngine:
         if not self.pending:
             return
         free = [k for k, e in enumerate(self.engines)
-                if e.alive() and not self.inflight[k] and k not in self.paused]
+                if e.alive() and not self.inflight[k] and k not in self.paused and k not in self.standby]
         while free:
             pick = pull_choose(self.pending, free, now, self.pull_starve_s, self.router.matched,
                                priorities=self.priorities, idle_since=self.idle_since,

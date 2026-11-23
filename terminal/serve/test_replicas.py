@@ -1653,6 +1653,55 @@ class ReplicaVramResize(unittest.TestCase):
         self.assertEqual(self.children[0].reserves, [])
         self.assertEqual(self.children[1].reserves, [2400])
 
+    def test_standby_parks_and_keeps_replica_out_of_routing_until_cleared(self):
+        for pull in (False, True):
+            with self.subTest(pull=pull):
+                self._start(pull=pull)
+                parked_calls = []
+                self.children[1].park = lambda timeout=120.0: (parked_calls.append(1), {"status": "published", "tokens": 100, "bytes": 1024, "ms": 1.0})[1]
+                # Seed live conversation match on replica 1 so router would normally prefer replica 1
+                self.engine.router.note(1, [10, 20, 30, 40])
+
+                # Putting every replica into standby is rejected
+                code, _ = self._req("POST", "/v1/vram", {"reserve_mib": 3500, "standby": True})
+                self.assertEqual(code, 400)
+                code, _ = self._req("POST", "/v1/vram", {"reserve_mib": 3500, "replica": 1, "standby": "yes"})
+                self.assertEqual(code, 400)
+
+                # Put replica 1 into standby + shrink
+                code, body = self._req("POST", "/v1/vram", {"reserve_mib": 3500, "replica": 1, "standby": True})
+                self.assertEqual(code, 200, body)
+                self.assertTrue(body["standby"])
+                self.assertEqual(parked_calls, [1])
+                _, st = self._req("GET", "/v1/status")
+                self.assertFalse(st["vram"]["replicas"][0]["standby"])
+                self.assertTrue(st["vram"]["replicas"][1]["standby"])
+
+                # Even with matching prompt on replica 1, routing must choose replica 0
+                for _ in range(3):
+                    g = self.engine.generate([10, 20, 30, 40], 16, {}, threading.Event())
+                    list(g)
+                    g.close()
+                self.assertEqual(self.engine.routed[1], 0)
+                self.assertEqual(self.engine.routed[0], 3)
+
+                # Clear standby on replica 1
+                code, body = self._req("POST", "/v1/vram", {"reserve_mib": 0, "replica": 1, "standby": False})
+                self.assertEqual(code, 200, body)
+                self.assertFalse(body["standby"])
+                self.assertEqual(self.children[1].reserves[-1], 0)
+
+                # Putting replica 1 back into standby and clearing via global reserve_mib=0
+                code, _ = self._req("POST", "/v1/vram", {"reserve_mib": 3500, "replica": 1, "standby": True})
+                self.assertEqual(code, 200)
+                code, body = self._req("POST", "/v1/vram", {"reserve_mib": 0})
+                self.assertEqual(code, 200, body)
+                self.assertFalse(body["replicas"][1]["standby"])
+                _, st = self._req("GET", "/v1/status")
+                self.assertFalse(st["vram"]["replicas"][1]["standby"])
+                self.tearDown()
+                self.httpd = None
+
 
 if __name__ == "__main__":
     unittest.main()
