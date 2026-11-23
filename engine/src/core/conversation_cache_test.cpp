@@ -869,5 +869,41 @@ int main() {
             check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
         }
     }
+    // Zero-copy ConversationBuffer::from_view semantics (PR 1.2)
+    {
+        auto storage = std::make_shared<std::vector<uint8_t>>(1024);
+        for (size_t i = 0; i < storage->size(); ++i) (*storage)[i] = uint8_t((i * 7 + 3) & 0xff);
+        std::weak_ptr<const std::vector<uint8_t>> weak = storage;
+        ConversationBuffer view = ConversationBuffer::from_view(storage, storage->data(), storage->size());
+        storage.reset();
+        check(!weak.expired(), "view retains shared backing owner");
+        check(view.is_view() && view.size() == 1024 && view.bytes() == 1024, "view metadata matches payload size");
+
+        // const visit() stays zero-copy and reads exact bytes
+        std::vector<uint8_t> readback(1024);
+        check(view.read(readback.data(), 0, readback.size()), "view readback succeeds");
+        check(view.is_view() && !weak.expired(), "const read does not materialize view");
+
+        // Compare view vs segmented buffer and view vs view
+        ConversationBuffer seg;
+        seg.resize(1024);
+        check(seg.visit(0, 1024, [&](uint8_t* p, size_t n, size_t at) {
+            std::memcpy(p, readback.data() + at, n);
+            return true;
+        }), "segmented fill succeeds");
+        check(!seg.is_view() && view == seg && seg == view, "view equals identically populated segmented buffer");
+        ConversationBuffer view_copy = view;
+        check(view_copy.is_view() && view == view_copy, "copy of view preserves zero-copy sharing");
+
+        // Mutating non-const visit materializes and drops owner once all views materialize/reset
+        check(view.visit(10, 4, [](uint8_t* p, size_t n, size_t) {
+            std::memset(p, 0xaa, n);
+            return true;
+        }), "non-const visit succeeds on view");
+        check(!view.is_view() && !(view == seg), "non-const visit materializes buffer");
+        check(view_copy.is_view() && view_copy == seg, "unrelated copy keeps original view data");
+        view_copy.resize(0);
+        check(!view_copy.is_view() && view_copy.empty() && weak.expired(), "resize(0) releases view owner cleanly");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

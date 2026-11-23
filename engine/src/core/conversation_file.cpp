@@ -29,6 +29,7 @@
 #include <process.h>
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -47,6 +48,7 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeader = 64, kTrailer = 16;
+constexpr uint64_t kFlagTrustedNoHash = uint64_t{1} << 1;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -695,12 +697,14 @@ struct Out {
     std::string read_error;
 };
 
-void put_kv_header(Out& o, int format, int64_t cells, int64_t heads, int64_t head_dim, int64_t page_size,
+template<class Writer>
+void put_kv_header(Writer& o, int format, int64_t cells, int64_t heads, int64_t head_dim, int64_t page_size,
                    int64_t pooled_rows, int64_t idx_dim) {
     for (int64_t v : {int64_t(format), cells, heads, head_dim, page_size, pooled_rows, idx_dim}) o.i64(v);
 }
 
-void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
+template<class Writer>
+void put_checkpoint(Writer& o, const ConversationCheckpoint& c) {
     o.vec(c.ids);
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
@@ -708,7 +712,8 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+template<class Writer>
+void put_payload(Writer& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
@@ -731,6 +736,7 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
 struct In {
+    static constexpr bool is_dry = false;
     FileSource* f;
     SessionHasher hash;
     uint64_t left;
@@ -757,6 +763,13 @@ struct In {
         if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
         return true;
     }
+    bool imgs(std::vector<ConversationImageKey>& out, uint64_t limit) {
+        uint64_t n = 0;
+        if (!count(n, 16, limit)) return false;
+        out.resize((size_t) n);
+        for (auto& k : out) if (!i64(k.start) || !u64(k.hash)) return false;
+        return true;
+    }
     template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
         uint64_t n = 0;
         if (!count(n, sizeof(T), limit)) return false;
@@ -773,18 +786,17 @@ struct In {
     }
 };
 
-bool get_checkpoint(In& in, ConversationCheckpoint& c) {
+template<class Reader>
+bool get_checkpoint(Reader& in, ConversationCheckpoint& c) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
-    uint64_t n = 0;
-    if (!in.count(n, 16, in.limits.max_tokens)) return false;
-    c.imgs.resize((size_t) n);
-    for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+    if (!in.imgs(c.imgs, in.limits.max_tokens)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+template<class Reader>
+bool get_payload(Reader& in, SavedConversation& s) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -800,19 +812,39 @@ bool get_payload(In& in, SavedConversation& s) {
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
-    s.checkpoints.resize((size_t) n);
-    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    if constexpr (Reader::is_dry) {
+        for (uint64_t i = 0; i < n; ++i) {
+            ConversationCheckpoint tmp;
+            if (!get_checkpoint(in, tmp)) return false;
+        }
+    } else {
+        s.checkpoints.resize((size_t) n);
+        for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    }
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
-    s.kv.resize((size_t) n);
-    for (auto& k : s.kv) {
-        in.kv_layer = (size_t) (&k - s.kv.data());
-        int64_t format = 0;
-        if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
-            !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
-        if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
-        k.format = (int) format;
-        if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
-            !in.buffer(k.pooled, 4)) return false;
+    if constexpr (Reader::is_dry) {
+        for (uint64_t i = 0; i < n; ++i) {
+            in.kv_layer = (size_t) i;
+            ConversationKv tmp;
+            int64_t format = 0;
+            if (!in.i64(format) || !in.i64(tmp.cells) || !in.i64(tmp.heads) || !in.i64(tmp.head_dim) ||
+                !in.i64(tmp.page_size) || !in.i64(tmp.pooled_rows) || !in.i64(tmp.idx_dim)) return false;
+            if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+            if (!in.buffer(tmp.k, 0) || !in.buffer(tmp.v, 1) || !in.buffer(tmp.k_scale, 2) ||
+                !in.buffer(tmp.v_scale, 3) || !in.buffer(tmp.pooled, 4)) return false;
+        }
+    } else {
+        s.kv.resize((size_t) n);
+        for (auto& k : s.kv) {
+            in.kv_layer = (size_t) (&k - s.kv.data());
+            int64_t format = 0;
+            if (!in.i64(format) || !in.i64(k.cells) || !in.i64(k.heads) || !in.i64(k.head_dim) ||
+                !in.i64(k.page_size) || !in.i64(k.pooled_rows) || !in.i64(k.idx_dim)) return false;
+            if (format < INT32_MIN || format > INT32_MAX) return in.fail("invalid K/V format");
+            k.format = (int) format;
+            if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
+                !in.buffer(k.pooled, 4)) return false;
+        }
     }
     return true;
 }
@@ -823,9 +855,9 @@ bool has_stage_parts(const SavedConversation& s) {
     return false;
 }
 
-// header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
+// header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 flags:u64 reserved:u64
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint64_t flags = 0) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
     const uint32_t version = kVersion, size = kHeader;
@@ -834,8 +866,38 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &flags, 8);
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
+}
+
+bool validate_header(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, const SessionReadLimits& limits,
+                     uint64_t& payload, uint64_t& flags, std::string& error) {
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, r0 = 0, r1 = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
+    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (hsize != kHeader || r1 != 0 || (r0 & ~kFlagTrustedNoHash) != 0) {
+        error = "session file: invalid header fields";
+        return false;
+    }
+    if ((r0 & kFlagTrustedNoHash) != 0 && !limits.trusted_memfd) {
+        error = "session file: untrusted file skips payload checksum";
+        return false;
+    }
+    if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
+    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+    if (payload > size || size - kHeader - kTrailer != payload) {
+        error = "session file: size " + std::to_string(size) + " does not match the header (" +
+                std::to_string(kHeader + payload + kTrailer) + ")";
+        return false;
+    }
+    flags = r0;
+    return true;
 }
 } // namespace
 
@@ -1204,6 +1266,11 @@ bool session_save_checkpoints(const std::vector<ConversationCheckpoint>& chain, 
     return true;
 }
 
+bool session_parent_fast_mmap_enabled() {
+    const char* v = std::getenv("STRATA_PARENT_FAST_MMAP");
+    return v == nullptr || std::strcmp(v, "0") != 0;
+}
+
 int64_t session_phase_limit_s(uint64_t bytes) {
     return std::min<int64_t>(3600, 60 + (int64_t) std::min<uint64_t>(bytes >> 22, 3600));
 }
@@ -1238,22 +1305,9 @@ bool read_body(RawFile& raw, uint64_t size, const SessionFileIdentity& id, Saved
     f.expected = size;
     uint8_t h[kHeader];
     if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
-    uint32_t version = 0, hsize = 0;
-    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
-    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
-    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
-    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
-    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
-    if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
-    if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
-    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
-    if (payload > size || size - kHeader - kTrailer != payload) {
-        error = "session file: size " + std::to_string(size) + " does not match the header (" +
-                std::to_string(kHeader + payload + kTrailer) + ")";
-        return false;
-    }
+    uint64_t payload = 0, flags = 0;
+    if (!validate_header(h, size, id, limits, payload, flags, error)) return false;
+    const bool skip_hash = (flags & kFlagTrustedNoHash) != 0 && limits.trusted_memfd;
     if (limits.admit) {
         std::string why;
         if (!limits.admit(session_read_peak_bytes(size), why)) {
@@ -1270,7 +1324,7 @@ bool read_body(RawFile& raw, uint64_t size, const SessionFileIdentity& id, Saved
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
     uint64_t ph = 0;
     std::memcpy(&ph, t, 8);
-    if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
+    if (!skip_hash && ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     image = std::move(parsed);
     bytes = (size_t) size;
@@ -1322,6 +1376,303 @@ bool session_file_measure(const SavedConversation& meta, const std::vector<Sessi
 
 #ifndef _WIN32
 namespace {
+struct MemCopyChunk {
+    const uint8_t* src = nullptr;
+    uint8_t* dst = nullptr;
+    size_t bytes = 0;
+};
+
+struct DevicePartCopy {
+    const SessionKvSource* src = nullptr;
+    size_t part = 0;
+    uint8_t* dst = nullptr;
+    size_t bytes = 0;
+};
+
+struct MemOut {
+    uint8_t* cur = nullptr;
+    uint8_t* end = nullptr;
+    bool ok = true;
+    std::vector<MemCopyChunk> host_chunks;
+    std::vector<DevicePartCopy> device_parts;
+
+    void raw(const void* p, size_t c) {
+        if (!ok || c == 0) return;
+        if ((size_t) (end - cur) < c) { ok = false; return; }
+        std::memcpy(cur, p, c);
+        cur += c;
+    }
+    void u64(uint64_t v) { raw(&v, 8); }
+    void i64(int64_t v) { raw(&v, 8); }
+    template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+    void enqueue_host(const uint8_t* src, uint8_t* dst, size_t n) {
+        constexpr size_t kChunk = 4u << 20;
+        for (size_t off = 0; off < n; off += kChunk) {
+            host_chunks.push_back({src + off, dst + off, std::min(kChunk, n - off)});
+        }
+    }
+    void buffer(const ConversationBuffer& b) {
+        const size_t n = b.size();
+        u64(n);
+        if (!ok || n == 0) return;
+        if ((size_t) (end - cur) < n) { ok = false; return; }
+        b.visit(0, n, [&](const uint8_t* p, size_t c, size_t) {
+            enqueue_host(p, cur, c);
+            cur += c;
+            return true;
+        });
+    }
+    void source(const SessionKvSource& s, size_t part) {
+        const size_t n = s.sizes[part];
+        u64(n);
+        if (!ok || n == 0) return;
+        if ((size_t) (end - cur) < n) { ok = false; return; }
+        if (s.host_ptrs[part] != nullptr) {
+            enqueue_host(s.host_ptrs[part], cur, n);
+        } else {
+            device_parts.push_back({&s, part, cur, n});
+        }
+        cur += n;
+    }
+};
+
+template<bool Dry>
+struct MemIn {
+    static constexpr bool is_dry = Dry;
+    const uint8_t* cur = nullptr;
+    const uint8_t* end = nullptr;
+    const std::shared_ptr<const void>* owner = nullptr;
+    std::string& error;
+    const SessionReadLimits& limits;
+    size_t kv_layer = 0;
+    uint64_t kv_payload_bytes = 0;
+
+    uint64_t left() const { return (uint64_t) (end - cur); }
+    bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
+    bool skip(uint64_t c) {
+        if (c > left()) return fail("payload ends early");
+        cur += (size_t) c;
+        return true;
+    }
+    bool raw(void* p, size_t c) {
+        if (c > left()) return fail("payload ends early");
+        if (c && p) std::memcpy(p, cur, c);
+        cur += c;
+        return true;
+    }
+    bool u64(uint64_t& v) { return raw(&v, 8); }
+    bool i64(int64_t& v) { return raw(&v, 8); }
+    bool count(uint64_t& n, size_t elem, uint64_t limit = UINT64_MAX) {
+        if (!u64(n)) return false;
+        if (elem && n > left() / elem) return fail("element count exceeds the payload");
+        if (n > limit) return fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
+                                   std::to_string(limit));
+        if (n > (uint64_t) std::numeric_limits<size_t>::max() / (elem ? elem : 1)) return fail("element count too large");
+        return true;
+    }
+    bool imgs(std::vector<ConversationImageKey>& out, uint64_t limit) {
+        uint64_t n = 0;
+        if (!count(n, 16, limit)) return false;
+        if constexpr (Dry) {
+            return skip(n * 16);
+        } else {
+            out.resize((size_t) n);
+            for (auto& k : out) if (!i64(k.start) || !u64(k.hash)) return false;
+            return true;
+        }
+    }
+    template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
+        uint64_t n = 0;
+        if (!count(n, sizeof(T), limit)) return false;
+        if constexpr (Dry) {
+            return skip(n * sizeof(T));
+        } else {
+            v.resize((size_t) n);
+            if (n) std::memcpy(v.data(), cur, (size_t) n * sizeof(T));
+            cur += (size_t) n * sizeof(T);
+            return true;
+        }
+    }
+    bool buffer(ConversationBuffer& b, size_t part) {
+        uint64_t n = 0;
+        const uint64_t limit = kv_layer < limits.max_kv_bytes.size() ? limits.max_kv_bytes[kv_layer][part] : UINT64_MAX;
+        if (!count(n, 1, limit)) return false;
+        if (n > left()) return fail("payload ends early");
+        if constexpr (Dry) {
+            kv_payload_bytes += n;
+        } else {
+            b = n == 0 ? ConversationBuffer{} : ConversationBuffer::from_view(*owner, cur, (size_t) n);
+        }
+        cur += (size_t) n;
+        return true;
+    }
+};
+
+struct MmapWriteGuard {
+    void* addr = nullptr;
+    size_t len = 0;
+    void reset() noexcept {
+        if (addr != nullptr && len > 0) ::munmap(addr, len);
+        addr = nullptr;
+        len = 0;
+    }
+    ~MmapWriteGuard() { reset(); }
+};
+
+struct MmapReadOwner {
+    void* addr = nullptr;
+    size_t len = 0;
+    ~MmapReadOwner() {
+        if (addr != nullptr && len > 0) ::munmap(addr, len);
+    }
+};
+
+bool write_fd_mmap(int fd, uint64_t cur_size, uint64_t total, uint64_t payload, const SavedConversation& image,
+                   const std::vector<SessionKvSource>* sources, const SessionFileIdentity& id, size_t& bytes,
+                   std::string& error, const SessionWriteOptions& opt, SessionStatus& st) {
+    const int fl = ::fcntl(fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) == O_RDONLY) {
+        st.error = SessionError::io;
+        error = "session file: writing the descriptor failed: descriptor is read-only";
+        return false;
+    }
+    if (cur_size != total && ::ftruncate(fd, (off_t) total) != 0) {
+        st.error = errno_kind(errno);
+        error = std::string("session file: cutting the descriptor to its size: ") + std::strerror(errno);
+        return false;
+    }
+    void* mapped = ::mmap(nullptr, (size_t) total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        st.error = errno_kind(errno);
+        error = std::string("session file: mapping descriptor for write: ") + std::strerror(errno);
+        return false;
+    }
+    // Guarantee munmap before return so parent_parking.py F_ADD_SEALS (F_SEAL_WRITE) never hits EBUSY.
+    MmapWriteGuard guard{mapped, (size_t) total};
+    uint8_t* const base = static_cast<uint8_t*>(mapped);
+    if (opt.progress) opt.progress(0, total);
+    header_bytes(base, id, payload, kFlagTrustedNoHash);
+
+    MemOut out;
+    out.cur = base + kHeader;
+    out.end = base + kHeader + payload;
+    put_payload(out, image, sources);
+    if (!out.ok || out.cur != out.end) {
+        st.error = SessionError::io;
+        error = "session file: internal size mismatch in mmap write";
+        return false;
+    }
+    const uint64_t ph = 0;
+    std::memcpy(base + kHeader + payload, &ph, 8);
+    std::memcpy(base + kHeader + payload + 8, kEnd, 8);
+
+    if (!out.host_chunks.empty()) {
+        if (opt.parallel_for && out.host_chunks.size() > 1) {
+            opt.parallel_for(out.host_chunks.size(), [&](size_t idx) {
+                const auto& c = out.host_chunks[idx];
+                std::memcpy(c.dst, c.src, c.bytes);
+            });
+        } else {
+            for (const auto& c : out.host_chunks) std::memcpy(c.dst, c.src, c.bytes);
+        }
+    }
+    for (const auto& dp : out.device_parts) {
+        if (!dp.src->read || !dp.src->read(dp.part, 0, dp.dst, dp.bytes)) {
+            st.error = SessionError::io;
+            const std::string why = dp.src->error ? dp.src->error() : std::string();
+            error = "session file: writing the descriptor failed: K/V source read" +
+                    (why.empty() ? std::string() : ": " + why);
+            return false;
+        }
+    }
+    guard.reset();
+    if (opt.progress) opt.progress(total, total);
+    st.error = SessionError::none;
+    bytes = (size_t) total;
+    return true;
+}
+
+bool read_fd_mmap(int fd, uint64_t size, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                  std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    const int fl = ::fcntl(fd, F_GETFL);
+    if (fl < 0 || (fl & O_ACCMODE) == O_WRONLY) {
+        st.error = SessionError::io;
+        error = "session file: descriptor is not readable";
+        return false;
+    }
+    if (size < kHeader + kTrailer) {
+        error = "session file: size " + std::to_string(size) + " is below the minimum";
+        return false;
+    }
+    const uint64_t max_size = session_read_max_file_bytes(limits);
+    if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
+                (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
+        return false;
+    }
+    void* mapped = ::mmap(nullptr, (size_t) size, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped == MAP_FAILED) {
+        st.error = errno_kind(errno);
+        error = std::string("session file: mapping descriptor for read: ") + std::strerror(errno);
+        return false;
+    }
+    auto owner_ptr = std::make_shared<MmapReadOwner>();
+    owner_ptr->addr = mapped;
+    owner_ptr->len = (size_t) size;
+    std::shared_ptr<const void> owner_view = owner_ptr;
+
+    const uint8_t* const base = static_cast<const uint8_t*>(mapped);
+    uint64_t payload = 0, flags = 0;
+    if (!validate_header(base, size, id, limits, payload, flags, error)) return false;
+
+    const uint8_t* const trailer = base + kHeader + payload;
+    if (std::memcmp(trailer + 8, kEnd, 8) != 0) {
+        error = "session file: bad end marker";
+        return false;
+    }
+    const bool skip_hash = (flags & kFlagTrustedNoHash) != 0;
+    if (!skip_hash) {
+        uint64_t ph = 0;
+        std::memcpy(&ph, trailer, 8);
+        if (ph != session_hash64(base + kHeader, (size_t) payload, 0)) {
+            error = "session file: payload checksum mismatch";
+            return false;
+        }
+    }
+
+    // Dry-validate metadata + bounds before admission so admit charges only metadata+checkpoints, not mapped KV.
+    MemIn<true> dry{base + kHeader, trailer, nullptr, error, limits};
+    SavedConversation dummy;
+    if (!get_payload(dry, dummy)) return false;
+    if (dry.left() != 0) {
+        error = "session file: payload has " + std::to_string(dry.left()) + " unparsed bytes";
+        return false;
+    }
+    if (limits.admit) {
+        const uint64_t meta_bytes = payload >= dry.kv_payload_bytes ? payload - dry.kv_payload_bytes : payload;
+        const uint64_t peak = sat_add(meta_bytes, uint64_t(1) << 20);
+        std::string why;
+        if (!limits.admit(peak, why)) {
+            st.error = SessionError::memory;
+            error = "session file: " + why;
+            return false;
+        }
+    }
+
+    SavedConversation parsed;
+    MemIn<false> in{base + kHeader, trailer, &owner_view, error, limits};
+    if (!get_payload(in, parsed)) return false;
+    if (in.left() != 0) {
+        error = "session file: payload has " + std::to_string(in.left()) + " unparsed bytes";
+        return false;
+    }
+    image = std::move(parsed);
+    bytes = (size_t) size;
+    if (limits.progress) limits.progress(size, size);
+    st.error = SessionError::none;
+    return true;
+}
+
 // The descriptor variants: the same measure and the same stream as the path API, over a descriptor the caller owns.
 // No temporary file, no rename, no folder flush, no O_DIRECT, and the descriptor is never closed here.
 bool write_fd_impl(int fd, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
@@ -1346,6 +1697,9 @@ bool write_fd_impl(int fd, const SavedConversation& image, const std::vector<Ses
         st.error = raw.refused() ? SessionError::invalid : raw.kind();
         error = "session file: the descriptor: " + raw.error();
         return false;
+    }
+    if (opt.trusted_memfd && session_parent_fast_mmap_enabled() && !opt.fault) {
+        return write_fd_mmap(fd, size, total, payload, image, sources, id, bytes, error, opt, st);
     }
     st.error = SessionError::io;
     std::string why;
@@ -1376,6 +1730,9 @@ bool read_fd_impl(int fd, const SessionFileIdentity& id, SavedConversation& imag
         st.error = raw.refused() ? SessionError::invalid : raw.kind();
         error = "session file: the descriptor: " + raw.error();
         return false;
+    }
+    if (limits.trusted_memfd && session_parent_fast_mmap_enabled()) {
+        return read_fd_mmap(fd, size, id, image, bytes, error, limits, st);
     }
     return read_body(raw, size, id, image, bytes, error, limits, st);
 }

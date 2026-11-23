@@ -37,6 +37,11 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 // restore followed by a rewind to a checkpoint.
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool include_index, std::string& error);
+// Restores all KV layers of a snapshot (full or prefix `upto`), parallelizing host-backed copies via `parallel_for`.
+bool conversation_kv_restore_batch(const std::vector<ConversationKv>& images,
+                                   const std::vector<const QsaState*>& targets, const ModelGeometry& g,
+                                   int64_t captured, int64_t upto, bool has_draft,
+                                   const SessionParallelFor& parallel_for, std::string& error);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
@@ -158,13 +163,14 @@ enum class ConversationRestore { restored, invalid, transfer_failed };
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
-                                                   std::string& error);
+                                                   std::string& error, const SessionParallelFor& parallel_for = {});
 // The K/V of the image's first `upto` tokens (main layers and the draft layer), not its running state: the caller
 // mounts a checkpoint taken at `upto`.  For a checkpoint of a parked conversation that a new conversation starts
 // with, while the parked one stays where it is (ConversationCache::borrows).  Same failure contract as above.
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
-                                                          const QsaState& draft, std::string& error);
+                                                          const QsaState& draft, std::string& error,
+                                                          const SessionParallelFor& parallel_for = {});
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
@@ -187,9 +193,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const SessionParallelFor& parallel_for = {});
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
-                                                          const QsaState* draft, std::string& error);
+                                                          const QsaState* draft, std::string& error,
+                                                          const SessionParallelFor& parallel_for = {});
 
 } // namespace strata::core

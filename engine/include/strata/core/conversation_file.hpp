@@ -136,6 +136,10 @@ using SessionProgress = std::function<void(uint64_t done, uint64_t total)>;
 // concerns.  The engine turns this into an explicit, bounded allowance (session_phase_limit_s) for its watchdog and
 // for the server; when the allowance runs out the step is stuck.
 using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
+// Parallel task dispatcher for large host-memory session transfers (`fn(task_idx)` for `task_idx in [0, count)`).
+using SessionParallelFor = std::function<void(size_t count, const std::function<void(size_t)>& fn)>;
+// STRATA_PARENT_FAST_MMAP=0 disables zero-copy/mmap fast path on ParentParkingStore memfds and falls back to streaming.
+bool session_parent_fast_mmap_enabled();
 // The longest a non-streaming step over `bytes` may take before both sides call it stuck: 60 s plus one second per
 // 4 MiB (a slow disk or network folder at 4 MiB/s), at most an hour.  1.2 GB: 345 s.
 int64_t session_phase_limit_s(uint64_t bytes);
@@ -146,9 +150,11 @@ struct SessionWriteOptions {
     // write starts.  Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
+    bool trusted_memfd = false;     // sealed parent-parking memfd: fast mmap write (skip full payload hash)
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
+    SessionParallelFor parallel_for;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
 };
@@ -171,6 +177,8 @@ struct SessionKvSource {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     std::array<size_t, 5> sizes{};
+    // Optional directly CPU-readable host pointers per part (0..4) for fast parallel mmap copy without GPU D2H bounce.
+    std::array<const uint8_t*, 5> host_ptrs{};
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
@@ -222,6 +230,8 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    bool trusted_memfd = false;     // sealed parent-parking memfd: allow zero-copy mmap read & kFlagTrustedNoHash
+    SessionParallelFor parallel_for;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
