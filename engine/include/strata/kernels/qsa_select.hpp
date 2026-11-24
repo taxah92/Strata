@@ -59,6 +59,14 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
+/// Volta (sm_70) mma.m8n8k4 QSA indexer scorer control (PR 3.1; STRATA_QSA_SCORE_V70):
+/// mode < 0: auto/env (default 1 on sm_70 CUDA); 0: off;
+/// 1: default (decode 1-pass hi FP16 MMA with pow2 scale + prefill 3-pass hi+lo FP16 MMA);
+/// 2: 1-pass hi FP16 MMA for both decode and prefill;
+/// 3: 3-pass hi+lo FP16 MMA for both decode and prefill.
+void qsa_set_score_v70(int mode);
+int qsa_score_v70_mode();
+
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream,
