@@ -990,6 +990,7 @@ bool gdn_keyhead_ok() {
 // 512 1.67x, 2048+ 1.81x)
 constexpr int64_t kGdnChunkedMin = 128;
 constexpr int64_t kGdnTcMin = 128;        // STRATA_GDN_TC: the two launches cost ~20 us; below this the kh kernel wins
+constexpr int64_t kGdnTcV70Min = 512;     // Volta auto crossover (T=128/256 slower than pipe due to 2-SB y-scratch & prep overhead; T>=512 wins)
 constexpr int GCH = 32;            // tokens per chunk (the prep's solve is a lane per token)
 constexpr int GSB = 2048;          // tokens per super-block: the prep's scratch is GSB / GCH chunks of T, P and gamma
 constexpr int GDV = 16;            // value columns per scan block
@@ -1424,23 +1425,92 @@ cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const fl
     }
     return cudaSuccess;
 }
+// Volta (sm_70) register-resident chunked GDN via mma.m8n8k4 (PR 4.2).
+// When `nm != nullptr` (fused output norm) or `skip_y_out` (KVA state-only), carves scratch out of `y` (0 B extra VRAM).
+cudaError_t gdn_rec_tc_v70(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                           cudaStream_t s, int np = 3, const GdnTcNorm* nm = nullptr, bool skip_y_out = false) {
+    if (T <= 0) return cudaSuccess;
+    int dev = 0, major = 0, minor = 0, sms = 0, smem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return cudaErrorNotSupported;
+    }
+    const GdnProbe* pr = gdn_probe_get();
+    const bool any_sms = pr != nullptr && pr->any_sms;
+    if (strata::cc_major_of(major) != 7 || minor != 0 || (!any_sms && sms < HV) ||
+        (size_t) strata::smem_optin_of(smem) < kTcScanSmemV70)
+        return cudaErrorNotSupported;
+
+    int64_t gsb = GSB;
+    if (pr && pr->gsb >= GCH && pr->gsb < GSB) gsb = (pr->gsb / GCH) * GCH;
+    GtcScratch sc{};
+    const bool can_borrow_y = (nm != nullptr || skip_y_out) && y != nullptr;
+    if (!can_borrow_y || !gdn_tc_v70_scratch_from_y(y, T, gsb, sc, gsb)) {
+        sc = gdn_tc_scratch();
+        if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
+    }
+    {   // opt-in dynamic smem (> 48 KB) once per device
+        static bool attrs_v70[64] = {};
+        if (dev >= 0 && dev < 64 && !attrs_v70[dev]) {
+            const cudaError_t e0 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            const cudaError_t e1 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            const cudaError_t e2 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<false, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            const cudaError_t e3 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<true,  3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            const cudaError_t e4 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<true,  2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            const cudaError_t e5 = cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<true,  1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70);
+            if (e0 != cudaSuccess || e1 != cudaSuccess || e2 != cudaSuccess ||
+                e3 != cudaSuccess || e4 != cudaSuccess || e5 != cudaSuccess) {
+                cudaGetLastError();
+                return cudaErrorNotSupported;
+            }
+            attrs_v70[dev] = true;
+        }
+    }
+    float* const oc_dst = (nm != nullptr || skip_y_out) ? nullptr : y;
+    for (int64_t t0 = 0; t0 < T; t0 += gsb) {
+        const int nch = (int) ((std::min<int64_t>(gsb, T - t0) + GCH - 1) / GCH);
+        if (np == 2) gdn_tc_prep_v70_kernel<2><<<dim3((unsigned) nch, HK), 256, kTcPrepSmemV70, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        else if (np == 1) gdn_tc_prep_v70_kernel<1><<<dim3((unsigned) nch, HK), 256, kTcPrepSmemV70, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        else gdn_tc_prep_v70_kernel<3><<<dim3((unsigned) nch, HK), 256, kTcPrepSmemV70, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+        if (nm != nullptr) {
+#define STRATA_TCV70N(NPV) gdn_tc_scan_v70_kernel<true, NPV><<<HV, GTC_CW * 32, kTcScanSmemV70, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, nullptr, t0, nch, T, nm->z, nm->gamma, nm->eps, nm->y16, nm->ld16)
+            if (np == 2) STRATA_TCV70N(2);
+            else if (np == 1) STRATA_TCV70N(1);
+            else STRATA_TCV70N(3);
+#undef STRATA_TCV70N
+        } else {
+#define STRATA_TCV70(NPV) gdn_tc_scan_v70_kernel<false, NPV><<<HV, GTC_CW * 32, kTcScanSmemV70, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, oc_dst, t0, nch, T)
+            if (np == 2) STRATA_TCV70(2);
+            else if (np == 1) STRATA_TCV70(1);
+            else STRATA_TCV70(3);
+#undef STRATA_TCV70
+        }
+    }
+    return cudaSuccess;
+}
 // Why gdn_rec_chunked (tc false) or gdn_rec_tc (tc true) launched nothing, in words: the same tests asked again.  Only
 // the gdn_probe.hpp `reason` uses it (a test says what it timed); the dispatch itself never calls it.
 const char* gdn_chunk_why(bool tc, cudaError_t e, bool any_sms, bool split = false) {
     static thread_local char buf[200];
     if (e == cudaErrorMemoryAllocation) return "scratch allocation failed";
-    int dev = 0, major = 0, sms = 0, smem = 0;
+    int dev = 0, major = 0, minor = 0, sms = 0, smem = 0;
     if (cudaGetDevice(&dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
         cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
         cudaGetLastError();
         return "device attributes unavailable";
     }
     const int cc = strata::cc_major_of(major);
-    const size_t need = tc ? (split ? kTcScanSmemSplit : (size_t) kTcScanSmem<false>) : kChunkScanSmem;
+    const bool is_v70 = tc && cc == 7 && minor == 0;
+    const size_t need = is_v70 ? kTcScanSmemV70 : (tc ? (split ? kTcScanSmemSplit : (size_t) kTcScanSmem<false>) : kChunkScanSmem);
     const int sm_need = tc ? HV : HK * (S / GDV);
-    if (cc < 8) std::snprintf(buf, sizeof buf, "compute capability %d < 8 (cp.async)", cc);
+    if (!is_v70 && cc < 8) std::snprintf(buf, sizeof buf, "compute capability %d < 8 (cp.async)", cc);
     else if (!tc && !any_sms && sms < sm_need)
         std::snprintf(buf, sizeof buf, "%d SMs < %d: the scan would run in several waves (STRATA_GDN_CHUNKED=2 bypasses)", sms, sm_need);
     else if (tc && !any_sms && sms < sm_need) std::snprintf(buf, sizeof buf, "%d SMs < %d (one block per value head)", sms, sm_need);
@@ -3047,7 +3117,20 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     if (serial || T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
-        static const int fused_mode = [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return v ? std::atoi(v) : 0; }();
+        static const int fused_mode = [] {
+            const char* v = std::getenv("STRATA_GDN_CONVL2");
+            if (v != nullptr && *v != '\0') return std::atoi(v);
+#if !defined(__HIPCC__)
+            int dev = 0, major = 0, minor = 0;
+            if (cudaGetDevice(&dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                strata::cc_major_of(major) == 7 && minor == 0)
+                return 2;   // Volta: 1-pass warp-fused conv + SiLU + L2 norm (1.55x faster, kill-switch STRATA_GDN_CONVL2=0)
+            cudaGetLastError();
+#endif
+            return 0;
+        }();
         const bool fused = fused_mode != 0;
         if (fused_mode >= 2) {
             gdn_conv_w_kernel<<<dim3(C / 128, (unsigned) ((T + 4 * CONVW_TOK - 1) / (4 * CONVW_TOK))), 128, 0,
@@ -3195,18 +3278,32 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
         bool normed = false;   // the scan wrote y16 itself
         const char* why = "";
         const cudaStream_t cs = (cudaStream_t) stream;
+        // STRATA_GDN_TC_V70 (Volta sm_70, default ON = 3; =2 state f16x3 / out f16x1; =1 f16x1; =0 kill-switch)
+        static const int tc_v70_env = [] {
+            const char* v = std::getenv("STRATA_GDN_TC_V70");
+            if (v == nullptr || *v == '\0') return 3;
+            const int x = std::atoi(v);
+            if (x == 0) return 0;
+            return (x == 1 || x == 2) ? x : 3;
+        }();
         // the split tensor-core scan can write y16 itself (STRATA_GDN_TC_FUSE=0 off): then the norm kernel below is skipped
         static const bool tc_fuse = [] { const char* v = std::getenv("STRATA_GDN_TC_FUSE"); return v == nullptr || std::atoi(v) != 0; }();
         const GdnTcNorm tcn = {z, gamma, eps, y16, ld16};
         const int tcl = gdn_tc_tiles();
         const GdnTcNorm* tcnp = with_out && tc_fuse && tcl == 1 ? &tcn : nullptr;   // 2 tiles a head: the norm kernel (a head's norm spans both)
+        const GdnTcNorm* tcnp_v70 = with_out && tc_fuse ? &tcn : nullptr;
         if (force != kGdnAuto) {
             if (force == kGdnTc || force == kGdnTcSplit || force == kGdnTcS2 || force == kGdnTcS1) {
                 const bool sp = force != kGdnTc;
                 const int np = force == kGdnTcS2 ? 2 : force == kGdnTcS1 ? 1 : 3;
                 cudaError_t e = T >= kGdnTcMin ? gdn_rec_tc(state, h, gate, beta, y, T, cs, sp, np, sp ? tcnp : nullptr, sp ? tcl : 1) : cudaErrorInvalidValue;
                 if (e == cudaSuccess) { sel = force; normed = sp && tcnp != nullptr; }
-                else why = T < kGdnTcMin ? "T below the tc minimum (128)" : gdn_chunk_why(true, e, false, sp);
+                else if (T >= kGdnTcMin && e == cudaErrorNotSupported) {
+                    const GdnTcNorm* vnm = sp ? tcnp_v70 : nullptr;
+                    cudaError_t ev = gdn_rec_tc_v70(state, h, gate, beta, y, T, cs, np, vnm, !with_out);
+                    if (ev == cudaSuccess) { sel = force; normed = vnm != nullptr; }
+                    else why = gdn_chunk_why(true, ev, false, sp);
+                } else why = T < kGdnTcMin ? "T below the tc minimum (128)" : gdn_chunk_why(true, e, false, sp);
             } else if (force == kGdnChunked) {
                 cudaError_t e = T >= kGdnChunkedMin ? gdn_rec_chunked(state, h, gate, beta, y, T, cs) : cudaErrorInvalidValue;
                 if (e == cudaSuccess) sel = kGdnChunked;
@@ -3234,6 +3331,15 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                     static const int tc_np = [] { const char* v = std::getenv("STRATA_GDN_TC_NP"); const int x = v ? std::atoi(v) : 3; return x == 1 || x == 2 ? x : 3; }();
                     e = gdn_rec_tc(state, h, gate, beta, y, T, cs, true, tc_np, tcnp, tcl);
                     if (e == cudaSuccess) { sel = kGdnTcSplit; why = ""; normed = tcnp != nullptr; }
+                }
+            }
+            if (sel == kGdnNone && tc_v70_env != 0 && T >= kGdnTcV70Min) {
+                const cudaError_t ev = gdn_rec_tc_v70(state, h, gate, beta, y, T, cs, tc_v70_env, tcnp_v70, !with_out);
+                if (ev == cudaSuccess) {
+                    sel = tc_v70_env == 2 ? kGdnTcS2 : (tc_v70_env == 1 ? kGdnTcS1 : kGdnTcSplit);
+                    wanted = sel;
+                    why = "";
+                    normed = tcnp_v70 != nullptr;
                 }
             }
             if (sel == kGdnNone && chunked && T >= kGdnChunkedMin) {
