@@ -11,6 +11,9 @@
 #include "strata/core/amd_community.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cuda_fp16.h>
+#endif
 
 #include <atomic>
 #include <cfloat>
@@ -1934,8 +1937,661 @@ __global__ void __launch_bounds__(MT_T) block_topk_multi_emit_kernel(const float
       }
     }
 }
+
+// ---- Volta (sm_70) shared-key mma.m8n8k4 QSA indexer scorer (PR 3.1) ---------------------------------------------
+// Computes sum_{h=0..3} relu(q_h . k_b) using Volta's mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32.
+// Each warp's 4 quad-pairs independently multiply 8 key blocks x 8 queries x 4 K-dims (32 distinct key blocks x 8
+// queries per warp per instruction).  Warps 0..3 within a group own heads h = 0..3 and share the same 32 key blocks
+// in XOR-swizzled shared memory (0 bank conflicts on both global->smem write and MMA read).
+// Per-vector power-of-two scaling (exact IEEE-754 exponent shift, 0 rounding error) maps max|x| into [1, 2) so FP16
+// never overflows/underflows across arbitrary FP32 exponents; 3-pass hi+lo (hi*hi + 2^-11*(hi*lo + lo*hi)) retains
+// ~22 bits of mantissa (~1e-6 vs FP64, passing qsa_select_bench's 1e-5 gate), while HI_ONLY=true runs 1-pass hi*hi.
+// Decode kernel: fixed grid (CUDA-Graph-safe, no host step reads), CTA-uniform early exit, CTA 0 computes the exact
+// FP32 tail block (b == n_bid on `dead` + 1e9f) with zero extra kernel launch.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+#define STRATA_SEL_V70 1
+#else
+#define STRATA_SEL_V70 0
+#endif
+
+__device__ __forceinline__ void sel_v70_mma884(float (&c)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if STRATA_SEL_V70
+    asm volatile(
+        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+        : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    (void) c; (void) a0; (void) a1; (void) b0; (void) b1;
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ void sel_v70_pow2_scale(float m, float& scale, float& inv_scale) {
+    if (!(m > 0.0f) || !isfinite(m)) {
+        scale = 1.0f;
+        inv_scale = 1.0f;
+        return;
+    }
+    uint32_t exp_bits = __float_as_uint(m) & 0x7f800000u;
+    if (exp_bits < (8u << 23)) exp_bits = (8u << 23);
+    else if (exp_bits > (246u << 23)) exp_bits = (246u << 23);
+    inv_scale = __uint_as_float(exp_bits);
+    scale = __uint_as_float(0x7f000000u - exp_bits);
+}
+
+__device__ __forceinline__ void sel_v70_pack4_hi(float4 v, float sc, uint32_t& hi0, uint32_t& hi1) {
+    const __half2 h01 = __floats2half2_rn(v.x * sc, v.y * sc);
+    const __half2 h23 = __floats2half2_rn(v.z * sc, v.w * sc);
+    hi0 = *reinterpret_cast<const uint32_t*>(&h01);
+    hi1 = *reinterpret_cast<const uint32_t*>(&h23);
+}
+
+__device__ __forceinline__ void sel_v70_pack4_hilo(float4 v, float sc, uint32_t& hi0, uint32_t& hi1,
+                                                   uint32_t& lo0, uint32_t& lo1) {
+    const float x0 = v.x * sc, x1 = v.y * sc, x2 = v.z * sc, x3 = v.w * sc;
+    const __half2 h01 = __floats2half2_rn(x0, x1);
+    const __half2 h23 = __floats2half2_rn(x2, x3);
+    hi0 = *reinterpret_cast<const uint32_t*>(&h01);
+    hi1 = *reinterpret_cast<const uint32_t*>(&h23);
+    const float2 f01 = __half22float2(h01);
+    const float2 f23 = __half22float2(h23);
+    const __half2 l01 = __floats2half2_rn((x0 - f01.x) * 2048.0f, (x1 - f01.y) * 2048.0f);
+    const __half2 l23 = __floats2half2_rn((x2 - f23.x) * 2048.0f, (x3 - f23.y) * 2048.0f);
+    lo0 = *reinterpret_cast<const uint32_t*>(&l01);
+    lo1 = *reinterpret_cast<const uint32_t*>(&l23);
+}
+
+template <int NTILES, int NGROUPS, bool HI_ONLY>
+struct SelV70Smem {
+    static constexpr int QT = NTILES * 8;
+    static constexpr int NB = NGROUPS * 32;
+    uint2 q_hi[IDX_HEADS][32][QT];
+    uint2 q_lo[HI_ONLY ? 1 : IDX_HEADS][HI_ONLY ? 1 : 32][HI_ONLY ? 1 : QT];
+    union {
+        struct {
+            uint2 k_hi[NGROUPS][32][32];
+            uint2 k_lo[HI_ONLY ? 1 : NGROUPS][HI_ONLY ? 1 : 32][HI_ONLY ? 1 : 32];
+        } k;
+        float out[NGROUPS][IDX_HEADS][QT][33];
+    } u;
+    float inv_q[IDX_HEADS][QT];
+    float inv_k[NB];
+    int64_t nbid[QT];
+    int64_t nkv[QT];
+};
+
+template <int NTILES, int NGROUPS, bool HI_ONLY>
+__device__ __forceinline__ void sel_v70_stage_queries(SelV70Smem<NTILES, NGROUPS, HI_ONLY>& S,
+                                                      const float* __restrict__ q_idx, int64_t q0, int nq_tile,
+                                                      int warp, int lane) {
+    constexpr int QT = NTILES * 8;
+    constexpr int NWARPS = NGROUPS * IDX_HEADS;
+    for (int row = warp; row < QT * IDX_HEADS; row += NWARPS) {
+        const int qi = row >> 2;
+        const int h = row & 3;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (qi < nq_tile)
+            v = __ldg(reinterpret_cast<const float4*>(q_idx + (q0 + qi) * IDX_HEADS * IDX_DIM + h * IDX_DIM) + lane);
+        float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float sc, inv_sc;
+        sel_v70_pow2_scale(m, sc, inv_sc);
+        if (lane == 0) S.inv_q[h][qi] = inv_sc;
+        uint32_t hi0, hi1;
+        if constexpr (HI_ONLY) {
+            sel_v70_pack4_hi(v, sc, hi0, hi1);
+            S.q_hi[h][lane][qi] = make_uint2(hi0, hi1);
+        } else {
+            uint32_t lo0, lo1;
+            sel_v70_pack4_hilo(v, sc, hi0, hi1, lo0, lo1);
+            S.q_hi[h][lane][qi] = make_uint2(hi0, hi1);
+            S.q_lo[h][lane][qi] = make_uint2(lo0, lo1);
+        }
+    }
+}
+
+template <int NTILES, int NGROUPS, bool HI_ONLY>
+__device__ __forceinline__ void sel_v70_score_tile(SelV70Smem<NTILES, NGROUPS, HI_ONLY>& S,
+                                                   const float* __restrict__ pooled, int64_t b0, int64_t top,
+                                                   int64_t q0, int nq_tile, int64_t max_blocks,
+                                                   float* __restrict__ out, int warp, int lane) {
+    const int grp = warp >> 2;
+    const int h = warp & 3;
+    const int qp = (lane >> 2) & 3;
+    const int g_lane = lane & 3;
+    const int h_lane = lane >> 4;
+    const int j = g_lane + 4 * h_lane;
+    const int my_blk = qp * 8 + j;
+
+    // Coalesced batch-4 loads of 8 key blocks per warp (32 blocks per group) for 4x HBM2 MLP.
+#pragma unroll
+    for (int g4 = 0; g4 < 8; g4 += 4) {
+        float4 vs[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_blk = h * 8 + g4 + i;
+            const int64_t b = b0 + (int64_t) grp * 32 + r_blk;
+            vs[i] = (b < top) ? __ldg(reinterpret_cast<const float4*>(pooled + b * IDX_DIM) + lane)
+                              : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_blk = h * 8 + g4 + i;
+            float m = fmaxf(fmaxf(fabsf(vs[i].x), fabsf(vs[i].y)), fmaxf(fabsf(vs[i].z), fabsf(vs[i].w)));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            float sc, inv_sc;
+            sel_v70_pow2_scale(m, sc, inv_sc);
+            if (lane == 0) S.inv_k[grp * 32 + r_blk] = inv_sc;
+            uint32_t hi0, hi1;
+            if constexpr (HI_ONLY) {
+                sel_v70_pack4_hi(vs[i], sc, hi0, hi1);
+                S.u.k.k_hi[grp][lane][r_blk ^ lane] = make_uint2(hi0, hi1);
+            } else {
+                uint32_t lo0, lo1;
+                sel_v70_pack4_hilo(vs[i], sc, hi0, hi1, lo0, lo1);
+                S.u.k.k_hi[grp][lane][r_blk ^ lane] = make_uint2(hi0, hi1);
+                S.u.k.k_lo[grp][lane][r_blk ^ lane] = make_uint2(lo0, lo1);
+            }
+        }
+    }
+    __syncthreads();
+
+    float c[NTILES][8];
+#pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) c[nt][i] = 0.0f;
+
+    if constexpr (!HI_ONLY) {
+        float c_lo[NTILES][8];
+#pragma unroll
+        for (int nt = 0; nt < NTILES; ++nt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c_lo[nt][i] = 0.0f;
+
+        // Single K-loop: read k_hi and q_hi ONCE instead of twice (33% fewer LDS.64).
+#pragma unroll 4
+        for (int k4 = 0; k4 < 32; ++k4) {
+            const uint2 ka_hi = S.u.k.k_hi[grp][k4][my_blk ^ k4];
+            const uint2 ka_lo = S.u.k.k_lo[grp][k4][my_blk ^ k4];
+#pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const uint2 qb_hi = S.q_hi[h][k4][nt * 8 + j];
+                const uint2 qb_lo = S.q_lo[h][k4][nt * 8 + j];
+                sel_v70_mma884(c[nt], ka_hi.x, ka_hi.y, qb_hi.x, qb_hi.y);
+                sel_v70_mma884(c_lo[nt], ka_hi.x, ka_hi.y, qb_lo.x, qb_lo.y);
+                sel_v70_mma884(c_lo[nt], ka_lo.x, ka_lo.y, qb_hi.x, qb_hi.y);
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < NTILES; ++nt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[nt][i] = fmaf(c_lo[nt][i], 1.0f / 2048.0f, c[nt][i]);
+    } else {
+#pragma unroll 4
+        for (int k4 = 0; k4 < 32; ++k4) {
+            const uint2 ka_hi = S.u.k.k_hi[grp][k4][my_blk ^ k4];
+#pragma unroll
+            for (int nt = 0; nt < NTILES; ++nt) {
+                const uint2 qb_hi = S.q_hi[h][k4][nt * 8 + j];
+                sel_v70_mma884(c[nt], ka_hi.x, ka_hi.y, qb_hi.x, qb_hi.y);
+            }
+        }
+    }
+
+    // Union reuse barrier: all warps finished reading S.u.k before writing S.u.out.
+    __syncthreads();
+
+    const float inv_k_even = S.inv_k[grp * 32 + qp * 8 + (g_lane & 1) + 4 * h_lane];
+    const float inv_k_odd = S.inv_k[grp * 32 + qp * 8 + (g_lane & 1) + 2 + 4 * h_lane];
+#pragma unroll
+    for (int nt = 0; nt < NTILES; ++nt) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int r_blk = qp * 8 + (g_lane & 1) + (i & 2) + 4 * h_lane;
+            const int qi = nt * 8 + (i & 4) + (g_lane & 2) + (i & 1);
+            const float inv_k = (i & 2) ? inv_k_odd : inv_k_even;
+            const float val = (c[nt][i] * inv_k) * S.inv_q[h][qi];
+            S.u.out[grp][h][qi][r_blk] = val > 0.0f ? val : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    // Exact head-order sum (0 + r0 + r1 + r2 + r3) and coalesced 128-byte stores.
+    const int64_t b = b0 + (int64_t) grp * 32 + lane;
+    for (int qi = h; qi < nq_tile; qi += IDX_HEADS) {
+        if (b < S.nbid[qi] && b < max_blocks) {
+            float score = 0.0f;
+            score += S.u.out[grp][0][qi][lane];
+            score += S.u.out[grp][1][qi][lane];
+            score += S.u.out[grp][2][qi][lane];
+            score += S.u.out[grp][3][qi][lane];
+            out[(q0 + qi) * max_blocks + b] = score;
+        }
+    }
+}
+
+template <int NTILES, int NGROUPS, bool HI_ONLY>
+__global__ void __launch_bounds__(NGROUPS * 128)
+block_scores_v70_decode_kernel(const float* __restrict__ pooled, const float* __restrict__ dead,
+                               const float* __restrict__ q_idx, const int32_t* __restrict__ steps, int nq,
+                               int64_t max_blocks, float* __restrict__ out) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& S = *reinterpret_cast<SelV70Smem<NTILES, NGROUPS, HI_ONLY>*>(smem_raw);
+    constexpr int NB = NGROUPS * 32;
+    constexpr int NWARPS = NGROUPS * IDX_HEADS;
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+
+    if (t < nq) {
+        S.nkv[t] = steps[t * kStepCount + kStepNKv];
+        S.nbid[t] = steps[t * kStepCount + kStepNBid];
+    }
+    __syncthreads();
+
+    int64_t top = 0;
+    for (int q = 0; q < nq; ++q) top = S.nbid[q] > top ? S.nbid[q] : top;
+    if (top > max_blocks) top = max_blocks;
+
+    // CTA-uniform early exit: CTA 0 always runs so it writes every query's exact FP32 tail block on `dead`.
+    if (blockIdx.x != 0 && (int64_t) blockIdx.x * NB >= top) return;
+
+    if (blockIdx.x == 0) {
+        const float4 kd = __ldg(reinterpret_cast<const float4*>(dead) + lane);
+        for (int qi = warp; qi < nq; qi += NWARPS) {
+            const int64_t nb = S.nbid[qi];
+            if (nb >= max_blocks) continue;
+            const float* q = q_idx + qi * IDX_HEADS * IDX_DIM + lane * 4;
+            float score = 0.0f;
+#pragma unroll
+            for (int hh = 0; hh < IDX_HEADS; ++hh) {
+                const float4 q4 = *reinterpret_cast<const float4*>(q + hh * IDX_DIM);
+                float d = kd.x * q4.x + kd.y * q4.y + kd.z * q4.z + kd.w * q4.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+                score += d > 0.0f ? d : 0.0f;
+            }
+            if (lane == 0) {
+                if (S.nkv[qi] % R != 0) score += 1e9f;
+                out[qi * max_blocks + nb] = score;
+            }
+        }
+        if (top <= 0) return;
+    }
+
+    sel_v70_stage_queries<NTILES, NGROUPS, HI_ONLY>(S, q_idx, 0, nq, warp, lane);
+    const int64_t stride = (int64_t) gridDim.x * NB;
+    bool first = true;
+    for (int64_t b0 = (int64_t) blockIdx.x * NB; b0 < top; b0 += stride) {
+        if (!first) __syncthreads();
+        first = false;
+        sel_v70_score_tile<NTILES, NGROUPS, HI_ONLY>(S, pooled, b0, top, 0, nq, max_blocks, out, warp, lane);
+    }
+}
+
+// Prefill CTA: 256 threads = 2 query groups (16 queries each => QT=32 total!) x 4 heads, sharing ONE 32-block key
+// tile in smem.  Halves pooled HBM2 reads and float->half key conversions vs QT=16, and each warp only loads 4 blocks
+// back-to-back in registers before packing.  V70_TC_ITER=8 => 256 key blocks per CTA per Q staging.
+constexpr int V70_TC_QT = 32;
+constexpr int V70_TC_NB = 32;
+constexpr int V70_TC_ITER = 8;
+
+template <bool HI_ONLY>
+struct SelV70PrefillSmem {
+    uint2 q_hi[IDX_HEADS][32][V70_TC_QT];
+    uint2 q_lo[HI_ONLY ? 1 : IDX_HEADS][HI_ONLY ? 1 : 32][HI_ONLY ? 1 : V70_TC_QT];
+    union {
+        struct {
+            uint2 k_hi[32][32];
+            uint2 k_lo[HI_ONLY ? 1 : 32][HI_ONLY ? 1 : 32];
+        } k;
+        // For HI_ONLY, flush 8 queries per qgrp at a time so total smem stays <= 42 KB (2 CTA/SM = 16 warps/SM!).
+        float out[2][IDX_HEADS][HI_ONLY ? 8 : 16][33];
+    } u;
+    float inv_q[IDX_HEADS][V70_TC_QT];
+    float inv_k[V70_TC_NB];
+    int64_t nbid[V70_TC_QT];
+};
+
+template <bool HI_ONLY>
+__global__ void __launch_bounds__(256)
+block_scores_v70_tc_kernel(const float* __restrict__ pooled, const float* __restrict__ q_idx,
+                           const int32_t* __restrict__ steps, int64_t nq, int64_t max_blocks, int64_t reach,
+                           float* __restrict__ out) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& S = *reinterpret_cast<SelV70PrefillSmem<HI_ONLY>*>(smem_raw);
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int qgrp = warp >> 2;
+    const int h = warp & 3;
+    const int qp = (lane >> 2) & 3;
+    const int g_lane = lane & 3;
+    const int h_lane = lane >> 4;
+    const int j = g_lane + 4 * h_lane;
+    const int my_blk = qp * 8 + j;
+
+    const int64_t q0 = (int64_t) blockIdx.y * V70_TC_QT;
+    const int nq_tile = (q0 + V70_TC_QT <= nq) ? V70_TC_QT : (int) (nq - q0);
+
+    if (t < nq_tile) S.nbid[t] = steps[(q0 + t) * kStepCount + kStepNBid];
+    __syncthreads();
+
+    int64_t hi_nbid = 0;
+    for (int i = 0; i < nq_tile; ++i) hi_nbid = S.nbid[i] > hi_nbid ? S.nbid[i] : hi_nbid;
+    if (hi_nbid > reach) hi_nbid = reach;
+    if (hi_nbid > max_blocks) hi_nbid = max_blocks;
+
+    const int64_t b0_base = (int64_t) blockIdx.x * (V70_TC_NB * V70_TC_ITER);
+    if (b0_base >= hi_nbid) return;
+
+    // Stage 32 queries x 4 heads = 128 rows across 8 warps (16 rows/warp) once per CTA.
+    for (int row = warp; row < V70_TC_QT * IDX_HEADS; row += 8) {
+        const int qi = row >> 2;
+        const int hh = row & 3;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (qi < nq_tile)
+            v = __ldg(reinterpret_cast<const float4*>(q_idx + (q0 + qi) * IDX_HEADS * IDX_DIM + hh * IDX_DIM) + lane);
+        float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float sc, inv_sc;
+        sel_v70_pow2_scale(m, sc, inv_sc);
+        if (lane == 0) S.inv_q[hh][qi] = inv_sc;
+        uint32_t hi0, hi1;
+        if constexpr (HI_ONLY) {
+            sel_v70_pack4_hi(v, sc, hi0, hi1);
+            S.q_hi[hh][lane][qi] = make_uint2(hi0, hi1);
+        } else {
+            uint32_t lo0, lo1;
+            sel_v70_pack4_hilo(v, sc, hi0, hi1, lo0, lo1);
+            S.q_hi[hh][lane][qi] = make_uint2(hi0, hi1);
+            S.q_lo[hh][lane][qi] = make_uint2(lo0, lo1);
+        }
+    }
+
+    for (int it = 0; it < V70_TC_ITER; ++it) {
+        const int64_t b0 = b0_base + (int64_t) it * V70_TC_NB;
+        if (b0 >= hi_nbid) break;
+        if (it > 0) __syncthreads();
+
+        // 8 warps load 32 key blocks => ONLY 4 blocks per warp, all 4 float4 loads issued back-to-back!
+        float4 vs[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_blk = warp * 4 + i;
+            const int64_t b = b0 + r_blk;
+            vs[i] = (b < hi_nbid) ? __ldg(reinterpret_cast<const float4*>(pooled + b * IDX_DIM) + lane)
+                                  : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int r_blk = warp * 4 + i;
+            float m = fmaxf(fmaxf(fabsf(vs[i].x), fabsf(vs[i].y)), fmaxf(fabsf(vs[i].z), fabsf(vs[i].w)));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            float sc, inv_sc;
+            sel_v70_pow2_scale(m, sc, inv_sc);
+            if (lane == 0) S.inv_k[r_blk] = inv_sc;
+            uint32_t hi0, hi1;
+            if constexpr (HI_ONLY) {
+                sel_v70_pack4_hi(vs[i], sc, hi0, hi1);
+                S.u.k.k_hi[lane][r_blk ^ lane] = make_uint2(hi0, hi1);
+            } else {
+                uint32_t lo0, lo1;
+                sel_v70_pack4_hilo(vs[i], sc, hi0, hi1, lo0, lo1);
+                S.u.k.k_hi[lane][r_blk ^ lane] = make_uint2(hi0, hi1);
+                S.u.k.k_lo[lane][r_blk ^ lane] = make_uint2(lo0, lo1);
+            }
+        }
+        __syncthreads();
+
+        float c[2][8];
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) c[nt][i] = 0.0f;
+
+        if constexpr (!HI_ONLY) {
+            float c_lo[2][8];
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) c_lo[nt][i] = 0.0f;
+#pragma unroll 4
+            for (int k4 = 0; k4 < 32; ++k4) {
+                const uint2 ka_hi = S.u.k.k_hi[k4][my_blk ^ k4];
+                const uint2 ka_lo = S.u.k.k_lo[k4][my_blk ^ k4];
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int q_col = qgrp * 16 + nt * 8 + j;
+                    const uint2 qb_hi = S.q_hi[h][k4][q_col];
+                    const uint2 qb_lo = S.q_lo[h][k4][q_col];
+                    sel_v70_mma884(c[nt], ka_hi.x, ka_hi.y, qb_hi.x, qb_hi.y);
+                    sel_v70_mma884(c_lo[nt], ka_hi.x, ka_hi.y, qb_lo.x, qb_lo.y);
+                    sel_v70_mma884(c_lo[nt], ka_lo.x, ka_lo.y, qb_hi.x, qb_hi.y);
+                }
+            }
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) c[nt][i] = fmaf(c_lo[nt][i], 1.0f / 2048.0f, c[nt][i]);
+        } else {
+#pragma unroll 4
+            for (int k4 = 0; k4 < 32; ++k4) {
+                const uint2 ka_hi = S.u.k.k_hi[k4][my_blk ^ k4];
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const uint2 qb_hi = S.q_hi[h][k4][qgrp * 16 + nt * 8 + j];
+                    sel_v70_mma884(c[nt], ka_hi.x, ka_hi.y, qb_hi.x, qb_hi.y);
+                }
+            }
+        }
+
+        __syncthreads();
+
+        const float inv_k_even = S.inv_k[qp * 8 + (g_lane & 1) + 4 * h_lane];
+        const float inv_k_odd = S.inv_k[qp * 8 + (g_lane & 1) + 2 + 4 * h_lane];
+        const int64_t b = b0 + lane;
+
+        if constexpr (HI_ONLY) {
+            // Flush one 8-query N-tile at a time to keep smem <= 42 KB (2 CTA/SM).
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                if (nt > 0) __syncthreads();
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int r_blk = qp * 8 + (g_lane & 1) + (i & 2) + 4 * h_lane;
+                    const int col8 = (i & 4) + (g_lane & 2) + (i & 1);
+                    const int qi = qgrp * 16 + nt * 8 + col8;
+                    const float inv_k = (i & 2) ? inv_k_odd : inv_k_even;
+                    const float val = (c[nt][i] * inv_k) * S.inv_q[h][qi];
+                    S.u.out[qgrp][h][col8][r_blk] = val > 0.0f ? val : 0.0f;
+                }
+                __syncthreads();
+                for (int col8 = h; col8 < 8; col8 += IDX_HEADS) {
+                    const int qi = qgrp * 16 + nt * 8 + col8;
+                    if (qi < nq_tile && b < S.nbid[qi] && b < max_blocks) {
+                        float score = 0.0f;
+                        score += S.u.out[qgrp][0][col8][lane];
+                        score += S.u.out[qgrp][1][col8][lane];
+                        score += S.u.out[qgrp][2][col8][lane];
+                        score += S.u.out[qgrp][3][col8][lane];
+                        out[(q0 + qi) * max_blocks + b] = score;
+                    }
+                }
+            }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int r_blk = qp * 8 + (g_lane & 1) + (i & 2) + 4 * h_lane;
+                    const int col16 = nt * 8 + (i & 4) + (g_lane & 2) + (i & 1);
+                    const int qi = qgrp * 16 + col16;
+                    const float inv_k = (i & 2) ? inv_k_odd : inv_k_even;
+                    const float val = (c[nt][i] * inv_k) * S.inv_q[h][qi];
+                    S.u.out[qgrp][h][col16][r_blk] = val > 0.0f ? val : 0.0f;
+                }
+            }
+            __syncthreads();
+            for (int col16 = h; col16 < 16; col16 += IDX_HEADS) {
+                const int qi = qgrp * 16 + col16;
+                if (qi < nq_tile && b < S.nbid[qi] && b < max_blocks) {
+                    float score = 0.0f;
+                    score += S.u.out[qgrp][0][col16][lane];
+                    score += S.u.out[qgrp][1][col16][lane];
+                    score += S.u.out[qgrp][2][col16][lane];
+                    score += S.u.out[qgrp][3][col16][lane];
+                    out[(q0 + qi) * max_blocks + b] = score;
+                }
+            }
+        }
+    }
+}
+
+static std::atomic<int> g_score_v70_hook{-1};
+
+static bool scores_v70_device() {
+    static int ok[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        ok[dev] = (strata::cc_major_of(major) == 7 && minor == 0) ? 1 : 2;
+    }
+    return ok[dev] == 1;
+}
+
+static int scores_v70_mode_for(bool is_decode) {
+    if (!scores_v70_device()) return 0;
+    const int hook = g_score_v70_hook.load(std::memory_order_relaxed);
+    if (hook >= 0) return hook;
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_QSA_SCORE_V70");
+        if (!v || !v[0]) return -1;
+        const int x = std::atoi(v);
+        if (x <= 0) return 0;
+        if (x == 2) return 2;
+        if (x == 3) return 3;
+        return 1;
+    }();
+    if (env >= 0) return env;
+    static const bool warp_off = [] {
+        const char* w = std::getenv("STRATA_QSA_WARP");
+        return w && (!std::strcmp(w, "1") || !std::strcmp(w, "select"));
+    }();
+    if (warp_off) return 0;
+    if (is_decode) {
+        static const bool dx_forced = [] {
+            const char* v = std::getenv("STRATA_SCORES_DX");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (dx_forced) return 0;
+    }
+    return 1;
+}
+
+template <typename Fn>
+static bool sel_v70_ensure_smem(Fn kernel, int bytes, bool (&attr)[64], int dev) {
+    if (bytes <= 48 * 1024 || attr[dev]) return true;
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    attr[dev] = true;
+    return true;
+}
+
+static bool qsa_block_scores_v70_decode(const float* pooled, const float* dead, const float* q_idx,
+                                        const int32_t* steps, int64_t nq, int64_t max_blocks, float* scores,
+                                        cudaStream_t stream, bool hi_only) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    if (nq <= 8) {
+        if (hi_only) {
+            constexpr int GRID = 400;
+            constexpr int bytes = (int) sizeof(SelV70Smem<1, 1, true>);
+            block_scores_v70_decode_kernel<1, 1, true><<<GRID, 128, bytes, stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
+        } else {
+            constexpr int GRID = 320;
+            constexpr int bytes = (int) sizeof(SelV70Smem<1, 1, false>);
+            block_scores_v70_decode_kernel<1, 1, false><<<GRID, 128, bytes, stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
+        }
+    } else {
+        constexpr int GRID = 160;
+        if (hi_only) {
+            constexpr int bytes = (int) sizeof(SelV70Smem<2, 2, true>);
+            block_scores_v70_decode_kernel<2, 2, true><<<GRID, 256, bytes, stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
+        } else {
+            static bool attr[64] = {};
+            constexpr int bytes = (int) sizeof(SelV70Smem<2, 2, false>);
+            if (!sel_v70_ensure_smem(block_scores_v70_decode_kernel<2, 2, false>, bytes, attr, dev)) return false;
+            block_scores_v70_decode_kernel<2, 2, false><<<GRID, 256, bytes, stream>>>(
+                pooled, dead, q_idx, steps, (int) nq, max_blocks, scores);
+        }
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_block_scores (v70 decode): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
+
+static bool qsa_block_scores_v70_prefill(const float* pooled, const float* dead, const float* q_idx,
+                                         const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t reach,
+                                         float* scores, cudaStream_t stream, bool hi_only) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+    const int64_t per = (int64_t) V70_TC_NB * V70_TC_ITER;
+    const dim3 grid((unsigned) ((reach + per - 1) / per), (unsigned) ((nq + V70_TC_QT - 1) / V70_TC_QT));
+    if (grid.y > 65535) return false;
+    if (hi_only) {
+        constexpr int bytes = (int) sizeof(SelV70PrefillSmem<true>);
+        block_scores_v70_tc_kernel<true><<<grid, 256, bytes, stream>>>(
+            pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    } else {
+        static bool attr[64] = {};
+        constexpr int bytes = (int) sizeof(SelV70PrefillSmem<false>);
+        if (!sel_v70_ensure_smem(block_scores_v70_tc_kernel<false>, bytes, attr, dev)) return false;
+        block_scores_v70_tc_kernel<false><<<grid, 256, bytes, stream>>>(
+            pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    }
+    block_scores_tail_kernel<<<(unsigned) nq, 32, 0, stream>>>(dead, q_idx, steps, max_blocks, scores);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_block_scores_tc (v70): %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    return true;
+}
 #endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
 }  // namespace
+
+void qsa_set_score_v70(int mode) {
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    g_score_v70_hook.store(mode, std::memory_order_relaxed);
+#else
+    (void) mode;
+#endif
+}
+
+int qsa_score_v70_mode() {
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    return scores_v70_mode_for(true);
+#else
+    return 0;
+#endif
+}
 
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
                             const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
@@ -2096,9 +2752,23 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         std::exit(1);
     }
     // a block past a query's n_bid returns at once: the grid need only reach the batch's largest n_bid (C-1)
+    static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // On Volta (sm_70), block_scores_rows_kernel<2> is faster for nq==2 at 32K/131K when STRATA_QSA_ROWS=1;
+    // for nq >= 3 (or nq >= 2 without STRATA_QSA_ROWS), shared-key mma.m8n8k4 wins across all context lengths.
+    const int64_t v70_min_nq = rows_env ? 3 : 2;
+    if (scores_multi_on() && nq >= v70_min_nq && nq <= 12 && active_blocks <= 0) {
+        const int v70 = scores_v70_mode_for(true);
+        if (v70 > 0) {
+            const bool hi_only = (v70 != 3);   // mode 1 (default) & 2: 1-pass hi; mode 3: 3-pass hi+lo
+            if (qsa_block_scores_v70_decode(pooled, dead, q_idx, steps, nq, max_blocks, scores,
+                                            (cudaStream_t) stream, hi_only))
+                return;
+        }
+    }
+#endif
     if (scores_multi_on() && nq <= MQ && active_blocks <= 0) {   // no active count: decode (captured or not) and prefill's pooled16
         // QSAROWS: STRATA_QSA_ROWS=1 (exactly) takes block_scores_rows_kernel for calls of up to 4 queries - the same bits
-        static const bool rows_env = [] { const char* v = std::getenv("STRATA_QSA_ROWS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
         if (rows_env && qsa_block_scores_rows(pooled, dead, q_idx, steps, nq, max_blocks, s, scores, stream)) return;
         if (scores_halve_on()) {   // Turing: block_scores_halve_kernel, the same bits
             const cudaStream_t st = (cudaStream_t) stream;
@@ -2286,6 +2956,16 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
             cc_major[dev] = w && (!std::strcmp(w, "1") || !std::strcmp(w, "select")) ? 7 : strata::cc_major_of(major);
         }
         if (cc_major[dev] < 8) {
+#if defined(STRATA_EXPERIMENTAL_SM60)
+            const int v70 = scores_v70_mode_for(false);
+            if (v70 > 0) {
+                const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+                const bool hi_only = (v70 == 2);   // mode 1 (default) & 3: 3-pass hi+lo (FP64 gate); mode 2: 1-pass hi
+                if (qsa_block_scores_v70_prefill(pooled, dead, q_idx, steps, nq, max_blocks, reach, scores,
+                                                 (cudaStream_t) stream, hi_only))
+                    return true;
+            }
+#endif
             // no TF32 tensor cores: the FP32 tiled kernel, opt-in (STRATA_SELECT_SIMT=1): its sum order differs from the
             // warp kernel's, so the default stays the caller's warp kernel and the output bytes stay the same
             // STRATA_SELECT_SIMT=2: block_scores_simt2_kernel (the same bits as =1, larger tiles)
