@@ -170,6 +170,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # PR #600: the Volta (sm_70) prompt attention's latency pipeline against the FP32 kernel it replaces.  Only in the
   # experimental sm_60/sm_70 build, where prompt_attn_v70_kernel is compiled in.
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND STRATA_EXPERIMENTAL_SM60)
+    # PR 4.1: Volta (sm_70) grouped 8q/CTA QSA prefill attention parity + bench
+    add_executable(qsa_prompt_attn_v70_g8_parity src/kernels/qsa_prompt_attn_v70_g8_parity.cpp)
+    target_include_directories(qsa_prompt_attn_v70_g8_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_prompt_attn_v70_g8_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME qsa_prompt_attn_v70_g8_parity COMMAND qsa_prompt_attn_v70_g8_parity)
+    set_tests_properties(qsa_prompt_attn_v70_g8_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(qsa_prompt_attn_sm70_bench bench/qsa_prompt_attn_sm70_bench.cpp)
     target_include_directories(qsa_prompt_attn_sm70_bench PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_sm70_bench PRIVATE strata_kernels CUDA::cudart)
