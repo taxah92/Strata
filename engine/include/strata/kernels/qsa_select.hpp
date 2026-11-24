@@ -68,6 +68,15 @@ void qsa_set_score_v70(int mode);
 int qsa_score_v70_mode();
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
+///
+/// STRATA_TOPK_COMPACT (alias STRATA_QSA_TOPK_FP16; CUDA, default 1 on sm_70, 0 disables): past the register kernel's
+/// reach, a 2-pass monotone 12-bit half-rounded coarse histogram narrows each query to its cutoff bucket (<= 4,096
+/// candidate blocks) + strictly-above blocks (<= 514), refines the exact 32-bit order_key pivot in shared memory, and
+/// emits cell IDs in ascending order without rescanning scores; any NaN, concentrated, or oversized-bucket row is
+/// re-run by block_topk_wide_kernel<true> in the same call.  Mode 1 uses multi-CTA hist/gather for decode-sized calls
+/// (nq <= 16) and 1-CTA for larger batches; mode 2 forces 1-CTA.  Selected IDs are bitwise identical to qsa_block_topk_ref.
+void qsa_set_topk_compact(int mode);
+int qsa_topk_compact_mode();
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream,
                     int64_t active_blocks = -1);   ///< > 0: no query of the call has more than this many blocks (n_bid + 1;

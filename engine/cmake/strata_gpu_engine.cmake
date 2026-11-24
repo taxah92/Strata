@@ -186,6 +186,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # same ids, including the rows past 524,288 cells where its sampling stride doubles
     add_test(NAME qsa_topk_active_parity_sample COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity_sample PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_TOPK_SAMPLE=1")
+    # PR 3.2: compact 2-pass top-k (multi-CTA decode + 1-CTA prefill) on active-bound cases up to 1M cells
+    add_test(NAME qsa_topk_active_parity_compact COMMAND qsa_topk_active_parity)
+    set_tests_properties(qsa_topk_active_parity_compact PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_TOPK_COMPACT=1")
     # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
     # against one call per row, bitwise (synthetic, no model)
     add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
@@ -1193,6 +1196,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the register kernel from the smallest prompt batch (the line gfx1151 moves to 4096 blocks): same ids at every case
   add_test(NAME qsa_topk_parity_reg_always COMMAND qsa_topk_parity --selftest)
   set_tests_properties(qsa_topk_parity_reg_always PROPERTIES ENVIRONMENT "STRATA_TOPK_REG_MIN_BLOCKS=0")
+  if(NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+    # PR 3.2: 2-pass compact top-k (mode 1: multi-CTA decode + 1-CTA prefill; mode 2: 1-CTA only; mode 0: wide fallback)
+    add_test(NAME qsa_topk_parity_compact COMMAND qsa_topk_parity --selftest)
+    set_tests_properties(qsa_topk_parity_compact PROPERTIES ENVIRONMENT "STRATA_TOPK_COMPACT=1")
+    add_test(NAME qsa_topk_parity_compact_1cta COMMAND qsa_topk_parity --selftest)
+    set_tests_properties(qsa_topk_parity_compact_1cta PROPERTIES ENVIRONMENT "STRATA_TOPK_COMPACT=2")
+    add_test(NAME qsa_topk_parity_wide COMMAND qsa_topk_parity --selftest)
+    set_tests_properties(qsa_topk_parity_wide PROPERTIES ENVIRONMENT "STRATA_TOPK_COMPACT=0")
+  endif()
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
