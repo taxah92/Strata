@@ -44,6 +44,13 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+/// Sample from pre-filtered `(cand_ids, cand_logits)` shortlists produced by `vhead_bitplane_candidates`.
+/// Skips any token `t` where `cand_overflow[t] != 0` (leaving it for full-logits fallback).
+/// Returns true if launched cleanly; false if fallback to full `sample_tokens` is needed.
+bool sample_tokens_candidates(const int32_t* cand_ids, const float* cand_logits, const int32_t* cand_counts,
+                              const uint8_t* cand_overflow, int max_cand, int n_tokens, int n_vocab,
+                              const int* history, int history_len, const SamplerParams& p, int* out, void* stream);
+
 // The greedy pick (no penalties) on a thread-block cluster of 8 CTAs per row (sm_90+, CUDA; S19): the same token as
 // sample_tokens' one-block argmax, which takes it unless STRATA_ARGMAX_MULTI=0.  False (nothing launched) where it
 // cannot run: HIP, a card or a build below sm_90.  Device pointers; capturable.

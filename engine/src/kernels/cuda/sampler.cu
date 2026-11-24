@@ -632,6 +632,99 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
 }
 
+constexpr int kCandThreads = 256;
+constexpr int kCandPerThread = 16;   // supports max_cand <= 4096 in registers
+
+__global__ void __launch_bounds__(kCandThreads)
+sampler_candidates_kernel(const int32_t* __restrict__ cand_ids, const float* __restrict__ cand_logits,
+                          const int32_t* __restrict__ cand_counts, const uint8_t* __restrict__ cand_overflow,
+                          int max_cand, int n_vocab, const int* __restrict__ history, int history_len,
+                          const SamplerParams p, int* __restrict__ out) {
+    const int t = (int) blockIdx.x;
+    if (cand_overflow != nullptr && cand_overflow[t] != 0) return;
+    const int n_cand = min(cand_counts[t], max_cand);
+    const int tid = (int) threadIdx.x;
+    if (n_cand <= 0) {
+        if (tid == 0) out[t] = 0;
+        return;
+    }
+
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    __shared__ int sh_hist[256];
+    const bool use_sh_hist = (hrow != nullptr && hlen > 0 && hlen <= 256);
+    if (use_sh_hist) {
+        if (tid < hlen) sh_hist[tid] = hrow[tid];
+        __syncthreads();
+    }
+    const int* h_src = use_sh_hist ? sh_hist : hrow;
+    const bool use_pen = (h_src != nullptr && hlen > 0);
+
+    const int32_t* c_ids = cand_ids + (size_t) t * (size_t) max_cand;
+    const float* c_log = cand_logits + (size_t) t * (size_t) max_cand;
+
+    int cid[kCandPerThread];
+    float clog[kCandPerThread];
+    int n_loc = 0;
+    for (int c = tid; c < n_cand && n_loc < kCandPerThread; c += kCandThreads, ++n_loc) {
+        const int id = c_ids[c];
+        float v = c_log[c];
+        if (p.logit_bias) v += p.logit_bias[id];
+        if (use_pen) v = apply_penalties(v, history_count(h_src, hlen, id), p);
+        cid[n_loc] = id;
+        clog[n_loc] = v;
+    }
+
+    const int k = (p.greedy || p.temperature <= 0.0f) ? 1 : sampled_k(p.top_k, n_vocab);
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ float sv[8];
+    __shared__ int si[8];
+    const int warp = tid >> 5, lane = tid & 31;
+    float prev_v = __int_as_float(0x7f800000);
+    int prev_i = -1;
+
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int bi = n_vocab;
+        for (int j = 0; j < n_loc; ++j) {
+            const float s = clog[j];
+            const int id = cid[j];
+            if (s < prev_v || (s == prev_v && id > prev_i)) {
+                take_first(bv, bi, s, id);
+            }
+        }
+        warp_first(bv, bi);
+        if (lane == 0) { sv[warp] = bv; si[warp] = bi; }
+        __syncthreads();
+        if (warp == 0) {
+            float wv = lane < 8 ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < 8 ? si[lane] : n_vocab;
+            warp_first(wv, wi);
+            if (lane == 0) {
+                sel_ids[i] = (wi < n_vocab) ? wi : 0;
+                sel_logit[i] = wv;
+            }
+        }
+        __syncthreads();
+        prev_v = sel_logit[i];
+        prev_i = sel_ids[i];
+    }
+
+    if (warp != 0) return;
+    if (p.greedy || p.temperature <= 0.0f) {
+        if (lane == 0) out[t] = sel_ids[0];
+        return;
+    }
+    sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+}
+
 // ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
 // 248,320 logits k times.  Here a warp keeps the top_k of 1,024 logits held in registers, four warps make a block of
 // 4,096 logits that merges their lists, and a row is 61 such blocks over the whole GPU; one warp per row then
@@ -1316,6 +1409,26 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         std::exit(1);
     }
     if (stream == nullptr) cudaDeviceSynchronize();
+}
+
+bool sample_tokens_candidates(const int32_t* cand_ids, const float* cand_logits, const int32_t* cand_counts,
+                              const uint8_t* cand_overflow, int max_cand, int n_tokens, int n_vocab,
+                              const int* history, int history_len, const SamplerParams& p_in, int* out, void* stream) {
+    if (cand_ids == nullptr || cand_logits == nullptr || cand_counts == nullptr || out == nullptr ||
+        n_tokens <= 0 || n_vocab <= 0 || max_cand <= 0 || max_cand > kCandThreads * kCandPerThread)
+        return false;
+    SamplerParams p = p_in;
+    p.gumbel = p_in.gumbel || gumbel_env();
+    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
+    sampler_candidates_kernel<<<(unsigned) n_tokens, kCandThreads, 0, (cudaStream_t) stream>>>(
+        cand_ids, cand_logits, cand_counts, cand_overflow, max_cand, n_vocab, history, history_len, p, out);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
+    return true;
 }
 
 namespace {

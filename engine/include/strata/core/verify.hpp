@@ -684,6 +684,7 @@ private:
     cudaGraphExec_t exec_[2][strata::kernels::kVerifyLongT + 1] = {};
     cudaGraphExec_t exec_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     bool launched_[2][strata::kernels::kVerifyLongT + 1] = {}, launched_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    bool graph_head_bp_[2][strata::kernels::kVerifyLongT + 1] = {}, graph_head_bp_nr_[2][strata::kernels::kVerifyLongT + 1] = {};   ///< captured graph skipped argmax_rows via vhead_bitplane_argmax
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention

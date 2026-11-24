@@ -11,6 +11,7 @@
 
 #include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/megakernel.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -23,7 +24,15 @@ bool vhead_bitplane_enabled() { return false; }
 BitplaneHeadHandle* vhead_bitplane_create(int, const void*, int, int) { return nullptr; }
 void vhead_bitplane_destroy(BitplaneHeadHandle*) {}
 size_t vhead_bitplane_bytes(const BitplaneHeadHandle*) { return 0; }
-bool vhead_bitplane_argmax(BitplaneHeadHandle*, const void*, int, int32_t*, void*, uint32_t*, int) { return false; }
+bool vhead_bitplane_exact_logits(const BitplaneHeadHandle*) { return false; }
+bool vhead_bitplane_argmax(BitplaneHeadHandle*, const void*, int, int32_t*, void*, uint32_t*, int, int, float*) { return false; }
+bool vhead_bitplane_candidates(BitplaneHeadHandle*, const void*, int, int, float, bool, bool, void*,
+                               const int32_t**, const float**, const int32_t**, const uint8_t**,
+                               const uint8_t**, int*, int) { return false; }
+bool vhead_bitplane_logits(const BitplaneHeadHandle*, const void*, int, float*, void*) { return false; }
+bool vhead_bitplane_gather_raw(const BitplaneHeadHandle*, const int32_t*, int64_t, void*, void*) { return false; }
+bool sample_tokens_candidates(const int32_t*, const float*, const int32_t*, const uint8_t*, int, int, int,
+                              const int*, int, const SamplerParams&, int*, void*) { return false; }
 
 unsigned* mk_counters_alloc() { return nullptr; }
 int mk_gdn_grid(int) { return 0; }

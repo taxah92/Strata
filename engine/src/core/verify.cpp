@@ -2821,9 +2821,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
-        static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
+        static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr || std::getenv("STRATA_DBG_NAN") != nullptr;
         const bool use_bitplane = head_ != nullptr && head_->loaded() && head_->bitplane() != nullptr &&
-                                  T <= 16 && (head_->type() == 8 || T >= 4) && !logits_dump;
+                                  T <= 16 && (head_->type() == 8 || T >= 4 || head_->weights() == nullptr) && !logits_dump;
       for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
         const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
@@ -2904,9 +2904,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 uint32_t* const nf_dst = nan_guard_on() && m_nf_ != nullptr
                                              ? m_nf_ + (size_t) h0 * strata::kernels::kNonfiniteBlocks
                                              : nullptr;
+                const bool bp_exact_logits = strata::kernels::vhead_bitplane_exact_logits(head_->bitplane());
                 if (use_bitplane && strata::kernels::vhead_bitplane_argmax(head_->bitplane(), xq_, HT, m_out_ + h0, cs,
-                                                                           nf_dst, strata::kernels::kNonfiniteBlocks)) {
+                                                                           nf_dst, strata::kernels::kNonfiniteBlocks, h0,
+                                                                           bp_exact_logits ? hl : nullptr)) {
                     head_bitplane_used_ = true;
+                } else if (head_->weights() == nullptr && head_->bitplane() != nullptr) {
+                    strata::kernels::vhead_bitplane_logits(head_->bitplane(), xq_, HT, hl, cs);
                 } else if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
                     if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
@@ -3071,8 +3075,10 @@ bool Verifier::capture(int T, std::string& err) {
     prio_forks_.clear();
     prio_tails_.clear();
 #endif
+    head_bitplane_used_ = false;
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
+    if (ok) (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T] = head_bitplane_used_;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -3632,6 +3638,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // STRATA_SELECT_LONG: the select kernels this window's context pays off with (the same on every stage)
     sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
     if (!capture(T, err) || !capture_commit(err)) return false;
+    head_bitplane_used_ = (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T];
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
         const OnDevice on_next(next_->device_);
@@ -3960,44 +3967,105 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
-        ensure_head_logits(T);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
-        bool judged = false;
-        if (sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= kVerifyMaxT) {
-            if (d_spec_ == nullptr &&
-                cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
-                    cudaSuccess) {
-                (void) cudaGetLastError();
-                d_spec_ = nullptr;
+        const bool use_spec_prob = sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= kVerifyMaxT;
+        bool bp_sampled = false;
+        if (head_bitplane_used_ && head_ != nullptr && !strata::kernels::vhead_bitplane_exact_logits(head_->bitplane()) &&
+            !use_spec_prob && sp.logit_bias == nullptr &&
+            (hist_d_ == nullptr || (sp.penalty_last_n <= 128 && sp.penalty_repeat >= 1.0f &&
+                                    sp.penalty_freq >= 0.0f && sp.penalty_present >= 0.0f))) {
+            const int k_top = (!sampled || sp.greedy || sp.temperature <= 0.0f)
+                                  ? 1
+                                  : std::min<int>((sp.top_k > 0 && sp.top_k < 64) ? sp.top_k : 64, (int) n_vocab_);
+            int pen_bound = 0;
+            if (hist_d_ != nullptr && sp.penalty_last_n > 0) {
+                pen_bound = std::min(sp.penalty_last_n, hist_len_);
             }
-            if (d_spec_ != nullptr) {
-                const int nq = measure ? spec_nq_ : std::min(spec_nq_, T - 1);
-                int32_t* d_q = d_spec_ + kVerifyMaxT;
-                if ((T == 1 || cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
-                        cudaSuccess) &&
-                    (nq == 0 || cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
-                                               cudaMemcpyHostToDevice, cs_) == cudaSuccess))
-                    judged = measure
-                        ? sample_tokens_proposal(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
-                                                 d_spec_, d_q, nq, m_out_, cs_)
-                        : sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
-                                             d_spec_, d_q, nq, m_out_, cs_);
+            const bool use_min_p_cut = sampled && sp.top_p >= 1.0f && sp.min_p > 0.0f && sp.min_p < 1.0f && pen_bound == 0;
+            const int k_need = use_min_p_cut ? 0 : (k_top + pen_bound);
+            bool all_ok = true;
+            for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
+                const int HT = std::min(T - h0, kFusedGrMaxT);
+                const bool can_reuse = (T <= kFusedGrMaxT);
+                if (!can_reuse) {
+                    strata::kernels::native_quantize_q8_1(head_mixed_ + (size_t) h0 * g_->n_embd, xq_, (int) g_->n_embd, HT, cs_);
+                }
+                const int32_t* c_ids = nullptr;
+                const float* c_log = nullptr;
+                const int32_t* c_cnt = nullptr;
+                const uint8_t* c_ov_d = nullptr;
+                const uint8_t* c_ov_h = nullptr;
+                int max_cand = 0;
+                if (!strata::kernels::vhead_bitplane_candidates(
+                        head_->bitplane(), xq_, HT, k_need, sp.min_p, use_min_p_cut, can_reuse, cs_,
+                        &c_ids, &c_log, &c_cnt, &c_ov_d, &c_ov_h, &max_cand, h0)) {
+                    all_ok = false;
+                    break;
+                }
+                SamplerParams sp_c = sp;
+                sp_c.counter = (uint64_t) (pos0 + h0);
+                const int* h_ptr = hist_d_ != nullptr ? (hist_d_ + (size_t) h0 * (size_t) hist_len_) : nullptr;
+                if (!strata::kernels::sample_tokens_candidates(
+                        c_ids, c_log, c_cnt, c_ov_d, max_cand, HT, (int) n_vocab_,
+                        h_ptr, hist_len_, sp_c, m_out_ + h0, cs_)) {
+                    all_ok = false;
+                    break;
+                }
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                    err = "verify: the head sampling failed";
+                    return false;
+                }
+                bool overflow = false;
+                for (int t = 0; t < HT; ++t) {
+                    if (c_ov_h[t] != 0) { overflow = true; break; }
+                }
+                if (overflow) { all_ok = false; break; }
+            }
+            if (all_ok) {
+                bp_sampled = true;
+                spec_q_ = nullptr;
+                spec_nq_ = 0;
             }
         }
-        spec_q_ = nullptr;
-        spec_nq_ = 0;
-        if (measure && !judged) {
-            (void) cudaStreamSynchronize(cs_);
-            err = "verify: proposal sampler unavailable or allocation/copy/launch failed";
-            return false;
-        }
-        if (judged) ++spec_windows;
-        else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
-            err = "verify: the head sampling failed";
-            return false;
+        if (!bp_sampled) {
+            ensure_head_logits(T);
+            // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
+            bool judged = false;
+            if (use_spec_prob) {
+                if (d_spec_ == nullptr &&
+                    cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
+                        cudaSuccess) {
+                    (void) cudaGetLastError();
+                    d_spec_ = nullptr;
+                }
+                if (d_spec_ != nullptr) {
+                    const int nq = measure ? spec_nq_ : std::min(spec_nq_, T - 1);
+                    int32_t* d_q = d_spec_ + kVerifyMaxT;
+                    if ((T == 1 || cudaMemcpyAsync(d_spec_, tokens + 1, (size_t) (T - 1) * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) ==
+                            cudaSuccess) &&
+                        (nq == 0 || cudaMemcpyAsync(d_q, spec_q_, (size_t) nq * strata::core::kSpecQStride * sizeof(int32_t),
+                                                   cudaMemcpyHostToDevice, cs_) == cudaSuccess))
+                        judged = measure
+                            ? sample_tokens_proposal(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                                     d_spec_, d_q, nq, m_out_, cs_)
+                            : sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                                 d_spec_, d_q, nq, m_out_, cs_);
+                }
+            }
+            spec_q_ = nullptr;
+            spec_nq_ = 0;
+            if (measure && !judged) {
+                (void) cudaStreamSynchronize(cs_);
+                err = "verify: proposal sampler unavailable or allocation/copy/launch failed";
+                return false;
+            }
+            if (judged) ++spec_windows;
+            else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
+                err = "verify: the head sampling failed";
+                return false;
+            }
         }
     }
     if (measure) {
@@ -4187,13 +4255,22 @@ void Verifier::publish_plan(void* ctx) {
 void Verifier::ensure_head_logits(int T) {
     if (!head_bitplane_used_ || head_ == nullptr || !head_->loaded() || head_mixed_ == nullptr || head_logits_ == nullptr)
         return;
+    if (strata::kernels::vhead_bitplane_exact_logits(head_->bitplane())) {
+        head_bitplane_used_ = false;
+        return;
+    }
     const int64_t N = g_->n_embd;
     for (int h0 = 0; h0 < T; h0 += strata::kernels::kFusedGrMaxT) {
         const int HT = std::min(T - h0, strata::kernels::kFusedGrMaxT);
         strata::kernels::native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs_);
-        strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_,
-                                     head_logits_ + (size_t) h0 * (size_t) n_vocab_,
-                                     (int) N, (int) n_vocab_, HT, cs_);
+        if (head_->weights() != nullptr) {
+            strata::kernels::native_mmvq(head_->type(), head_->weights(), xq_,
+                                         head_logits_ + (size_t) h0 * (size_t) n_vocab_,
+                                         (int) N, (int) n_vocab_, HT, cs_);
+        } else if (head_->bitplane() != nullptr) {
+            strata::kernels::vhead_bitplane_logits(head_->bitplane(), xq_, HT,
+                                                   head_logits_ + (size_t) h0 * (size_t) n_vocab_, cs_);
+        }
     }
     head_bitplane_used_ = false;
 }

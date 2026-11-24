@@ -110,16 +110,24 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             strata::kernels::native_q6_k_pack(weights_, n_in_, n_out_, "output head");
         if (type_ == 8)   // STRATA_Q8_SM60=1 (a no-op otherwise); the MTP draft head reads the same matrix
             strata::kernels::native_q8_0_sm60_pack(weights_, n_in_, n_out_, "output head");
+        const char* df2_h = std::getenv("STRATA_DF2_HEAD");
+        const bool df2_native = (df2_h != nullptr && std::strcmp(df2_h, "native") == 0);
         if (host_ == nullptr && (type_ == 8 || type_ == 14) && strata::kernels::vhead_bitplane_enabled() &&
-            !(type_ == 14 && strata::kernels::native_q6_k_packed_enabled())) {
+            !df2_native &&
+            !(type_ == 14 && strata::kernels::native_q6_k_packed_enabled()) &&
+            !(type_ == 8 && strata::kernels::native_q8_0_packed_enabled())) {
             size_t free_b = 0, total_b = 0;
-            // Require >= 1.5 GiB VRAM headroom so small-VRAM cards keep their expert slots.
-            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > (1536ull << 20)) {
+            // Zero-duplication repack frees raw weights_ immediately after building HI+LO+scales.
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > bytes_ + (128ull << 20)) {
                 bitplane_ = strata::kernels::vhead_bitplane_create(type_, weights_, n_in_, n_out_);
                 if (bitplane_ != nullptr) {
-                    std::fprintf(stderr, "strata: exact bit-plane LM head enabled (%s, +%.1f MiB VRAM; STRATA_VHEAD_BITPLANE=0 disables)\n",
+                    const size_t bp_bytes = strata::kernels::vhead_bitplane_bytes(bitplane_);
+                    const double delta_mib = ((double) bp_bytes - (double) bytes_) / 1048576.0;
+                    cudaFree(weights_);
+                    weights_ = nullptr;
+                    std::fprintf(stderr, "strata: exact bit-plane LM head enabled (%s, zero-dup %.1f MiB, delta %+.1f MiB VRAM; STRATA_VHEAD_BITPLANE=0 disables)\n",
                                  strata::ggml_type_name((uint32_t) type_),
-                                 (double) strata::kernels::vhead_bitplane_bytes(bitplane_) / (1024.0 * 1024.0));
+                                 (double) bp_bytes / 1048576.0, delta_mib);
                 }
             } else {
                 (void) cudaGetLastError();
@@ -174,7 +182,14 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
-            strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
+            if (weights_ != nullptr) {
+                strata::kernels::native_mmvq(type_, weights_, scratch_, logits, n_in_, n_out_, 1, stream);
+            } else if (bitplane_ != nullptr) {
+                strata::kernels::vhead_bitplane_logits(bitplane_, scratch_, 1, logits, stream);
+            } else {
+                err = "native head: no weights loaded";
+                return false;
+            }
         }
     } catch (const std::exception& error) {
         err = std::string("native head launch: ") + error.what();
