@@ -51,6 +51,9 @@ bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int3
                            void* stream);
 /// Tests: the int8-KV kernel on INT8 tensor cores (1), v2 (0), or as STRATA_PROMPT_ATTN_IMMA says (-1).
 void qsa_prompt_attn_set_imma(int on);
+/// Tests (PR 4.1, Volta sm_70): override STRATA_PA_V70_G8 (0 off, 1 H_CTA=3, 2 H_CTA=4, -1 env default) and
+/// STRATA_PA_V70_G8_SPLIT (0 1-pass FP16 Q/P, 1 2-pass hi+lo, -1 env default).
+void qsa_prompt_attn_set_v70_g8(int mode, int split = -1);
 /// HIP: STRATA_HIP_WMMA asks for the matrix-core prompt attention (=1 or =auto) and this device is a gfx11 / gfx12 matrix-core part
 /// that has not switched it off after a failed launch.  The prompt path's 96-slot expert ring follows it.  False off HIP.
 bool qsa_prompt_attn_matrix_cores_requested();
