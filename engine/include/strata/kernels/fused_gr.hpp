@@ -81,6 +81,9 @@ void fused_gr_set_fast(int on);
 /// `ts` = the transposed per-token sums (gr_down_q8_fast_kernel), `pfs` = its weight-prefetch variant.
 /// -1 = the environment (STRATA_TSUM / STRATA_GR_Q8_PFS) and the card default. All arms are bitwise equal.
 void fused_gr_set_q8_parallel(int ts, int pfs);
+/// PR 2.1b test/bench hook: force the Volta sm_70 mma.m8n8k4 Q8_0 hyper-connection read (`STRATA_HC_Q8_V70`).
+/// -1 = the environment (STRATA_HC_Q8_V70) and the card default (1 on sm_70 CUDA).
+void fused_gr_set_q8_v70(int on);
 /// The bench only: the v3 read's weight-prefetch kernels (STRATA_GR_V3_PF, bit 0 down / bit 1 up) for every read; -1 = the environment.
 void fused_gr_v3_pf(int mask);
 /// The bench only: registers / spills / shared memory / resident blocks a multiprocessor of the v3 kernels (T = 4), one line each.

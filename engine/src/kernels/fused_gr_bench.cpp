@@ -209,13 +209,20 @@ int main(int argc, char** argv) {
             }
             std::printf("Q8 vs bf16 T %d apply %d | rel rms lo %.4f mixed %.4f | max |dR,dinject| %.3g | q8_1 image vs mixed rel rms %.4f | hash %016llx\n", T, apply,
                         std::sqrt(num / den), std::sqrt(nm / dm), rn, std::sqrt(qn / qd2), hq);
-            // PR 2.1: the three arms of the Q8_0 fast read, timed and compared bit for bit.  launch_q8_t latches
-            // STRATA_TSUM once per process, so the env cannot A/B them in one run; the hook can.
-            std::vector<float> oa[3];
-            std::vector<uint8_t> iqa[3];
-            unsigned long long ha[3];
-            for (int arm = 0; arm < 3; ++arm) {
-                K::fused_gr_set_q8_parallel(arm >= 1 ? 1 : 0, arm >= 2 ? 1 : 0);
+            // PR 2.1: the three arms of the Q8_0 fast read, timed and compared bit for bit, plus Volta mma.m8n8k4 (v70_tc).
+            // launch_q8_t latches STRATA_TSUM once per process, so the env cannot A/B them in one run; the hooks can.
+            int dev_cur = 0;
+            cudaDeviceProp prop_cur{};
+            const bool is_sm70 = cudaGetDevice(&dev_cur) == cudaSuccess &&
+                                 cudaGetDeviceProperties(&prop_cur, dev_cur) == cudaSuccess &&
+                                 prop_cur.major == 7 && prop_cur.minor == 0;
+            const int n_arms = is_sm70 ? 4 : 3;
+            std::vector<float> oa[4];
+            std::vector<uint8_t> iqa[4];
+            unsigned long long ha[4];
+            for (int arm = 0; arm < n_arms; ++arm) {
+                K::fused_gr_set_q8_v70(arm == 3 ? 1 : 0);
+                K::fused_gr_set_q8_parallel(arm == 1 || arm == 2 ? 1 : 0, arm == 2 ? 1 : 0);
                 cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
                 cudaMemset(dqm, 0, (size_t) TM * (N / 32) * 36);
                 K::fused_gr_read_multi(a, T, dxn, s);
@@ -232,10 +239,11 @@ int main(int argc, char** argv) {
                 for (size_t b = 0; b < oa[arm].size() * 4; ++b) ha[arm] = (ha[arm] ^ ((const unsigned char*) oa[arm].data())[b]) * 1099511628211ull;
                 for (size_t b = 0; b < iqa[arm].size(); ++b) ha[arm] = (ha[arm] ^ iqa[arm][b]) * 1099511628211ull;
             }
-            double us[3] = {1e30, 1e30, 1e30};
+            double us[4] = {1e30, 1e30, 1e30, 1e30};
             for (int round = 0; round < 3; ++round)
-                for (int arm = 0; arm < 3; ++arm) {
-                    K::fused_gr_set_q8_parallel(arm >= 1 ? 1 : 0, arm >= 2 ? 1 : 0);
+                for (int arm = 0; arm < n_arms; ++arm) {
+                    K::fused_gr_set_q8_v70(arm == 3 ? 1 : 0);
+                    K::fused_gr_set_q8_parallel(arm == 1 || arm == 2 ? 1 : 0, arm == 2 ? 1 : 0);
                     for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
                     cudaEventRecord(e0, s);
                     for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
@@ -246,10 +254,24 @@ int main(int argc, char** argv) {
                     us[arm] = std::fmin(us[arm], 1e3 * ms / iters);
                 }
             K::fused_gr_set_q8_parallel(-1, -1);
+            K::fused_gr_set_q8_v70(-1);
             const bool same3 = ha[0] == ha[1] && ha[0] == ha[2];
-            std::printf("Q8 T %d apply %d | plain %6.1f us  tsum %6.1f us (%+5.1f%%)  pf %6.1f us (%+5.1f%%) | %s | hashes %016llx/%016llx/%016llx\n",
-                        T, apply, us[0], us[1], 1e2 * (us[1] / us[0] - 1.0), us[2], 1e2 * (us[2] / us[0] - 1.0),
-                        same3 ? "bitwise equal" : "DIFFERS", ha[0], ha[1], ha[2]);
+            if (is_sm70) {
+                double vn = 0.0, vd = 0.0;
+                for (size_t i = 0; i < oa[0].size(); ++i) {
+                    const double df = (double) oa[3][i] - (double) oa[0][i];
+                    vn += df * df;
+                    vd += (double) oa[0][i] * (double) oa[0][i];
+                }
+                std::printf("Q8 T %d apply %d | plain %6.1f us  tsum %6.1f us (%+5.1f%%)  pf %6.1f us (%+5.1f%%)  v70_tc %6.1f us (%+5.1f%%, rel_rms %.2e) | %s | hashes %016llx/%016llx/%016llx\n",
+                            T, apply, us[0], us[1], 1e2 * (us[1] / us[0] - 1.0), us[2], 1e2 * (us[2] / us[0] - 1.0),
+                            us[3], 1e2 * (us[3] / us[0] - 1.0), std::sqrt(vn / (vd > 0 ? vd : 1.0)),
+                            same3 ? "bitwise equal" : "DIFFERS", ha[0], ha[1], ha[2]);
+            } else {
+                std::printf("Q8 T %d apply %d | plain %6.1f us  tsum %6.1f us (%+5.1f%%)  pf %6.1f us (%+5.1f%%) | %s | hashes %016llx/%016llx/%016llx\n",
+                            T, apply, us[0], us[1], 1e2 * (us[1] / us[0] - 1.0), us[2], 1e2 * (us[2] / us[0] - 1.0),
+                            same3 ? "bitwise equal" : "DIFFERS", ha[0], ha[1], ha[2]);
+            }
             if (!same3) ++failures;
         }
     }
@@ -275,8 +297,17 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &dst, (size_t) iters * 4 * 8);
         std::vector<unsigned long long> hst((size_t) iters * 4);
         std::vector<K::FusedGrArgs> as((size_t) cold_sets * 8);
-        for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < 3; ++f) {
+        int dev_cur = 0;
+        cudaDeviceProp prop_cur{};
+        const bool is_sm70 = cudaGetDevice(&dev_cur) == cudaSuccess &&
+                             cudaGetDeviceProperties(&prop_cur, dev_cur) == cudaSuccess &&
+                             prop_cur.major == 7 && prop_cur.minor == 0;
+        const int max_f = is_sm70 ? 6 : 4;   // 0: bf16 plain, 1: bf16 fast, 2: q8 plain, 3: q8 pf, 4: q8 v70_tc, 5: q8 fast+v70up
+        const char* f_names[] = {"bf16_plain", "bf16_fast", "q8_plain", "q8_pf", "q8_v70_tc", "q8_v70_m2"};
+        for (int T = t_lo; T <= t_hi; ++T) for (int f = 0; f < max_f; ++f) {
             K::fused_gr_set_fast(f == 1);
+            K::fused_gr_set_q8_v70(f == 4 ? 1 : (f == 5 ? 2 : 0));
+            K::fused_gr_set_q8_parallel(f == 3 ? 1 : 0, f == 3 ? 1 : 0);
             for (int c = 0; c < cold_sets; ++c)
                 for (int t = 0; t < T; ++t) {
                     K::FusedGrArgs& a = as[(size_t) c * 8 + t];
@@ -285,7 +316,7 @@ int main(int argc, char** argv) {
                     a.bo_prev = dbo + (size_t) t * N; a.inj_prev = dinj + (size_t) t * HC;
                     a.w_norm = cwn[c]; a.w_down = cwd[c]; a.w_up = cwu[c]; a.w_inject = cwi[c];
                     if (with_q) { a.q8_mixed = dqm + (size_t) t * (N / 32) * 36; a.q8_cnt = dcnt; }
-                    if (f == 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
+                    if (f >= 2) { a.q8_down = cqd[c]; a.q8_up = cqu[c]; }
                     a.lo = dlo + (size_t) t * LR; a.rs = drs + (size_t) t * HC;
                     a.inject_out = dio + (size_t) t * HC; a.mixed = dmix + (size_t) t * N;
                 }
@@ -311,9 +342,11 @@ int main(int argc, char** argv) {
                 n_.push_back((double) (p[1] - p[0])); d_.push_back((double) (p[2] - p[1])); u_.push_back((double) (p[3] - p[2]));
             }
             auto med = [](std::vector<double>& v) { std::sort(v.begin(), v.end()); return v[v.size() / 2] / 1e3; };
-            std::printf("COLD(%d sets) fast %d T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us (incl. a stamp kernel each)\n",
-                        cold_sets, f, T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
+            std::printf("COLD(%d sets) %-10s T %d | read %6.1f us (events) | stamps median: norm %5.1f down %5.1f up %5.1f us\n",
+                        cold_sets, f_names[f], T, 1e3 * ms / iters, med(n_), med(d_), med(u_));
         }
+        K::fused_gr_set_q8_parallel(-1, -1);
+        K::fused_gr_set_q8_v70(-1);
     }
     std::printf("fused_gr_bench: %d differing\n", failures);
     return failures ? 1 : 0;

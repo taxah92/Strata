@@ -471,6 +471,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         fused_gr_quantize_q8_0(d_up, d_qu, D * LR / 32, stream);
         fused_gr_quantize_q8_0(d_inject, d_qi, HC * D / 32, stream);
         int q8_bad = 0;
+        fused_gr_set_q8_v70(0);
         for (int tt = 1; tt <= T && !q8_bad; ++tt) {
             for (int qinj = 0; qinj < 2 && !q8_bad; ++qinj) {
                 Snapshot snaps[3];
@@ -512,9 +513,164 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
             }
         }
         fused_gr_set_q8_parallel(-1, -1);
-        cudaFree(d_qd); cudaFree(d_qu); cudaFree(d_qi);
+        fused_gr_set_q8_v70(-1);
         std::printf("  fused GR Q8_0 multi (STRATA_HC_Q8 + q8_inject, plain / tsum / tsum+prefetch), T 1..8: %s\n", q8_bad ? "FAIL" : "pass");
         bad += q8_bad;
+
+        // D1b: PR 2.1b Volta sm_70 mma.m8n8k4 Q8_0 read (STRATA_HC_Q8_V70): T 1..8, apply 0/1, inject (bf16/q8/none),
+        // q8_mixed (off/on), and CUDA Graph capture + replay with changing inputs.
+        int dev_cur = 0;
+        cudaDeviceProp prop_cur{};
+        const bool is_sm70 = cudaGetDevice(&dev_cur) == cudaSuccess &&
+                             cudaGetDeviceProperties(&prop_cur, dev_cur) == cudaSuccess &&
+                             prop_cur.major == 7 && prop_cur.minor == 0;
+        if (is_sm70) {
+            int v70_bad = 0;
+            double worst_rel = 0.0, worst_abs = 0.0;
+            auto cmp_tol = [&](const char* tag, const std::vector<float>& got, const std::vector<float>& ref, size_t n,
+                               double* out_rel = nullptr, double* out_abs = nullptr) {
+                double num = 0.0, den = 0.0, mabs = 0.0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double df = std::fabs((double) got[i] - (double) ref[i]);
+                    num += df * df;
+                    den += (double) ref[i] * (double) ref[i];
+                    mabs = std::fmax(mabs, df);
+                }
+                const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+                worst_rel = std::fmax(worst_rel, rel);
+                worst_abs = std::fmax(worst_abs, mabs);
+                if (out_rel) *out_rel = rel;
+                if (out_abs) *out_abs = mabs;
+                // FP16 mma.m8n8k4 input quantisation in gr_down/gr_up introduces ~3e-4 relative FP16 rounding
+                // on stream outputs whose scale grows with 2^(2c) (so |ref| reaches ~8 and abs ~ 2.3e-3).
+                if (!(rel < 1e-3 && mabs < 5e-3)) {
+                    std::printf("    v70_tc %s field rel %.3e abs %.3e\n", tag, rel, mabs);
+                    return false;
+                }
+                return true;
+            };
+            std::vector<float> r_alt = r, bo_alt = bo, inj_alt = inj;
+            for (size_t i = 0; i < r_alt.size(); ++i) r_alt[i] = -0.65f * r[i] + 0.015f * (float) ((i % 13) - 6);
+            for (size_t i = 0; i < bo_alt.size(); ++i) bo_alt[i] = -0.35f * bo[i] + 0.02f;
+            for (size_t i = 0; i < inj_alt.size(); ++i) inj_alt[i] = 0.8f * inj[i] - 0.1f;
+
+            for (int mode = 1; mode <= 2 && !v70_bad; ++mode) {
+                for (int tt = 1; tt <= T && !v70_bad; ++tt) {
+                    for (int app = 0; app < 2 && !v70_bad; ++app) {
+                        for (int injm = 0; injm < 3 && !v70_bad; ++injm) {
+                            for (int qf = 0; qf < 2 && !v70_bad; ++qf) {
+                                std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
+                                for (int t = 0; t < tt; ++t) {
+                                    qa[t].apply = app != 0;
+                                    qa[t].q8_down = d_qd;
+                                    qa[t].q8_up = d_qu;
+                                    qa[t].w_inject = injm < 2 ? d_inject : nullptr;
+                                    qa[t].q8_inject = injm == 1 ? d_qi : nullptr;
+                                    qa[t].q8_mixed = qf ? d_q + (size_t) t * (N / 32) * 36 : nullptr;
+                                    qa[t].q8_cnt = d_cnt;
+                                }
+                                auto run_direct = [&](const std::vector<float>& rr, const std::vector<float>& bb,
+                                                      const std::vector<float>& ii, Snapshot& out_snap,
+                                                      std::vector<uint8_t>& out_q, bool& out_wrote) {
+                                    check(cudaMemcpyAsync(d_r, rr.data(), rr.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 R");
+                                    check(cudaMemcpyAsync(d_bo, bb.data(), bb.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 bo");
+                                    check(cudaMemcpyAsync(d_inj, ii.data(), ii.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 inj");
+                                    check(cudaMemsetAsync(d_r_out, 0x5a, (size_t) T * D * sizeof(float), stream), "v70 rout poison");
+                                    check(cudaMemsetAsync(d_lo, 0x5a, (size_t) T * LR * sizeof(float), stream), "v70 lo poison");
+                                    check(cudaMemsetAsync(d_rs, 0x5a, (size_t) T * HC * sizeof(float), stream), "v70 rs poison");
+                                    check(cudaMemsetAsync(d_inj_out, 0x5a, (size_t) T * HC * sizeof(float), stream), "v70 inj poison");
+                                    check(cudaMemsetAsync(d_mixed, 0x5a, (size_t) T * N * sizeof(float), stream), "v70 mix poison");
+                                    check(cudaMemsetAsync(d_q, 0x5a, qbytes, stream), "v70 q poison");
+                                    out_wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                                    if (qf) strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
+                                    check(cudaStreamSynchronize(stream), "v70 sync");
+                                    out_snap = snapshot();
+                                    out_q.resize((size_t) tt * (N / 32) * 36);
+                                    check(cudaMemcpy(out_q.data(), d_q, out_q.size(), cudaMemcpyDeviceToHost), "v70 q read");
+                                };
+                                Snapshot ref_s, v70_s;
+                                std::vector<uint8_t> ref_q, v70_q;
+                                bool ref_w = false, v70_w = false;
+                                fused_gr_set_q8_v70(0);
+                                fused_gr_set_q8_parallel(0, 0);
+                                run_direct(r, bo, inj, ref_s, ref_q, ref_w);
+                                fused_gr_set_q8_parallel(-1, -1);
+                                fused_gr_set_q8_v70(mode);
+                                run_direct(r, bo, inj, v70_s, v70_q, v70_w);
+
+                                if (v70_w != (qf != 0)) ++v70_bad;
+                                if (qf) {
+                                    check(cudaMemcpy(hr.data(), d_ref, v70_q.size(), cudaMemcpyDeviceToHost), "v70 qref");
+                                    if (std::memcmp(v70_q.data(), hr.data(), v70_q.size()) != 0) ++v70_bad;
+                                } else {
+                                    for (uint8_t b : v70_q) if (b != 0x5a) { ++v70_bad; break; }
+                                }
+                                if (!cmp_tol("lo", v70_s.lo, ref_s.lo, (size_t) tt * LR) ||
+                                    !cmp_tol("mixed", v70_s.mixed, ref_s.mixed, (size_t) tt * N) ||
+                                    !cmp_tol("rs", v70_s.rs, ref_s.rs, (size_t) tt * HC) ||
+                                    (injm < 2 && !cmp_tol("inject", v70_s.inject, ref_s.inject, (size_t) tt * HC)) ||
+                                    (app && !cmp_tol("r_out", v70_s.r_out, ref_s.r_out, (size_t) tt * D))) {
+                                    std::printf("  v70_tc mode=%d mismatch T=%d app=%d inj=%d qf=%d (worst rel %.3e abs %.3e)\n",
+                                                mode, tt, app, injm, qf, worst_rel, worst_abs);
+                                    ++v70_bad;
+                                }
+                                // CUDA Graph capture + replay with changed inputs (for qf=0 and qf=1)
+                                if (injm == 1) {
+                                    Snapshot dir_alt, grp_alt;
+                                    std::vector<uint8_t> dir_q, grp_q;
+                                    bool dir_w = false;
+                                    run_direct(r_alt, bo_alt, inj_alt, dir_alt, dir_q, dir_w);
+
+                                    cudaGraph_t vg = nullptr;
+                                    cudaGraphExec_t vx = nullptr;
+                                    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "v70 g begin");
+                                    const bool gw = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                                    check(cudaStreamEndCapture(stream, &vg), "v70 g end");
+                                    check(cudaGraphInstantiate(&vx, vg, nullptr, nullptr, 0), "v70 g inst");
+                                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g R1");
+                                    check(cudaMemcpyAsync(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g bo1");
+                                    check(cudaMemcpyAsync(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g inj1");
+                                    check(cudaGraphLaunch(vx, stream), "v70 g launch 1");
+                                    check(cudaMemcpyAsync(d_r, r_alt.data(), r_alt.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g R2");
+                                    check(cudaMemcpyAsync(d_bo, bo_alt.data(), bo_alt.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g bo2");
+                                    check(cudaMemcpyAsync(d_inj, inj_alt.data(), inj_alt.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "v70 g inj2");
+                                    check(cudaMemsetAsync(d_q, 0x5a, qbytes, stream), "v70 g q poison");
+                                    check(cudaGraphLaunch(vx, stream), "v70 g launch 2");
+                                    check(cudaStreamSynchronize(stream), "v70 g sync");
+                                    grp_alt = snapshot();
+                                    grp_q.resize((size_t) tt * (N / 32) * 36);
+                                    check(cudaMemcpy(grp_q.data(), d_q, grp_q.size(), cudaMemcpyDeviceToHost), "v70 g q read");
+                                    cudaGraphExecDestroy(vx);
+                                    cudaGraphDestroy(vg);
+                                    if (gw != (qf != 0) ||
+                                        std::memcmp(grp_alt.mixed.data(), dir_alt.mixed.data(), (size_t) tt * N * 4) != 0 ||
+                                        std::memcmp(grp_alt.lo.data(), dir_alt.lo.data(), (size_t) tt * LR * 4) != 0 ||
+                                        std::memcmp(grp_alt.rs.data(), dir_alt.rs.data(), (size_t) tt * HC * 4) != 0 ||
+                                        std::memcmp(grp_alt.inject.data(), dir_alt.inject.data(), (size_t) tt * HC * 4) != 0 ||
+                                        (app && std::memcmp(grp_alt.r_out.data(), dir_alt.r_out.data(), (size_t) tt * D * 4) != 0) ||
+                                        std::memcmp(grp_q.data(), dir_q.data(), dir_q.size()) != 0 ||
+                                        std::memcmp(grp_alt.mixed.data(), v70_s.mixed.data(), (size_t) tt * N * 4) == 0) {
+                                        std::printf("  v70_tc mode=%d graph replay mismatch T=%d app=%d qf=%d\n", mode, tt, app, qf);
+                                        ++v70_bad;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            fused_gr_set_q8_v70(-1);
+            fused_gr_set_q8_parallel(-1, -1);
+            // restore d_r/d_bo/d_inj for subsequent tests
+            check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "restore R");
+            check(cudaMemcpyAsync(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "restore bo");
+            check(cudaMemcpyAsync(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "restore inj");
+            check(cudaStreamSynchronize(stream), "restore sync");
+            std::printf("  fused GR Q8_0 Volta mma.m8n8k4 (modes 1/2, T 1..8, apply 0/1, inj 0/1/2, qfuse 0/1, graph): %s (worst rel %.2e, max |diff| %.2e)\n",
+                        v70_bad ? "FAIL" : "pass", worst_rel, worst_abs);
+            bad += v70_bad;
+        }
+        cudaFree(d_qd); cudaFree(d_qu); cudaFree(d_qi);
 #if (defined(STRATA_USE_HIP) || defined(__HIP_PLATFORM_AMD__)) && !defined(STRATA_HIP_GFX906)
         // Counter-free q8_mixed path (q8_cnt == nullptr, used by MTP when STRATA_QFUSE_HC_LOCAL=1 on wave32 HIP where
         // STRATA_GR_FAST_BUILD == 0): must return true and write identical q8_1 bytes across T=1..8 and graph replays,
