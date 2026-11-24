@@ -113,8 +113,24 @@ inline int i8_tile_two_blocks(int tm, std::size_t bytes2, std::size_t bytes3, st
 /// at 40 entries (2,048 tokens) 1.38 -> 1.22 (slower), at 160 (8,192) 0.95 -> 0.96 (IQ3_S), 0.95 -> 0.94 (IQ3_XXS), 0.90 -> 0.94 (IQ2_S), at 508 (26,000) 0.82 -> 0.86,
 /// 0.83 -> 0.84, 0.82 -> 0.89; output hashes equal at every size.
 inline constexpr int64_t kI8hMinAvg = 160;
-/// The Volta pick: tile 5 from kI8hMinAvg entries on average when the formats have it (`h_ok`), else the two-block tile of i8_tile_two_blocks.
-inline int i8_tile_volta(int two_block_tile, int64_t avg, bool h_ok) { return h_ok && avg >= kI8hMinAvg ? 5 : two_block_tile; }
+/// PR 4.3 Volta two-tier tensor-core thresholds (measured on Tesla V100-SXM2-32GB, Flash-Next shape, uniform + Zipf skew=1.0, T=256..20000):
+/// with I8H_LDH=132, packed s_r (I8H_RS=10) and warp-uniform partial-tile skip, BM=32 (tile 6, 128 thr, 3 CTA/SM) beats dp4a by +15..23% and
+/// BM=64 by +6..18% for avg < 30 (all the way down to avg=5), while BM=64 (tile 5, 256 thr, 2 CTA/SM) beats dp4a by +13..39% from avg >= 30 up.
+/// Setting STRATA_I8H32=0 (h32_on=false) restores the pre-PR-4.3 rule (tile 5 only from kI8hMinAvg=160, else dp4a).
+inline constexpr int64_t kI8h32MinAvg = 1;
+inline constexpr int64_t kI8hV2MinAvg = 30;
+/// STRATA_I8H32 read as a state (1 / 0 / -1 not set): the two-tier Volta tensor-core dispatch (tile 6 BM=32 + lowered tile 5 BM=64) is on unless it is 0.
+inline bool i8h32_rule_on(int state) { return state != 0; }
+/// The Volta pick: when `h32_on`, tile 5 (BM=64) from kI8hV2MinAvg and tile 6 (BM=32) from kI8h32MinAvg; when `!h32_on` (kill-switch), tile 5 only from kI8hMinAvg; else `two_block_tile`.
+inline int i8_tile_volta(int two_block_tile, int64_t avg, bool h_ok, bool h32_on = false) {
+    if (!h_ok) return two_block_tile;
+    if (h32_on) {
+        if (avg >= kI8hV2MinAvg) return 5;
+        if (avg >= kI8h32MinAvg) return 6;
+        return two_block_tile;
+    }
+    return avg >= kI8hMinAvg ? 5 : two_block_tile;
+}
 /// STRATA_I8_SM70 read as a state (1 / 0 / -1 not set): the Volta tile rule above and the global grid are on unless it is 0.
 inline bool i8_volta_rule_on(int state) { return state != 0; }
 

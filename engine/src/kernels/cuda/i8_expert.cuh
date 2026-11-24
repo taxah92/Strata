@@ -1176,7 +1176,8 @@ void i8b_launch(const I8Args& a, cudaStream_t s) {
 template <int T>
 size_t i8_sm(int tm, bool gg = false) {
 #if !defined(__HIPCC__)
-    if (tm == 5) return I8HSmem<T>::bytes;
+    if (tm == 5) return I8HSmem<T, 64>::bytes;
+    if (tm == 6) return I8HSmem<T, 32>::bytes;
 #endif
     if (gg && i8_gg_type(T) && tm != 8) return tm <= 2 ? I8Smem<T, 2, true>::bytes : tm == 3 ? I8Smem<T, 3, true>::bytes : I8Smem<T, 4, true>::bytes;
     return tm == 8 ? I8BSmem<T>::bytes : tm <= 2 ? I8Smem<T, 2>::bytes : tm == 3 ? I8Smem<T, 3>::bytes : I8Smem<T, 4>::bytes;
@@ -1218,23 +1219,25 @@ size_t i8_smem_limit() {
     return o > 0 && (size_t) o < lim ? (size_t) o : lim;
 }
 #if !defined(__HIPCC__)
-template <int T, bool GU>
+template <int T, bool GU, int BM = I8H_BM>
 void i8h_launch(const I8Args& a, cudaStream_t s) {
-    constexpr size_t smem = I8HSmem<T>::bytes;
-    if (smem > 48 * 1024) cudaFuncSetAttribute(i8h_kernel<T, GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+    constexpr size_t smem = I8HSmem<T, BM>::bytes;
+    constexpr int nt = BM * 4;
+    if (smem > 48 * 1024) cudaFuncSetAttribute(i8h_kernel<T, GU, BM>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
     if constexpr (GU)
-        i8h_kernel<T, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L);
+        i8h_kernel<T, true, BM><<<grid, nt, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L);
     else
-        i8h_kernel<T, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L);
-    i8_note_launch(GU, 5, smem);
+        i8h_kernel<T, false, BM><<<grid, nt, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L);
+    i8_note_launch(GU, BM == 32 ? 6 : 5, smem);
 }
 #endif
 template <int T, bool GU>
 void i8_launch(int tm, const I8Args& a, cudaStream_t s) {
 #if !defined(__HIPCC__)
     if constexpr (i8h_type(T)) {
-        if (tm == 5) { i8h_launch<T, GU>(a, s); return; }   // the Volta tensor-core form (native_expert_i8 takes tile 5 only on a compute capability 7.0 card)
+        if (tm == 5) { i8h_launch<T, GU, 64>(a, s); return; }   // Volta tensor-core form BM=64 (256 thr, 2 CTA/SM)
+        if (tm == 6) { i8h_launch<T, GU, 32>(a, s); return; }   // Volta tensor-core form BM=32 (128 thr, 3 CTA/SM)
     }
 #endif
     if constexpr (i8_tile8_type(T)) {

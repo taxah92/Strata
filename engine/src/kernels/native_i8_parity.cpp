@@ -29,6 +29,11 @@ namespace k = strata::kernels;
 namespace {
 
 int g_fail = 0, g_run = 0, g_skipped = 0;
+bool g_is_sm70 = false;
+bool is_i8h_pair(int gu, int dt) {
+    auto no_min = [](int t) { return t != 12 && t != 13 && t != 7; };
+    return no_min(gu) && no_min(dt);
+}
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -315,7 +320,10 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     double worst = 0;
     // (tile code, shared-memory limit to pretend: 0 = the device's own).  Tile code 8 is variant B (128 entries); with a 48 KB limit (a Pascal card) the
     // call must fall to a tile that fits, or the format is unsupported there (then the pass is skipped).
-    for (const auto& tl : std::vector<std::pair<int, int>>{{2, 0}, {3, 0}, {4, 0}, {8, 0}, {8, 49152}, {4, 49152}}) {
+    std::vector<std::pair<int, int>> tiles = {{2, 0}, {3, 0}, {4, 0}, {8, 0}, {8, 49152}, {4, 49152}};
+    const bool test_v70_tc = g_is_sm70 && is_i8h_pair(gu, dt) && FF % 32 == 0 && H % 64 == 0;
+    if (test_v70_tc) { tiles.push_back({5, 0}); tiles.push_back({6, 0}); }
+    for (const auto& tl : tiles) {
         const int tm = tl.first;
 #ifdef _WIN32
         _putenv_s("STRATA_I8_TM", std::to_string(tm).c_str());
@@ -339,11 +347,23 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                 ++calls;
                 bool fail = false;
                 if (hash_bits(a) != hash_bits(b) || hash_bits(a) != hash_bits(c)) { std::printf("  tm %d base %d: the bits changed between runs  FAIL\n", tm, base); fail = true; }
+                const uint64_t ha = hash_bits(a);
+                if ((tm == 5 || tm == 6) && tl.second == 0) {
+                    const auto la = k::native_expert_i8_last_launch();
+                    if (total > 0 && la.tile != tm) { std::printf("  tm %d base %d: expected tile %d, launched %d  FAIL\n", tm, base, tm, la.tile); fail = true; }
+                    set_env("STRATA_I8_TM", "2");
+                    const auto ref2 = S.result(true, 0x00, s);
+                    set_env("STRATA_I8_TM", std::to_string(tm).c_str());
+                    if (ha != hash_bits(ref2)) {
+                        std::printf("  tm %d base %d: Volta TC output bits differ from dp4a tm=2  FAIL\n", tm, base);
+                        fail = true;
+                    }
+                }
                 if (tm <= 4) {   // tile codes 2-4 also run as 8-entry slices (STRATA_I8_N8=1): the same terms in the same order, so the same bits
                     set_env("STRATA_I8_N8", "1");
                     const auto d8 = S.result(true, 0x7F, s);
                     set_env("STRATA_I8_N8", "0");
-                    if (hash_bits(a) != hash_bits(d8)) { std::printf("  tm %d base %d: 8-entry slices (N8) changed the bits  FAIL\n", tm, base); fail = true; }
+                    if (ha != hash_bits(d8)) { std::printf("  tm %d base %d: 8-entry slices (N8) changed the bits  FAIL\n", tm, base); fail = true; }
                 }
                 std::vector<char> active((size_t) S.cap, 0);
                 for (int e = S.active_lo; e < S.active_hi; ++e) active[(size_t) S.dst_h[(size_t) e]] = 1;
@@ -383,7 +403,9 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
         }
     }
     set_env("STRATA_I8_SMEM_LIMIT", "0");
-    for (const int tm : {2, 3, 4, 8}) {   // the carved layer of a CPU share (check_carved), the device's own limit
+    std::vector<int> carved_tms = {2, 3, 4, 8};
+    if (test_v70_tc) { carved_tms.push_back(5); carved_tms.push_back(6); }
+    for (const int tm : carved_tms) {   // the carved layer of a CPU share (check_carved), the device's own limit
         set_env("STRATA_I8_TM", std::to_string(tm).c_str());
         check_carved(S, H, FF, s, rng, tm, bad, worst, calls);
     }
@@ -409,6 +431,7 @@ int main() {
         cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
         cudaFree(nullptr);
+        g_is_sm70 = (mj == 7 && mn == 0);
         std::printf("device: sm_%d%d, shared memory per block %d bytes, opt-in %d bytes\n", mj, mn, a, b);
         // to stderr (the result lines on stdout stay the same on every card): the limit the call uses, and which sizes an empty kernel really launches with (1 yes, 0 refused,
         // -1 not available): 49152 = 48 KB, then the sizes the iteration-3 and later tiles of IQ2_S ask for (TM 2 / 3 / 4: 41,088 / 46,272 / 51,456 bytes; later sources 51,328 / 56,512 / 61,696)
