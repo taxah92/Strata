@@ -86,6 +86,158 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
+template <int PS_SHIFT>
+__global__ void __launch_bounds__(RT) resolve_kernel_v70(KvStreamMap m, const int32_t* __restrict__ ids,
+                                                         const int32_t* __restrict__ steps, int n_q, int cap,
+                                                         int page_size) {
+    __shared__ int s_nmiss, s_lookups, s_cut;
+    __shared__ int warp_sums[32];
+    const int epoch = m.ctl[0] + 1;
+    if (threadIdx.x == 0) { s_nmiss = 0; s_lookups = 0; }
+    __syncthreads();
+    // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
+    int lookups = 0;
+    for (int q = 0; q < n_q; ++q) {
+        const int width = __ldg(steps + q * kStepCount + kStepWidth);
+        const int32_t* qi = ids + (long long) q * cap;
+        for (int i = threadIdx.x; i < width; i += RT) {
+            const int cell = __ldg(qi + i);
+            const int b = PS_SHIFT > 0 ? (cell >> PS_SHIFT) : (cell / page_size);
+            if (i > 0) {
+                const int prev = __ldg(qi + i - 1);
+                const int bp = PS_SHIFT > 0 ? (prev >> PS_SHIFT) : (prev / page_size);
+                if (bp == b) continue;
+            }
+            ++lookups;
+            const int sl = m.page_table[b];
+            if (sl >= 0) {
+                if (m.slot_stamp[sl] != epoch) {
+                    m.slot_stamp[sl] = epoch;
+                    m.slot_ref[sl] = 1;
+                }
+            } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
+                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+            }
+        }
+    }
+    if (lookups > 0) atomicAdd(&s_lookups, lookups);
+    __syncthreads();
+    // 2. one victim per miss: clock sweep from hand (no 64-bit modulo; n >= RT is checked on host).
+    const int need = s_nmiss, n = (int) m.n_slots;
+    int hand = m.ctl[1], got = 0;
+    for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
+        int j = hand + threadIdx.x;
+        if (j >= n) j -= n;
+        const bool mine = m.slot_stamp[j] == epoch;
+        const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
+        int total = 0;
+        const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
+        const int want = need - got;
+        if (threadIdx.x == 0) s_cut = RT;
+        __syncthreads();
+        if (cand && rank == want - 1) s_cut = threadIdx.x + 1;
+        __syncthreads();
+        const int cut = s_cut;
+        if (cand && rank < want) {
+            m.miss_slot[got + rank] = j;
+            m.slot_stamp[j] = epoch;
+        } else if (threadIdx.x < cut && !mine) {
+            m.slot_ref[j] = 0;
+        }
+        got += total < want ? total : want;
+        hand += cut;
+        if (hand >= n) hand -= n;
+        __syncthreads();
+    }
+    // 3. re-point the table; the copy kernel fills the slots
+    const int placed = got < need ? got : need;
+    for (int k = threadIdx.x; k < need; k += RT) {
+        const int b = m.miss_block[k];
+        if (k >= placed) { m.page_table[b] = -1; continue; }
+        const int sl = m.miss_slot[k];
+        const int old = m.slot_block[sl];
+        if (old >= 0) m.page_table[old] = -1;
+        m.slot_block[sl] = b;
+        m.slot_stamp[sl] = epoch;
+        m.slot_ref[sl] = 1;
+        m.page_table[b] = sl;
+    }
+    if (threadIdx.x == 0) {
+        m.ctl[0] = epoch;
+        m.ctl[1] = hand;
+        m.ctl[2] = placed;
+        if (placed < need) m.ctl[3] = 1;
+        unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
+        c[0] += (unsigned long long) placed;
+        c[1] += (unsigned long long) s_lookups;
+        c[2] += 1ull;
+    }
+}
+
+// Flat zero-spill copy kernels (PR 3.3c): scalar pointer args avoid the STACK:88 local spill of `Runs` array
+// indexing, and map all runs of a missed block onto one parallel 256-thread uint4 PCIe burst.
+constexpr int CT = 256;
+
+__global__ void __launch_bounds__(CT)
+copy_2run_kernel(KvStreamMap m, const uint4* __restrict__ s0, uint4* __restrict__ d0, int n0,
+                 const uint4* __restrict__ s1, uint4* __restrict__ d1, int n1) {
+    const int need = __ldg(m.ctl + 2);
+    if (blockIdx.x >= need) return;
+    const int total = n0 + n1;
+    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+        const long long b = __ldg(m.miss_block + k), sl = __ldg(m.miss_slot + k);
+        for (int i = threadIdx.x; i < total; i += CT) {
+            if (i < n0) d0[sl * n0 + i] = s0[b * n0 + i];
+            else { const int j = i - n0; d1[sl * n1 + j] = s1[b * n1 + j]; }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(CT)
+copy_3run_kernel(KvStreamMap m, const uint4* __restrict__ s0, uint4* __restrict__ d0, int n0,
+                 const uint4* __restrict__ s1, uint4* __restrict__ d1, int n1,
+                 const uint4* __restrict__ s2, uint4* __restrict__ d2, int n2) {
+    const int need = __ldg(m.ctl + 2);
+    if (blockIdx.x >= need) return;
+    const int n01 = n0 + n1;
+    const int total = n01 + n2;
+    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+        const long long b = __ldg(m.miss_block + k), sl = __ldg(m.miss_slot + k);
+        for (int i = threadIdx.x; i < total; i += CT) {
+            if (i < n0) d0[sl * n0 + i] = s0[b * n0 + i];
+            else if (i < n01) { const int j = i - n0; d1[sl * n1 + j] = s1[b * n1 + j]; }
+            else { const int j = i - n01; d2[sl * n2 + j] = s2[b * n2 + j]; }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(CT)
+copy_4run_kernel(KvStreamMap m, const uint4* __restrict__ s0, uint4* __restrict__ d0, int n0,
+                 const uint4* __restrict__ s1, uint4* __restrict__ d1, int n1,
+                 const uint4* __restrict__ s2, uint4* __restrict__ d2, int n2,
+                 const uint4* __restrict__ s3, uint4* __restrict__ d3, int n3) {
+    const int need = __ldg(m.ctl + 2);
+    if (blockIdx.x >= need) return;
+    const int n01 = n0 + n1, n012 = n01 + n2, total = n012 + n3;
+    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+        const long long b = __ldg(m.miss_block + k), sl = __ldg(m.miss_slot + k);
+        for (int i = threadIdx.x; i < total; i += CT) {
+            if (i < n0) d0[sl * n0 + i] = s0[b * n0 + i];
+            else if (i < n01) { const int j = i - n0; d1[sl * n1 + j] = s1[b * n1 + j]; }
+            else if (i < n012) { const int j = i - n01; d2[sl * n2 + j] = s2[b * n2 + j]; }
+            else { const int j = i - n012; d3[sl * n3 + j] = s3[b * n3 + j]; }
+        }
+    }
+}
+
+bool kv_stream_v70_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KV_STREAM_V70");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
                                                      const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
@@ -226,6 +378,31 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
         std::fprintf(stderr, "kv_stream: %lld slots is fewer than the resolve block (%d): the clock sweep would take a "
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
+    }
+    if (kv_stream_v70_on()) {
+        if (s.page_size == 4)
+            resolve_kernel_v70<2><<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
+        else
+            resolve_kernel_v70<0><<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
+        check("resolve");
+        const Runs r = runs_of(slots, host, fmt, s);
+        if (r.n == 3)
+            copy_3run_kernel<<<96, CT, 0, (cudaStream_t) stream>>>(
+                m, reinterpret_cast<const uint4*>(r.src[0]), reinterpret_cast<uint4*>(r.dst[0]), r.len[0] / 16,
+                reinterpret_cast<const uint4*>(r.src[1]), reinterpret_cast<uint4*>(r.dst[1]), r.len[1] / 16,
+                reinterpret_cast<const uint4*>(r.src[2]), reinterpret_cast<uint4*>(r.dst[2]), r.len[2] / 16);
+        else if (r.n == 4)
+            copy_4run_kernel<<<96, CT, 0, (cudaStream_t) stream>>>(
+                m, reinterpret_cast<const uint4*>(r.src[0]), reinterpret_cast<uint4*>(r.dst[0]), r.len[0] / 16,
+                reinterpret_cast<const uint4*>(r.src[1]), reinterpret_cast<uint4*>(r.dst[1]), r.len[1] / 16,
+                reinterpret_cast<const uint4*>(r.src[2]), reinterpret_cast<uint4*>(r.dst[2]), r.len[2] / 16,
+                reinterpret_cast<const uint4*>(r.src[3]), reinterpret_cast<uint4*>(r.dst[3]), r.len[3] / 16);
+        else
+            copy_2run_kernel<<<96, CT, 0, (cudaStream_t) stream>>>(
+                m, reinterpret_cast<const uint4*>(r.src[0]), reinterpret_cast<uint4*>(r.dst[0]), r.len[0] / 16,
+                reinterpret_cast<const uint4*>(r.src[1]), reinterpret_cast<uint4*>(r.dst[1]), r.len[1] / 16);
+        check("copy");
+        return;
     }
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");

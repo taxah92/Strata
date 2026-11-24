@@ -205,10 +205,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_merge_daily_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_merge_daily_parity_default COMMAND qsa_merge_daily_parity)
     add_test(NAME qsa_merge_daily_parity_daily COMMAND qsa_merge_daily_parity)
-    set_tests_properties(qsa_merge_daily_parity_default PROPERTIES ENVIRONMENT "STRATA_ATTN_DAILY=0"
+    set_tests_properties(qsa_merge_daily_parity_default PROPERTIES ENVIRONMENT "STRATA_ATTN_DAILY=0;STRATA_ATTN_V70=0"
                          SKIP_RETURN_CODE 77)
-    set_tests_properties(qsa_merge_daily_parity_daily PROPERTIES ENVIRONMENT "STRATA_ATTN_DAILY=1"
+    set_tests_properties(qsa_merge_daily_parity_daily PROPERTIES ENVIRONMENT "STRATA_ATTN_DAILY=1;STRATA_ATTN_V70=0"
                          SKIP_RETURN_CODE 77)
+    # PR 3.3: Volta sm_70 mma.m8n8k4 + 128-bit KV decode attention parity & microbench (all 4 KV formats,
+    # unresident holes, edge widths, CUDA Graph replay) + kv_stream_resolve microbench
+    add_executable(qsa_decode_attn_v70_parity src/kernels/qsa_decode_attn_v70_parity.cpp)
+    target_include_directories(qsa_decode_attn_v70_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_decode_attn_v70_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME qsa_decode_attn_v70_parity_hi COMMAND qsa_decode_attn_v70_parity)
+    add_test(NAME qsa_decode_attn_v70_parity_hl COMMAND qsa_decode_attn_v70_parity)
+    set_tests_properties(qsa_decode_attn_v70_parity_hi PROPERTIES ENVIRONMENT "STRATA_ATTN_V70=1" SKIP_RETURN_CODE 77)
+    set_tests_properties(qsa_decode_attn_v70_parity_hl PROPERTIES ENVIRONMENT "STRATA_ATTN_V70=2" SKIP_RETURN_CODE 77)
     # the prompt path's block scores on the thread-per-head kernel (Turing) against the warp kernel, bitwise
     add_executable(qsa_scores_parity src/kernels/qsa_scores_parity.cpp)
     target_include_directories(qsa_scores_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

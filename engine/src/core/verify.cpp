@@ -2366,7 +2366,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     err = "verify: the indexer's branch could not join";
                     return false;
                 }
-                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                // PR 3.3b (STRATA_QSA_RESOLVE_OVERLAP=1, default on; =0 restores pre-PR3.3 order): qsa_kv_resolve only
+                // reads sel_/step_/host and updates the KV slots, never qfull_/qcur_.  Deferring the queries' branch
+                // join (pjoin_) until after qsa_kv_resolve overlaps KV resolution and PCIe miss copies with wq+norm+RoPE
+                // on side2_, matching df_branch's join(0) below (bitwise identical, CUDA-Graph-safe).
+                static const bool resolve_overlap_env = [] {
+                    const char* v = std::getenv("STRATA_QSA_RESOLVE_OVERLAP");
+                    return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+                }();
+                const bool defer_pjoin = side_proj && resolve_overlap_env;
+                if (side_proj && !defer_pjoin && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the queries' branch could not join";
                     return false;
                 }
@@ -2374,6 +2383,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
+                if (defer_pjoin && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                    err = "verify: the queries' branch could not join";
+                    return false;
+                }
                 if (qbr) join(0);   // the query, for attention
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 // STRATA_QSA_SPLIT_ATTN=1: the split tensor-core attention where it applies (int8 KV, sm_80+)

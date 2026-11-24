@@ -726,6 +726,636 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
 }
 #endif  // STRATA_ATTN_PRE75_BUILT
 
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+// PR 3.3a (Volta sm_70): multi-chunk split-K decode attention on mma.m8n8k4 Tensor Cores + 128-bit uint4 KV staging.
+// Targets ~160 CTAs (2 full waves on 80-SM V100) using `nsp <= ceil(cap / 64)` splits over the existing scratch
+// buffer (0 extra VRAM, 100% CUDA-Graph-safe, exact match with attn_merge_v2_kernel's `ceil(width / 64)` bound).
+// Each CTA loads & packs Q once into smem, then strides 64-cell blocks (`blk64 = split, split+nsp, ...`) in 32-cell
+// sub-chunks (`CH_V70 = 32`) with online softmax:
+//   - K and V (all 256 dims of 32 cells) are loaded together in 128-bit uint4 bursts (1 barrier for modes 1/2/3!).
+//   - Q*K^T: 4 warps x 8 cells = 32 cells; QP (qp&1) picks head block (0..7 / 8..15), (qp>>1) picks dim half
+//     (0..127 / 128..255), reduced in-warp via 1 __shfl_xor_sync(8) (0 smem, 0 cross-warp barriers).
+//   - Online softmax over 32 cells -> updates running mrow/lsum and alpha.
+//   - P*V: 4 warps x 64 dims = 256 dims; QP (qp&1) owns 32 dims (1 block_q4_0 for k8v4/q4_0, half of a KV_Q8_GROUP
+//     for int8). Running vmax_run rescales `acc` directly in-place (0 duplicate `tmp` register array).
+// STRATA_ATTN_V70: 0 disables (fallback to attn_chunk_kernel_pre75), 1 1-pass FP16 Q/P,
+// 2 (default on sm_70) 2-pass hi+lo FP16 Q/P (~2e-6 FP32-level precision, tied speed on k8v4).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+#define STRATA_DEC_ATTN_VOLTA 1
+#else
+#define STRATA_DEC_ATTN_VOLTA 0
+#endif
+
+__device__ __forceinline__ void dec_mma884(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if STRATA_DEC_ATTN_VOLTA
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    (void) c; (void) a0; (void) a1; (void) b0; (void) b1;
+    __trap();
+#endif
+}
+
+__device__ __forceinline__ uint32_t dec_i8x2_to_h2(uint32_t x) {
+    uint32_t y = ((x & 0xffu) | ((x & 0xff00u) << 8)) ^ 0x00800080u;
+    y |= 0x64006400u;
+    __half2 h = *reinterpret_cast<__half2*>(&y);
+    h = __hsub2(h, __halves2half2(__float2half(1152.f), __float2half(1152.f)));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ uint32_t dec_u4x2_to_h2(uint32_t n0, uint32_t n1) {
+    const uint32_t y = 0x64006400u | (n0 & 0x0Fu) | ((n1 & 0x0Fu) << 16);
+    __half2 h = *reinterpret_cast<const __half2*>(&y);
+    h = __hsub2(h, __halves2half2(__float2half(1032.f), __float2half(1032.f)));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ uint32_t dec_pack_h2(float lo_k, float hi_k) {
+    __half2 h = __floats2half2_rn(lo_k, hi_k);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+constexpr int THREADS_V70 = 128;
+constexpr int CH_V70 = 32;
+
+template <int KV_MODE, bool SPLIT_HL>
+struct SmemDecV70 {
+    long long srow[CH_V70];          // 256 B
+    __align__(16) float sp[16][CH_V70 + 4];   // 2,304 B
+    float mrow[16];                  // 64 B
+    float lsum[16];                  // 64 B
+    float alpha[16];                 // 64 B
+    float qmax[4];                   // 16 B
+    __align__(16) __half qh[G][HD + 4];                                     // 6,240 B (G=12)
+    __align__(16) __half ql[SPLIT_HL ? G : 1][SPLIT_HL ? (HD + 4) : 1];     // 6,240 B if SPLIT_HL
+    // K and V staged together for modes 1/2/3 (only 1 barrier per 32 cells!); mode 0 (fp16) unions K and V.
+    static constexpr int K_BYTES = (KV_MODE == 0) ? (CH_V70 * 528) : (KV_MODE == 2 ? (CH_V70 * 144) : (CH_V70 * 272));
+    static constexpr int V_BYTES = (KV_MODE == 0) ? 16 : (KV_MODE == 1 ? (CH_V70 * 272) : (CH_V70 * 144));
+    __align__(16) uint8_t kbuf[K_BYTES];
+    __align__(16) uint8_t vbuf[V_BYTES];
+    float ks[(KV_MODE == 1 || KV_MODE == 3) ? CH_V70 : 1][4];
+    float vs[(KV_MODE == 1) ? CH_V70 : 1][4];
+    float vs_q4[(KV_MODE == 2 || KV_MODE == 3) ? CH_V70 : 1][8];
+};
+
+template <int KV_MODE, bool SPLIT_HL>
+__global__ void __launch_bounds__(THREADS_V70, SPLIT_HL ? 2 : 3)
+attn_chunk_v70_mma_kernel(const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+                          const int32_t* __restrict__ step, int n_kv_heads, int page_size, float scale,
+                          float* __restrict__ part_acc, float* __restrict__ part_m, float* __restrict__ part_l,
+                          int n_splits, int cap = 0, long long scratch_stride = 0) {
+    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+
+    const int n_ids = __ldg(step + kStepWidth);
+    const int sp_idx = blockIdx.x, kvh = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int slot = kvh * n_splits + sp_idx;
+    if (sp_idx * CHUNK >= n_ids) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+
+    __shared__ SmemDecV70<KV_MODE, SPLIT_HL> S;
+    const float* qkvh = q + (size_t) (kvh * G) * HD;
+
+    // 0. Load & scale Q ONCE for all 64-cell blocks handled by this split!
+    float qm = 0.0f;
+    const float4* q4 = reinterpret_cast<const float4*>(qkvh);
+    for (int i = t; i < G * (HD / 4); i += THREADS_V70) {
+        const float4 v = __ldg(q4 + i);
+        qm = fmaxf(qm, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
+    qm = warp_max(qm);
+    if (lane == 0) S.qmax[warp] = qm;
+    if (t < 16) { S.mrow[t] = -FLT_MAX; S.lsum[t] = 0.0f; S.alpha[t] = 0.0f; }
+    for (int i = t; i < (16 - G) * CH_V70; i += THREADS_V70)
+        S.sp[G + i / CH_V70][i % CH_V70] = 0.0f;
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) frexpf(qm, &qe);
+    const float qup = qm > 0.0f ? ldexpf(1.0f, 14 - qe) : 0.0f;
+    const float qdown = qm > 0.0f ? ldexpf(scale, qe - 14) : 0.0f;
+
+    for (int i = t; i < G * (HD / 4); i += THREADS_V70) {
+        const int h = i / (HD / 4);
+        const int d = (i % (HD / 4)) * 4;
+        const float4 v = __ldg(q4 + i);
+        const float x0 = v.x * qup, x1 = v.y * qup, x2 = v.z * qup, x3 = v.w * qup;
+        const __half2 h01 = __floats2half2_rn(x0, x1);
+        const __half2 h23 = __floats2half2_rn(x2, x3);
+        *reinterpret_cast<__half2*>(&S.qh[h][d]) = h01;
+        *reinterpret_cast<__half2*>(&S.qh[h][d + 2]) = h23;
+        if constexpr (SPLIT_HL) {
+            const float2 f01 = __half22float2(h01);
+            const float2 f23 = __half22float2(h23);
+            *reinterpret_cast<__half2*>(&S.ql[h][d]) = __floats2half2_rn(x0 - f01.x, x1 - f01.y);
+            *reinterpret_cast<__half2*>(&S.ql[h][d + 2]) = __floats2half2_rn(x2 - f23.x, x3 - f23.y);
+        }
+    }
+
+    const int qp = (lane >> 2) & 3;
+    const int jj = (lane & 3) + 4 * (lane >> 4);
+    const int crow = (lane & 1) + 4 * (lane >> 4);
+    const int ccol = lane & 2;
+    // Q*K^T mapping: warp w owns cells 8w..8w+7; (qp&1) picks head block rb; (qp>>1) picks dim half (0..127 / 128..255).
+    const int qk_rb = qp & 1;
+    const int qk_dh = qp >> 1;
+    const int qk_head = qk_rb * 8 + jj;
+    const int qk_cell = warp * 8 + jj;
+    // P*V mapping: warp w owns 64 output dims [64w..64w+63]; (qp>>1) picks head block pv_rb; (qp&1) picks 32-dim half db.
+    const int pv_rb = qp >> 1;
+    const int pv_db = qp & 1;
+    const int pv_head = pv_rb * 8 + jj;
+
+    float acc[4][8];
+    float accl[4][8];
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { acc[nt][i] = 0.0f; accl[nt][i] = 0.0f; }
+    }
+    float vmax_run = (KV_MODE == 0) ? 1.0f : 0.0f;
+
+    // Stride 64-cell blocks (exact match to attn_merge_v2_kernel's ceil(width / 64)), 2 x 32-cell sub-chunks each.
+    const int n_ids_bound = cap > 0 ? min(n_ids, ((cap + CHUNK - 1) / CHUNK) * CHUNK) : n_ids;
+    for (int blk64 = sp_idx; blk64 * CHUNK < n_ids_bound; blk64 += n_splits) {
+        for (int sub = 0; sub < 2; ++sub) {
+            const int c0 = blk64 * CHUNK + sub * CH_V70;
+            if (c0 >= n_ids_bound) break;
+            const int nh = min(CH_V70, n_ids_bound - c0);
+
+            __syncthreads();
+            if (t < CH_V70) {
+                long long r = -1;
+                if (t < nh) {
+                    const int cell = __ldg(ids + c0 + t);
+                    const long long page = (long long) __ldg(p.page_table + cell / page_size);
+                    if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                }
+                S.srow[t] = r;
+            }
+            __syncthreads();
+
+            // 1. Stage K (and V in parallel for modes 1/2/3!) in 128-bit uint4 bursts.
+            if constexpr (KV_MODE == 1 || KV_MODE == 3) {
+                uint4 kx[4];
+                int kc[4], ku[4];
+#pragma unroll
+                for (int s = 0; s < 4; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    kc[s] = idx >> 4;
+                    ku[s] = idx & 15;
+                    const long long r = S.srow[kc[s]];
+                    kx[s] = r >= 0 ? __ldg(reinterpret_cast<const uint4*>(p.k_q + r * HD) + ku[s]) : make_uint4(0, 0, 0, 0);
+                }
+                if constexpr (KV_MODE == 3) {
+                    // K8V4: also burst-load all 32 cells of Q4_0 V (288 uint4 / 128 threads <= 3 loads/thread)!
+                    constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+                    uint4 vx[3];
+                    int vidx[3];
+#pragma unroll
+                    for (int s = 0; s < 3; ++s) {
+                        const int idx = t + s * THREADS_V70;
+                        vidx[s] = idx;
+                        vx[s] = make_uint4(0, 0, 0, 0);
+                        if (idx < CH_V70 * 9) {
+                            const int c = idx / 9, u = idx - c * 9;
+                            const long long r = S.srow[c];
+                            if (r >= 0) vx[s] = __ldg(reinterpret_cast<const uint4*>(p.v_q4 + r * BYTES) + u);
+                        }
+                    }
+                    const int sc_c = t >> 2, sc_g = t & 3;
+                    const long long sc_r = S.srow[sc_c];
+                    const float ks_val = sc_r >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + sc_r * 4 + sc_g))) : 0.0f;
+#pragma unroll
+                    for (int s = 0; s < 4; ++s)
+                        *reinterpret_cast<uint4*>(S.kbuf + kc[s] * 272 + ku[s] * 16) = kx[s];
+                    uint4* vb4 = reinterpret_cast<uint4*>(S.vbuf);
+#pragma unroll
+                    for (int s = 0; s < 3; ++s)
+                        if (vidx[s] < CH_V70 * 9) vb4[vidx[s]] = vx[s];
+                    S.ks[sc_c][sc_g] = ks_val;
+                } else {
+                    // INT8: burst-load both K and V (4 uint4 each) + K/V scales in parallel!
+                    uint4 vx[4];
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        const long long r = S.srow[kc[s]];
+                        vx[s] = r >= 0 ? __ldg(reinterpret_cast<const uint4*>(p.v_q + r * HD) + ku[s]) : make_uint4(0, 0, 0, 0);
+                    }
+                    const int sc_c = t >> 2, sc_g = t & 3;
+                    const long long sc_r = S.srow[sc_c];
+                    const float ks_val = sc_r >= 0 ? __half2float(__ushort_as_half(__ldg(p.k_scale + sc_r * 4 + sc_g))) : 0.0f;
+                    const float vs_val = sc_r >= 0 ? __half2float(__ushort_as_half(__ldg(p.v_scale + sc_r * 4 + sc_g))) : 0.0f;
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        *reinterpret_cast<uint4*>(S.kbuf + kc[s] * 272 + ku[s] * 16) = kx[s];
+                        *reinterpret_cast<uint4*>(S.vbuf + kc[s] * 272 + ku[s] * 16) = vx[s];
+                    }
+                    S.ks[sc_c][sc_g] = ks_val;
+                    S.vs[sc_c][sc_g] = vs_val;
+                }
+            } else if constexpr (KV_MODE == 2) {
+                // Q4_0: burst-load both K and V (288 uint4 each)!
+                constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+                uint4 kx[3], vx[3];
+#pragma unroll
+                for (int s = 0; s < 3; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    kx[s] = make_uint4(0, 0, 0, 0);
+                    vx[s] = make_uint4(0, 0, 0, 0);
+                    if (idx < CH_V70 * 9) {
+                        const int c = idx / 9, u = idx - c * 9;
+                        const long long r = S.srow[c];
+                        if (r >= 0) {
+                            kx[s] = __ldg(reinterpret_cast<const uint4*>(p.k_q4 + r * BYTES) + u);
+                            vx[s] = __ldg(reinterpret_cast<const uint4*>(p.v_q4 + r * BYTES) + u);
+                        }
+                    }
+                }
+                uint4* kb4 = reinterpret_cast<uint4*>(S.kbuf);
+                uint4* vb4 = reinterpret_cast<uint4*>(S.vbuf);
+#pragma unroll
+                for (int s = 0; s < 3; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    if (idx < CH_V70 * 9) { kb4[idx] = kx[s]; vb4[idx] = vx[s]; }
+                }
+            } else {
+                // FP16: burst-load K (32 x 512 B = 1,024 uint4 -> 8 uint4/thread).
+                uint4 kx[8];
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    const int c = idx >> 5, u = idx & 31;
+                    const long long r = S.srow[c];
+                    kx[s] = r >= 0 ? __ldg(reinterpret_cast<const uint4*>(p.k_pool + r * HD) + u) : make_uint4(0, 0, 0, 0);
+                }
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    const int c = idx >> 5, u = idx & 31;
+                    *reinterpret_cast<uint4*>(S.kbuf + c * 528 + u * 16) = kx[s];
+                }
+            }
+            __syncthreads();
+
+            // 2. Q * K^T (0 extra barriers; 1 in-warp shuffle XOR 8 merges dims 0..127 and 128..255).
+            float total[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            const int cb0 = warp * 8 + ccol;
+            if constexpr (KV_MODE == 1 || KV_MODE == 3) {
+                const uint8_t* krow = S.kbuf + qk_cell * 272;
+#pragma unroll
+                for (int gl = 0; gl < 2; ++gl) {
+                    const int g = qk_dh * 2 + gl;
+                    float tg[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    float tgl[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                    for (int ks = 0; ks < 16; ++ks) {
+                        const int d0 = g * 64 + ks * 4;
+                        const uint32_t raw = *reinterpret_cast<const uint32_t*>(krow + d0);
+                        const uint32_t b0 = dec_i8x2_to_h2(raw & 0xffffu);
+                        const uint32_t b1 = dec_i8x2_to_h2(raw >> 16);
+                        const uint2 ah = qk_head < G ? *reinterpret_cast<const uint2*>(&S.qh[qk_head][d0]) : make_uint2(0, 0);
+                        dec_mma884(tg, ah.x, ah.y, b0, b1);
+                        if constexpr (SPLIT_HL) {
+                            const uint2 al = qk_head < G ? *reinterpret_cast<const uint2*>(&S.ql[qk_head][d0]) : make_uint2(0, 0);
+                            dec_mma884(tgl, al.x, al.y, b0, b1);
+                        }
+                    }
+                    const float sc0 = S.ks[cb0][g], sc1 = S.ks[cb0 + 1][g];
+                    const float sc4 = S.ks[cb0 + 4][g], sc5 = S.ks[cb0 + 5][g];
+                    const float sc[8] = {sc0, sc1, sc0, sc1, sc4, sc5, sc4, sc5};
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if constexpr (SPLIT_HL) total[i] = fmaf(tg[i] + tgl[i], sc[i], total[i]);
+                        else total[i] = fmaf(tg[i], sc[i], total[i]);
+                    }
+                }
+            } else if constexpr (KV_MODE == 2) {
+                constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+#pragma unroll
+                for (int bl = 0; bl < 4; ++bl) {
+                    const int b = qk_dh * 4 + bl;
+                    float tg[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    float tgl[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    const uint8_t* qs = S.kbuf + qk_cell * BYTES + b * 18 + 2;
+#pragma unroll
+                    for (int ks = 0; ks < 8; ++ks) {
+                        const int j0 = (ks & 3) * 4;
+                        const uint32_t w0 = qs[j0], w1 = qs[j0 + 1], w2 = qs[j0 + 2], w3 = qs[j0 + 3];
+                        const uint32_t b0 = (ks < 4) ? dec_u4x2_to_h2(w0, w1) : dec_u4x2_to_h2(w0 >> 4, w1 >> 4);
+                        const uint32_t b1 = (ks < 4) ? dec_u4x2_to_h2(w2, w3) : dec_u4x2_to_h2(w2 >> 4, w3 >> 4);
+                        const int d0 = b * 32 + ks * 4;
+                        const uint2 ah = qk_head < G ? *reinterpret_cast<const uint2*>(&S.qh[qk_head][d0]) : make_uint2(0, 0);
+                        dec_mma884(tg, ah.x, ah.y, b0, b1);
+                        if constexpr (SPLIT_HL) {
+                            const uint2 al = qk_head < G ? *reinterpret_cast<const uint2*>(&S.ql[qk_head][d0]) : make_uint2(0, 0);
+                            dec_mma884(tgl, al.x, al.y, b0, b1);
+                        }
+                    }
+                    auto get_kd = [&](int c) -> float {
+                        if (c >= nh || S.srow[c] < 0) return 0.0f;
+                        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(S.kbuf + c * BYTES) + b;
+                        return __half2float(__ushort_as_half(blk->d));
+                    };
+                    const float sc0 = get_kd(cb0), sc1 = get_kd(cb0 + 1), sc4 = get_kd(cb0 + 4), sc5 = get_kd(cb0 + 5);
+                    const float sc[8] = {sc0, sc1, sc0, sc1, sc4, sc5, sc4, sc5};
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if constexpr (SPLIT_HL) total[i] = fmaf(tg[i] + tgl[i], sc[i], total[i]);
+                        else total[i] = fmaf(tg[i], sc[i], total[i]);
+                    }
+                }
+            } else {
+                const uint8_t* krow = S.kbuf + qk_cell * 528;
+                float tot_l[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+                for (int ks = 0; ks < 32; ++ks) {
+                    const int d0 = qk_dh * 128 + ks * 4;
+                    const uint2 raw = *reinterpret_cast<const uint2*>(krow + d0 * 2);
+                    const uint2 ah = qk_head < G ? *reinterpret_cast<const uint2*>(&S.qh[qk_head][d0]) : make_uint2(0, 0);
+                    dec_mma884(total, ah.x, ah.y, raw.x, raw.y);
+                    if constexpr (SPLIT_HL) {
+                        const uint2 al = qk_head < G ? *reinterpret_cast<const uint2*>(&S.ql[qk_head][d0]) : make_uint2(0, 0);
+                        dec_mma884(tot_l, al.x, al.y, raw.x, raw.y);
+                    }
+                }
+                if constexpr (SPLIT_HL) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) total[i] += tot_l[i];
+                }
+            }
+            // Merge dim-half 0 (qp 0,1) and dim-half 1 (qp 2,3) via XOR-8 shuffle!
+#pragma unroll
+            for (int i = 0; i < 8; ++i) total[i] += __shfl_xor_sync(0xffffffffu, total[i], 8);
+            if (qk_dh == 0) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int row = qk_rb * 8 + crow + 2 * ((i >> 1) & 1);
+                    const int c = warp * 8 + ccol + 4 * (i >> 2) + (i & 1);
+                    if (row < G) S.sp[row][c] = (c < nh && S.srow[c] >= 0) ? total[i] * qdown : -FLT_MAX;
+                }
+            }
+            __syncthreads();
+
+            // 3. Online softmax over 32 cells (1 warp pass per head; for FP16 also load V into kbuf!).
+            if constexpr (KV_MODE == 0) {
+                uint4 vx[8];
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    const int c = idx >> 5, u = idx & 31;
+                    const long long r = S.srow[c];
+                    vx[s] = r >= 0 ? __ldg(reinterpret_cast<const uint4*>(p.v_pool + r * HD) + u) : make_uint4(0, 0, 0, 0);
+                }
+#pragma unroll
+                for (int s = 0; s < 8; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    const int c = idx >> 5, u = idx & 31;
+                    *reinterpret_cast<uint4*>(S.kbuf + c * 528 + u * 16) = vx[s];
+                }
+            }
+            for (int h = warp; h < G; h += 4) {
+                const float a = S.sp[h][lane];
+                const float m_ch = warp_max(a);
+                const float m_old = __shfl_sync(0xffffffffu, lane == 0 ? S.mrow[h] : 0.0f, 0);
+                const float m_new = fmaxf(m_old, m_ch);
+                const float e = (lane < nh && S.srow[lane] >= 0 && m_new > -FLT_MAX) ? __expf(a - m_new) : 0.0f;
+                S.sp[h][lane] = e;
+                const float l_ch = warp_sum(e);
+                if (lane == 0) {
+                    const float al = (m_old > -FLT_MAX && m_new > -FLT_MAX) ? __expf(m_old - m_new) : 0.0f;
+                    S.alpha[h] = al;
+                    S.lsum[h] = fmaf(S.lsum[h], al, l_ch);
+                    S.mrow[h] = m_new;
+                }
+            }
+            __syncthreads();
+
+            // 4. P * V (V is ALREADY in smem! Running vmax_run rescales `acc` directly in-place).
+            float cur_vmax = 1.0f;
+            if constexpr (KV_MODE == 2 || KV_MODE == 3) {
+                constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+                // Pre-decode all 32x8 Q4_0 V scales once across 128 threads (2 scales/thread, 0 branches in inner loop).
+#pragma unroll
+                for (int s = 0; s < 2; ++s) {
+                    const int idx = t + s * THREADS_V70;
+                    const int c = idx >> 3, b = idx & 7;
+                    float dv = 0.0f;
+                    if (c < nh && S.srow[c] >= 0) {
+                        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(S.vbuf + c * BYTES) + b;
+                        dv = __half2float(__ushort_as_half(blk->d));
+                    }
+                    S.vs_q4[c][b] = dv;
+                }
+                __syncthreads();
+                const float vm0 = warp_max(fabsf(S.vs_q4[lane][warp * 2]));
+                const float vm1 = warp_max(fabsf(S.vs_q4[lane][warp * 2 + 1]));
+                cur_vmax = pv_db == 0 ? vm0 : vm1;
+            } else if constexpr (KV_MODE == 1) {
+                cur_vmax = warp_max(fabsf(S.vs[lane][warp]));
+            }
+            const float new_vmax = fmaxf(vmax_run, cur_vmax);
+            const float v_ratio = (vmax_run > 0.0f && new_vmax > 0.0f) ? (vmax_run / new_vmax) : 0.0f;
+            const float a0 = S.alpha[pv_rb * 8 + crow] * v_ratio;
+            const float a1 = (pv_rb * 8 + crow + 2 < G) ? S.alpha[pv_rb * 8 + crow + 2] * v_ratio : 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const float sc_a = ((i >> 1) & 1) ? a1 : a0;
+                    acc[nt][i] *= sc_a;
+                    if constexpr (SPLIT_HL) accl[nt][i] *= sc_a;
+                }
+            }
+            vmax_run = new_vmax;
+            const float vup = vmax_run > 0.0f ? (16384.0f / vmax_run) : 0.0f;
+
+            if constexpr (KV_MODE == 2 || KV_MODE == 3) {
+                constexpr int BYTES = (HD / QK4_0) * (int) sizeof(block_q4_0);
+                const int b_blk = warp * 2 + pv_db;
+                const int b_off = b_blk * 18;
+                for (int c_rel = 0; c_rel < nh; c_rel += 4) {
+                    const float4 pv = *reinterpret_cast<const float4*>(&S.sp[pv_head][c_rel]);
+                    const float p0 = pv.x * (S.vs_q4[c_rel + 0][b_blk] * vup);
+                    const float p1 = pv.y * (S.vs_q4[c_rel + 1][b_blk] * vup);
+                    const float p2 = pv.z * (S.vs_q4[c_rel + 2][b_blk] * vup);
+                    const float p3 = pv.w * (S.vs_q4[c_rel + 3][b_blk] * vup);
+                    const uint32_t ah0 = dec_pack_h2(p0, p1);
+                    const uint32_t ah1 = dec_pack_h2(p2, p3);
+                    uint32_t al0 = 0, al1 = 0;
+                    if constexpr (SPLIT_HL) {
+                        const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&ah0));
+                        const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&ah1));
+                        al0 = dec_pack_h2(p0 - f01.x, p1 - f01.y);
+                        al1 = dec_pack_h2(p2 - f23.x, p3 - f23.y);
+                    }
+                    const uint8_t* qs0 = S.vbuf + (c_rel + 0) * BYTES + b_off + 2;
+                    const uint8_t* qs1 = S.vbuf + (c_rel + 1) * BYTES + b_off + 2;
+                    const uint8_t* qs2 = S.vbuf + (c_rel + 2) * BYTES + b_off + 2;
+                    const uint8_t* qs3 = S.vbuf + (c_rel + 3) * BYTES + b_off + 2;
+                    // Pair (nt, nt+2): read each qs byte ONCE and unpack both low (nt) and high (nt+2) nibbles!
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        const int bi = nt * 8 + jj;
+                        const uint32_t y0 = qs0[bi], y1 = qs1[bi], y2 = qs2[bi], y3 = qs3[bi];
+                        const uint32_t lo0 = dec_u4x2_to_h2(y0, y1);
+                        const uint32_t lo1 = dec_u4x2_to_h2(y2, y3);
+                        const uint32_t hi0 = dec_u4x2_to_h2(y0 >> 4, y1 >> 4);
+                        const uint32_t hi1 = dec_u4x2_to_h2(y2 >> 4, y3 >> 4);
+                        dec_mma884(acc[nt], ah0, ah1, lo0, lo1);
+                        dec_mma884(acc[nt + 2], ah0, ah1, hi0, hi1);
+                        if constexpr (SPLIT_HL) {
+                            dec_mma884(accl[nt], al0, al1, lo0, lo1);
+                            dec_mma884(accl[nt + 2], al0, al1, hi0, hi1);
+                        }
+                    }
+                }
+            } else if constexpr (KV_MODE == 1) {
+                for (int c_rel = 0; c_rel < nh; c_rel += 4) {
+                    float w[4];
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) w[e] = S.vs[c_rel + e][warp] * vup;
+                    const float4 pv = *reinterpret_cast<const float4*>(&S.sp[pv_head][c_rel]);
+                    const float p0 = pv.x * w[0], p1 = pv.y * w[1], p2 = pv.z * w[2], p3 = pv.w * w[3];
+                    const uint32_t ah0 = dec_pack_h2(p0, p1);
+                    const uint32_t ah1 = dec_pack_h2(p2, p3);
+                    uint32_t al0 = 0, al1 = 0;
+                    if constexpr (SPLIT_HL) {
+                        const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&ah0));
+                        const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&ah1));
+                        al0 = dec_pack_h2(p0 - f01.x, p1 - f01.y);
+                        al1 = dec_pack_h2(p2 - f23.x, p3 - f23.y);
+                    }
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) {
+                        const int d = warp * 64 + pv_db * 32 + nt * 8 + jj;
+                        const uint32_t x0 = (uint32_t) S.vbuf[(c_rel + 0) * 272 + d] |
+                                            ((uint32_t) S.vbuf[(c_rel + 1) * 272 + d] << 8);
+                        const uint32_t x1 = (uint32_t) S.vbuf[(c_rel + 2) * 272 + d] |
+                                            ((uint32_t) S.vbuf[(c_rel + 3) * 272 + d] << 8);
+                        const uint32_t b0 = dec_i8x2_to_h2(x0);
+                        const uint32_t b1 = dec_i8x2_to_h2(x1);
+                        dec_mma884(acc[nt], ah0, ah1, b0, b1);
+                        if constexpr (SPLIT_HL) dec_mma884(accl[nt], al0, al1, b0, b1);
+                    }
+                }
+            } else {
+                for (int c_rel = 0; c_rel < nh; c_rel += 4) {
+                    const float4 pv = *reinterpret_cast<const float4*>(&S.sp[pv_head][c_rel]);
+                    const float p0 = pv.x * vup, p1 = pv.y * vup, p2 = pv.z * vup, p3 = pv.w * vup;
+                    const uint32_t ah0 = dec_pack_h2(p0, p1);
+                    const uint32_t ah1 = dec_pack_h2(p2, p3);
+                    uint32_t al0 = 0, al1 = 0;
+                    if constexpr (SPLIT_HL) {
+                        const float2 f01 = __half22float2(*reinterpret_cast<const __half2*>(&ah0));
+                        const float2 f23 = __half22float2(*reinterpret_cast<const __half2*>(&ah1));
+                        al0 = dec_pack_h2(p0 - f01.x, p1 - f01.y);
+                        al1 = dec_pack_h2(p2 - f23.x, p3 - f23.y);
+                    }
+                    const __half* v0 = reinterpret_cast<const __half*>(S.kbuf + (c_rel + 0) * 528);
+                    const __half* v1 = reinterpret_cast<const __half*>(S.kbuf + (c_rel + 1) * 528);
+                    const __half* v2 = reinterpret_cast<const __half*>(S.kbuf + (c_rel + 2) * 528);
+                    const __half* v3 = reinterpret_cast<const __half*>(S.kbuf + (c_rel + 3) * 528);
+#pragma unroll
+                    for (int nt = 0; nt < 4; ++nt) {
+                        const int d = warp * 64 + pv_db * 32 + nt * 8 + jj;
+                        const __half2 h0 = __halves2half2(v0[d], v1[d]);
+                        const __half2 h1 = __halves2half2(v2[d], v3[d]);
+                        const uint32_t b0 = *reinterpret_cast<const uint32_t*>(&h0);
+                        const uint32_t b1 = *reinterpret_cast<const uint32_t*>(&h1);
+                        dec_mma884(acc[nt], ah0, ah1, b0, b1);
+                        if constexpr (SPLIT_HL) dec_mma884(accl[nt], al0, al1, b0, b1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Write final split partials (only once per split!).
+    if (t < G) {
+        part_m[slot * G + t] = S.mrow[t];
+        part_l[slot * G + t] = S.lsum[t];
+    }
+    const float vdown = vmax_run * (1.0f / 16384.0f);
+#pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int row = pv_rb * 8 + crow + 2 * ((i >> 1) & 1);
+            const int col = warp * 64 + pv_db * 32 + nt * 8 + ccol + 4 * (i >> 2) + (i & 1);
+            if (row < G) {
+                const float val = (SPLIT_HL ? (acc[nt][i] + accl[nt][i]) : acc[nt][i]) * vdown;
+                part_acc[((size_t) slot * G + row) * HD + col] = val;
+            }
+        }
+    }
+}
+
+int attn_v70_mode() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_ATTN_V70");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::atoi(v);
+    }();
+    if (env == 0) return 0;
+    static int cc[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (cc[dev] == 0) {
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return 0;
+        }
+        cc[dev] = 10 * major + minor;
+    }
+    if (cc[dev] != 70) return 0;
+    return env > 0 ? env : 2;   // default ON (mode 2: 2-pass hi+lo FP16 Q/P mma.m8n8k4, ~2e-6 precision) on sm_70
+}
+
+// Target <= 160 CTAs (2 full waves on 80-SM V100, zero tail wave), bounded by [1, n_chunks_cap] so partials always
+// fit in the caller's scratch and merge in 1..5 U=16 blocks.
+int attn_v70_splits(int64_t cap, int64_t n_head_kv, int64_t n_q) {
+    const int n_chunks_cap = (int) ((cap + CHUNK - 1) / CHUNK);
+    int want = (int) (160 / (n_q * n_head_kv));
+    if (want < 1) want = 1;
+    return want < n_chunks_cap ? want : n_chunks_cap;
+}
+
+void launch_v70_mma_chunks(int mode, int kv_mode, int n_splits, int64_t n_q, cudaStream_t st, const float* q,
+                           const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int n_kv_heads,
+                           int page_size, float scale, float* part_acc, float* part_m, float* part_l, int cap,
+                           long long stride) {
+    const dim3 grid((unsigned) n_splits, (unsigned) n_kv_heads, (unsigned) n_q);
+#define STRATA_ATTN_V70_L(M, HL) \
+    attn_chunk_v70_mma_kernel<M, HL><<<grid, THREADS_V70, 0, st>>>(q, pools, ids, steps, n_kv_heads, page_size, scale, \
+                                                                   part_acc, part_m, part_l, n_splits, cap, stride)
+    if (mode >= 2) {
+        if (kv_mode == 3) STRATA_ATTN_V70_L(3, true);
+        else if (kv_mode == 2) STRATA_ATTN_V70_L(2, true);
+        else if (kv_mode == 1) STRATA_ATTN_V70_L(1, true);
+        else STRATA_ATTN_V70_L(0, true);
+    } else {
+        if (kv_mode == 3) STRATA_ATTN_V70_L(3, false);
+        else if (kv_mode == 2) STRATA_ATTN_V70_L(2, false);
+        else if (kv_mode == 1) STRATA_ATTN_V70_L(1, false);
+        else STRATA_ATTN_V70_L(0, false);
+    }
+#undef STRATA_ATTN_V70_L
+}
+#endif  // !__HIPCC__ && STRATA_EXPERIMENTAL_SM60
+
 __global__ void __launch_bounds__(HD) attn_merge_kernel(const float* __restrict__ part_acc,
                                                         const float* __restrict__ part_m,
                                                         const float* __restrict__ part_l, int n_chunks,
@@ -1044,6 +1674,20 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         }
     } else
 #endif
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    if (kernel < 0 && !lane_cell) {
+        const int v70 = attn_v70_mode();
+        if (v70 > 0) {
+            const int nsp = attn_v70_splits(cap, s.n_head_kv, n_q);
+            float* pa = scratch;
+            float* pm = scratch + (size_t) nsp * s.n_head * HD;
+            float* pl = pm + (size_t) nsp * s.n_head;
+            launch_v70_mma_chunks(v70, kv_mode, nsp, n_q, st, q, pools, ids, steps, (int) s.n_head_kv,
+                                  (int) s.page_size, scale, pa, pm, pl, (int) cap, stride);
+            return;
+        }
+    }
+#endif
 #if !defined(__HIPCC__)
     if (kernel < 0 && kv_mode == 1 && attn_v3_on())   // (the parity harness names its kernel: never the environment)
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
@@ -1090,8 +1734,24 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::exit(1);
     }
     cudaStream_t st = (cudaStream_t) stream;
-    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
-    launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    if (!lane_cell_attn() && attn_v70_mode() > 0) {
+        const int nsp = attn_v70_splits(cap, s.n_head_kv, n_q);
+        const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
+        float* pa = scratch;
+        float* pm = scratch + (size_t) nsp * s.n_head * HD;
+        float* pl = pm + (size_t) nsp * s.n_head;
+        const int kv_mode = attn_kv_mode(pools);
+        const float scale = 1.0f / sqrtf((float) HD);
+        launch_v70_mma_chunks(attn_v70_mode(), kv_mode, nsp, n_q, st, q, pools, ids, steps, (int) s.n_head_kv,
+                              (int) s.page_size, scale, pa, pm, pl, (int) cap, stride);
+        launch_merge(attn_merge_v2(), pa, pm, pl, nsp, steps, attn, stride, (unsigned) s.n_head, (unsigned) n_q, st);
+    } else
+#endif
+    {
+        launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
+        launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
@@ -1236,6 +1896,18 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    if (const int v70 = attn_v70_mode(); v70 > 0) {
+        const int nsp = attn_v70_splits(cap, s.n_head_kv, 1);
+        float* pa = scratch;
+        float* pm = scratch + (size_t) nsp * s.n_head * HD;
+        float* pl = pm + (size_t) nsp * s.n_head;
+        launch_v70_mma_chunks(v70, kv_mode, nsp, 1, st, q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
+                              scale, pa, pm, pl, (int) cap, 0);
+        launch_merge(attn_merge_v2(), pa, pm, pl, nsp, step, attn, 0, (unsigned) s.n_head, 1u, st);
+    } else
+#endif
+    {
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
@@ -1255,6 +1927,7 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn: %s\n", cudaGetErrorString(e));
