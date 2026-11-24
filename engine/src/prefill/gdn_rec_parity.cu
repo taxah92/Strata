@@ -601,23 +601,40 @@ cudaError_t gdn_rec_chunked(float* state, const float* h, const float* gate, con
 cudaError_t gdn_rec_tc(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
                        cudaStream_t s) {
     if (T <= 0) return cudaSuccess;
-    {
-        int dev = 0, major = 0, sms = 0, smem = 0;
-        if (cudaGetDevice(&dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
-            cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
-            cudaGetLastError();
-            return cudaErrorNotSupported;
-        }
-        if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
+    int dev = 0, major = 0, minor = 0, sms = 0, smem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess) {
+        cudaGetLastError();
+        return cudaErrorNotSupported;
     }
+    const bool is_v70 = (major == 7 && minor == 0);
+    if (is_v70) {
+        if (sms < HV || (size_t) smem < kTcScanSmemV70) return cudaErrorNotSupported;
+        const GtcScratch sc = gdn_tc_scratch();
+        if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
+        static bool attrs_v70[64] = {};
+        if (dev >= 0 && dev < 64 && !attrs_v70[dev]) {
+            if (cudaFuncSetAttribute(gdn_tc_scan_v70_kernel<false, 3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmemV70) != cudaSuccess) {
+                cudaGetLastError();
+                return cudaErrorNotSupported;
+            }
+            attrs_v70[dev] = true;
+        }
+        for (int64_t t0 = 0; t0 < T; t0 += GSB) {
+            const int nch = (int) ((std::min<int64_t>(GSB, T - t0) + GCH - 1) / GCH);
+            gdn_tc_prep_v70_kernel<3><<<dim3((unsigned) nch, HK), 256, kTcPrepSmemV70, s>>>(h, gate, beta, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, t0, T);
+            gdn_tc_scan_v70_kernel<false, 3><<<HV, GTC_CW * 32, kTcScanSmemV70, s>>>(state, h, sc.ti, sc.te, sc.sc, sc.kq, sc.pi, y, t0, nch, T);
+        }
+        return cudaSuccess;
+    }
+    if (major < 8 || sms < HV || (size_t) smem < kTcScanSmem<false>) return cudaErrorNotSupported;
     const GtcScratch sc = gdn_tc_scratch();
     if (sc.ti == nullptr) return cudaErrorMemoryAllocation;
     {   // once a device
         static bool attrs[64] = {};
-        int dev = 0;
-        cudaGetDevice(&dev);
         if (dev >= 0 && dev < 64 && !attrs[dev]) {
             cudaFuncSetAttribute(gdn_tc_scan_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcScanSmem<false>);
             attrs[dev] = true;
@@ -1066,6 +1083,92 @@ template <bool SKIP> __global__ void st_dt_kernel(const float* d, const float* p
     gtc_prod_dt<SKIP>(dt, gtc_pow2(ed), ph, pl, ot);
     st_store_c<4>(ot, out, GCH, gtc_pow2(-(ed + eb)));
 }
+// Volta (sm_70) fragment self-test helpers (Layout 1: 16x16 tiles in c[NT][8])
+__device__ void st_v70_stage_k(uint16_t* kh, uint16_t* kl, const float* k) {
+    for (int p = threadIdx.x; p < GCH * S / 4; p += 32) {
+        const int t = p / (S / 4), r = (p % (S / 4)) * 4;
+        gtc_split_store4(kh + t * GTC_V70_KP + r, kl + t * GTC_V70_KP + r, *reinterpret_cast<const float4*>(k + t * S + r), 256.0f);
+    }
+    __syncwarp();
+}
+__device__ void st_v70_stage_kt(uint16_t* kh_T, uint16_t* kl_T, const float* k) {
+    for (int r = 0; r < S; ++r) {
+        const int t = threadIdx.x;
+        const float x = k[t * S + r] * 256.0f;
+        const __half hi = __float2half_rn(x);
+        kh_T[r * GTC_V70_KT + t] = __half_as_ushort(hi);
+        kl_T[r * GTC_V70_KT + t] = __half_as_ushort(__float2half_rn(x - __half2float(hi)));
+    }
+    __syncwarp();
+}
+template <int NT> __device__ void st_v70_load_c(float (&c)[NT][8], const float* m, int ld) {
+    const int lane = threadIdx.x & 31, g = lane & 3, qm = (lane >> 2) & 1, qn = (lane >> 3) & 1, hl = lane >> 4;
+    const int r0 = 8 * qm + 4 * hl + (g & 1), c0 = 8 * qn + (g & 2);
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+            c[j][q] = m[(r0 + (q & 2)) * ld + 16 * j + c0 + (q & 4) + (q & 1)];
+}
+template <int NT> __device__ void st_v70_store_c(const float (&c)[NT][8], float* m, int ld, float scale) {
+    const int lane = threadIdx.x & 31, g = lane & 3, qm = (lane >> 2) & 1, qn = (lane >> 3) & 1, hl = lane >> 4;
+    const int r0 = 8 * qm + 4 * hl + (g & 1), c0 = 8 * qn + (g & 2);
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+            m[(r0 + (q & 2)) * ld + 16 * j + c0 + (q & 4) + (q & 1)] = c[j][q] * scale;
+}
+template <int NT> __device__ float st_v70_max_abs(const float (&c)[NT][8]) {
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int q = 0; q < 8; ++q) m = fmaxf(m, fabsf(c[j][q]));
+    return gtc_warp_max(m);
+}
+__global__ void st_v70_state_kernel(const float* a, const float* k, float* out) {
+    __shared__ __align__(16) uint16_t kh[GCH * GTC_V70_KP], kl[GCH * GTC_V70_KP];
+    st_v70_stage_k(kh, kl, k);
+    float s[8][8];
+    st_v70_load_c<8>(s, a, S);
+    const int es = gtc_scale_exp(st_v70_max_abs<8>(s));
+    float xt[2][8] = {}, qs[2][8] = {};
+    gtc_v70_prod_state(s, gtc_pow2(es), kh, kl, kh, kl, xt, qs);
+    st_v70_store_c<2>(xt, out, GCH, gtc_pow2(-(8 + es)));
+}
+__global__ void st_v70_update_kernel(const float* s0, const float* dd, const float* k, float eL, float* out) {
+    __shared__ __align__(16) uint16_t kh_T[S * GTC_V70_KT], kl_T[S * GTC_V70_KT];
+    st_v70_stage_kt(kh_T, kl_T, k);
+    float s[8][8], dt[2][8], ddt[2][8];
+    st_v70_load_c<8>(s, s0, S);
+    st_v70_load_c<2>(dt, dd, GCH);
+    const int ed = gtc_scale_exp(st_v70_max_abs<2>(dt));
+    const float sD = gtc_pow2(ed), sPre = eL * gtc_pow2(ed + 8);
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int q = 0; q < 8; ++q) ddt[j][q] = dt[j][q] * sD;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+#pragma unroll
+        for (int q = 0; q < 8; ++q) s[j][q] *= sPre;
+    gtc_v70_update_state(s, ddt, kh_T, kl_T);
+    st_v70_store_c<8>(s, out, S, gtc_pow2(-(ed + 8)));
+}
+template <bool SKIP> __global__ void st_v70_dt_kernel(const float* d, const float* p, int eb, float* out) {
+    __shared__ __align__(16) uint16_t ph[GCH * GTC_V70_PP], pl[GCH * GTC_V70_PP];
+    for (int q = threadIdx.x; q < GCH * GCH / 4; q += 32) {
+        const int t = q / (GCH / 4), i = (q % (GCH / 4)) * 4;
+        gtc_split_store4(ph + t * GTC_V70_PP + i, pl + t * GTC_V70_PP + i, *reinterpret_cast<const float4*>(p + t * GCH + i), gtc_pow2(eb));
+    }
+    __syncwarp();
+    float dt[2][8], ot[2][8] = {};
+    st_v70_load_c<2>(dt, d, GCH);
+    const int ed = gtc_scale_exp(st_v70_max_abs<2>(dt));
+    gtc_v70_prod_dt<SKIP>(dt, gtc_pow2(ed), ph, pl, ot);
+    st_v70_store_c<2>(ot, out, GCH, gtc_pow2(-(ed + eb)));
+}
 int st_scale_exp(const std::vector<float>& m) {   // the prep's gtc_scale_exp on the host: max |m| into [2^14, 2^15)
     float mx = 0.0f;
     for (float x : m) mx = std::max(mx, std::fabs(x));
@@ -1101,8 +1204,8 @@ double st_max_rel(const std::vector<float>& got, const std::vector<double>& ref)
     }
     return mv > 0.0 ? md / mv : md;
 }
-int selftest_frag() {
-    std::printf("--selftest-frag: the tensor-core scan's fragment helpers, one warp each\n");
+int selftest_frag(bool is_v70 = false) {
+    std::printf("--selftest-frag (%s): the tensor-core scan's fragment helpers, one warp each\n", is_v70 ? "sm_70 m8n8k4" : "sm_80+ m16n8k16");
     int fails = 0;
     StRng rng(0x5e1f7e57ULL);
     auto unit_rows = [&](std::vector<float>& k, int rows, int cols) {   // gaussian rows, L2-normalized
@@ -1112,7 +1215,7 @@ int selftest_frag() {
             for (int r = 0; r < cols; ++r) k[t * cols + r] = (float) (k[t * cols + r] / std::sqrt(ss));
         }
     };
-    {   // (b) X^T = S^T K^T: f16x3 with the state's 2^es and k's 2^8, B by ldmatrix
+    {   // (b) X^T = S^T K^T: f16x3 with the state's 2^es and k's 2^8
         std::vector<float> a(16 * S), k(GCH * S);
         for (float& x : a) x = rng.logmag(-3.0f, 2.0f);
         unit_rows(k, GCH, S);
@@ -1126,14 +1229,15 @@ int selftest_frag() {
         float* da = st_upload(a);
         float* dk = st_upload(k);
         float* dout = dalloc<float>(16 * GCH);
-        st_state_kernel<<<1, 32>>>(da, dk, dout);
+        if (is_v70) st_v70_state_kernel<<<1, 32>>>(da, dk, dout);
+        else st_state_kernel<<<1, 32>>>(da, dk, dout);
         const double rel = st_max_rel(st_download(dout, 16 * GCH), ref);
         const bool bad = !(rel <= 2e-6);
-        std::printf("  (b) X^T = S^T K^T (16x128 . 128x32, f16x3, 2^es 2^8, ldmatrix): max |diff| / max |ref| %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        std::printf("  (b) X^T = S^T K^T (16x128 . 128x32, f16x3, 2^es 2^8): max |diff| / max |ref| %.2e  %s\n", rel, bad ? "FAIL" : "ok");
         fails += bad;
         cudaFree(da); cudaFree(dk); cudaFree(dout);
     }
-    {   // (c) S^T = eL S^T + Dd^T K: ldmatrix.trans, 2^ed, the accumulator scaled before and after
+    {   // (c) S^T = eL S^T + Dd^T K: 2^ed, the accumulator scaled before and after
         std::vector<float> s0(16 * S), dd(16 * GCH), k(GCH * S);
         for (float& x : s0) x = rng.logmag(-3.0f, 2.0f);
         for (float& x : dd) x = rng.logmag(-3.0f, 2.0f);
@@ -1150,14 +1254,15 @@ int selftest_frag() {
         float* dd_ = st_upload(dd);
         float* dk = st_upload(k);
         float* dout = dalloc<float>(16 * S);
-        st_update_kernel<<<1, 32>>>(ds, dd_, dk, eL, dout);
+        if (is_v70) st_v70_update_kernel<<<1, 32>>>(ds, dd_, dk, eL, dout);
+        else st_update_kernel<<<1, 32>>>(ds, dd_, dk, eL, dout);
         const double rel = st_max_rel(st_download(dout, 16 * S), ref);
         const bool bad = !(rel <= 2e-6);
-        std::printf("  (c) S^T = eL S^T + Dd^T K (16x32 . 32x128, f16x3, ldmatrix.trans, 2^ed pre / post scale): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
+        std::printf("  (c) S^T = eL S^T + Dd^T K (16x32 . 32x128, f16x3, 2^ed pre / post scale): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
         fails += bad;
         cudaFree(ds); cudaFree(dd_); cudaFree(dk); cudaFree(dout);
     }
-    {   // (d) D^T = Y^T T^T on f16x3 through gtc_prod_dt, a full random T of wide range with the prep's 2^et
+    {   // (d) D^T = Y^T T^T on f16x3, a full random T of wide range with the prep's 2^et
         std::vector<float> y(16 * GCH), t(GCH * GCH);
         for (float& x : y) x = rng.logmag(-3.0f, 2.0f);
         for (float& x : t) x = rng.logmag(-2.0f, 3.0f);
@@ -1171,7 +1276,8 @@ int selftest_frag() {
         float* dy = st_upload(y);
         float* dt_ = st_upload(t);
         float* dout = dalloc<float>(16 * GCH);
-        st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), dout);
+        if (is_v70) st_v70_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), dout);
+        else st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), dout);
         const double rel = st_max_rel(st_download(dout, 16 * GCH), ref);
         const bool bad = !(rel <= 2e-6);
         std::printf("  (d) D^T = Y^T T^T (16x32 . 32x32, f16x3, Y x 2^ey, T x 2^et): %.2e  %s\n", rel, bad ? "FAIL" : "ok");
@@ -1201,18 +1307,28 @@ int selftest_frag() {
         float* dp = st_upload(p);
         float* full = dalloc<float>(16 * GCH);
         float* skip = dalloc<float>(16 * GCH);
-        st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), full);
-        st_dt_kernel<true><<<1, 32>>>(dy, dt_, st_scale_exp(t), skip);
+        if (is_v70) {
+            st_v70_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), full);
+            st_v70_dt_kernel<true><<<1, 32>>>(dy, dt_, st_scale_exp(t), skip);
+        } else {
+            st_dt_kernel<false><<<1, 32>>>(dy, dt_, st_scale_exp(t), full);
+            st_dt_kernel<true><<<1, 32>>>(dy, dt_, st_scale_exp(t), skip);
+        }
         const std::vector<float> f1 = st_download(full, 16 * GCH), s1 = st_download(skip, 16 * GCH);
         const unsigned long long diff1 = std::memcmp(f1.data(), s1.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
         const double rel1 = st_max_rel(s1, ref_d);
-        st_dt_kernel<false><<<1, 32>>>(dd_, dp, 8, full);
-        st_dt_kernel<true><<<1, 32>>>(dd_, dp, 8, skip);
+        if (is_v70) {
+            st_v70_dt_kernel<false><<<1, 32>>>(dd_, dp, 8, full);
+            st_v70_dt_kernel<true><<<1, 32>>>(dd_, dp, 8, skip);
+        } else {
+            st_dt_kernel<false><<<1, 32>>>(dd_, dp, 8, full);
+            st_dt_kernel<true><<<1, 32>>>(dd_, dp, 8, skip);
+        }
         const std::vector<float> f2 = st_download(full, 16 * GCH), s2 = st_download(skip, 16 * GCH);
         const unsigned long long diff2 = std::memcmp(f2.data(), s2.data(), 16 * GCH * 4) != 0 ? diff_words(full, skip, 16 * GCH * 4) : 0;
         const double rel2 = st_max_rel(s2, ref_o);
         const bool bad = diff1 != 0 || diff2 != 0 || !(rel1 <= 2e-6) || !(rel2 <= 2e-6);
-        std::printf("  (e) triangle skipping: D^T 10 of 16 tiles %llu words differ (vs FP64 %.2e), o^T 6 of 8 tiles %llu words differ (vs FP64 %.2e)  %s\n",
+        std::printf("  (e) triangle skipping: D^T %llu words differ (vs FP64 %.2e), o^T %llu words differ (vs FP64 %.2e)  %s\n",
                     diff1, rel1, diff2, rel2, bad ? "FAIL" : "ok");
         fails += bad;
         cudaFree(dy); cudaFree(dt_); cudaFree(dd_); cudaFree(dp); cudaFree(full); cudaFree(skip);
@@ -1723,9 +1839,10 @@ int main(int argc, char** argv) {
     ck(cudaGetDeviceProperties(&p, 0), "device");
     std::printf("gdn_rec_parity on %s (sm_%d%d)\n", p.name, p.major, p.minor);
     int fails = 0;
-    if (do_self) {   // the tensor-core helpers alone (one warp each, any sm_80+ card; the device code below sm_80 traps)
-        if (p.major < 8) { std::printf("--selftest-frag: the tensor-core helpers need sm_80 or newer (skipped)\n"); return 77; }
-        fails = selftest_frag();
+    if (do_self) {   // the tensor-core helpers alone (one warp each, sm_70 or sm_80+)
+        const bool is_v70 = (p.major == 7 && p.minor == 0);
+        if (p.major < 8 && !is_v70) { std::printf("--selftest-frag: the tensor-core helpers need sm_70 or sm_80+ (skipped)\n"); return 77; }
+        fails = selftest_frag(is_v70);
         std::printf("gdn_rec_parity: %d failures\n", fails);
         return fails ? 1 : 0;
     }
