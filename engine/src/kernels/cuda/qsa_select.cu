@@ -972,6 +972,528 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
     }
 }
 
+#if !defined(__HIPCC__)
+// ---- PR 3.2 (STRATA_TOPK_COMPACT / STRATA_QSA_TOPK_FP16): 2-pass exact long-row top-k over a bounded candidate set.
+// Adapted from jmnargi/Strata-V100 PR #103 (MIT, commits 53a36c9b + 36bd991b) and 1CatAI/1Cat-vLLM #1171, enhanced to
+// 2 score passes (instead of wide's 6 and Strata-V100's 4) plus a multi-CTA decode path for nq <= 16:
+//   Pass 1: weighted 4,096-bin histogram over a monotone 12-bit half-rounded key finds the cutoff bucket `coarse_bin`,
+//           `above` (< width <= 2,051 -> <= 513 blocks), and `bucket` (accepted when <= TC_CAND * R - 3 -> <= TC_CAND).
+//   Pass 2: collects blocks with ck > coarse_bin directly into sel_packed (<= 514 blocks) and blocks with ck == coarse_bin
+//           into (cand_blk, cand_key) in shared memory (<= TC_CAND = 4,096 blocks, 32 KiB).
+//   Refine + emit (0 HBM2 reads of scores): exact 4-pass byte-radix on cand_key in shared memory gives the exact 32-bit
+//           pivot and eq_budget; bitonic sort resolves ascending-index ties on eq_blk and sorts the <= 514 selected
+//           blocks by block index, emitting cells in strictly ascending order.
+// Any NaN, concentrated/oversized bucket, or short row (< TC_MIN_CELLS) sets g_tk_fail[qi] = 1 and is re-run by
+// block_topk_wide_kernel<true> in the same call, guaranteeing bitwise-identical IDs to block_topk_kernel.
+// Signed zeros share both tc_coarse_key and order_key (normalized to +0.0f).
+constexpr int TC_CBINS = 4096;          // 12 bits of the monotone half key: 4 bins/thread, one block scan
+constexpr int TC_CAND = 4096;           // max candidate blocks in cutoff bucket (16,381 cells max)
+constexpr int TC_SEL_CAP = 1024;        // power-of-2 buffer for <= 514 selected blocks (bitonic sort in smem)
+constexpr int64_t TC_MIN_CELLS = 16000; // below ~16K cells wide is as fast; avoids splitting 16K/32K batches
+constexpr int TCM_MAXQ = 16;            // multi-CTA compact decode path covers verify (1..6) and lookup (1..12)
+constexpr int TCM_T = 256;              // threads/CTA in multi-CTA hist & gather (16 KiB smem -> high SM occupancy)
+static_assert(TC_CBINS == 4 * TK_T, "tc_choose_coarse scans four bins per thread");
+static_assert(TC_CAND % TK_T == 0, "tc_refine_and_emit buffers per-thread eq candidates in registers");
+static_assert(TC_SEL_CAP >= 516, "selected block buffer must hold floor(2051/4) + 2 blocks");
+
+__device__ __forceinline__ uint32_t tc_coarse_key(float v) {
+    if (v == 0.0f) v = 0.0f;            // fold -0.0 into +0.0, matching order_key
+    const uint16_t h = __half_as_ushort(__float2half_rn(v));
+    const uint32_t ordered = (h & 0x8000u) ? (uint32_t) (uint16_t) ~h : (uint32_t) (uint16_t) (h | 0x8000u);
+    return ordered >> 4;                // 12 bits: sign, 5 exponent bits, 6 mantissa bits
+}
+
+struct TcShared {
+    // Coarse histogram (16 KiB) is dead before candidate gather (32 KiB); cand_key is dead before eq_blk sort.
+    union {
+        uint32_t coarse[TC_CBINS];
+        struct {
+            int32_t cand_blk[TC_CAND];
+            uint32_t cand_key[TC_CAND];
+        } c;
+        struct {
+            int32_t cand_blk[TC_CAND];
+            uint32_t eq_blk[TC_CAND];
+        } e;
+    } u;
+    uint32_t sel_packed[TC_SEL_CAP];    // (blk << 2) | (take - 1), padded with 0xFFFFFFFFu for bitonic sort
+    uint32_t hist[256];
+    int s_warp[33];
+    int s_pmin[TK_T / 32], s_pmax[TK_T / 32];
+    uint32_t sel, above, bucket, n_gt, n_cand, n_eq;
+    int invalid;
+};
+static_assert(sizeof(TcShared) <= 48 * 1024, "compact selector must fit the 48 KiB static shared memory budget");
+
+__device__ __forceinline__ void tc_choose_coarse(const uint32_t* coarse, int* s_warp, uint32_t rem, uint32_t& sel,
+                                                 uint32_t& above, uint32_t& count) {
+    const int t = threadIdx.x;
+    uint32_t v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = coarse[TC_CBINS - 1 - 4 * t - i];
+    const uint32_t sum = v[0] + v[1] + v[2] + v[3];
+    int total = 0;
+    const uint32_t before = (uint32_t) block_excl_scan((int) sum, s_warp, total);
+    (void) total;
+    __syncthreads();
+    if (before < rem && before + sum >= rem) {
+        uint32_t cum = before;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (cum + v[i] >= rem) {
+                sel = (uint32_t) (TC_CBINS - 1 - 4 * t - i);
+                above = cum;
+                count = v[i];
+                break;
+            }
+            cum += v[i];
+        }
+    }
+}
+
+__device__ __forceinline__ void tc_choose_byte(const uint32_t* hist, int* s_warp, uint32_t rem, uint32_t& sel,
+                                               uint32_t& above, uint32_t& count) {
+    const int t = threadIdx.x;
+    const uint32_t v = t < 256 ? hist[255 - t] : 0u;
+    int total = 0;
+    const uint32_t before = (uint32_t) block_excl_scan((int) v, s_warp, total);
+    (void) total;
+    __syncthreads();
+    if (v != 0u && before < rem && before + v >= rem) {
+        sel = (uint32_t) (255 - t);
+        above = before;
+        count = v;
+    }
+}
+
+__device__ __forceinline__ void tc_bitonic_sort_u32(uint32_t* arr, uint32_t n) {
+    if (n <= 1u) return;
+    const uint32_t t = (uint32_t) threadIdx.x;
+    uint32_t p2 = 1u;
+    while (p2 < n) p2 <<= 1;
+    for (uint32_t i = n + t; i < p2; i += (uint32_t) TK_T) arr[i] = 0xffffffffu;
+    __syncthreads();
+    const uint32_t half = p2 >> 1;
+    for (uint32_t k = 2u; k <= p2; k <<= 1) {
+        for (uint32_t j = k >> 1; j > 0u; j >>= 1) {
+            for (uint32_t idx = t; idx < half; idx += (uint32_t) TK_T) {
+                const uint32_t i1 = ((idx & ~(j - 1u)) << 1) | (idx & (j - 1u));
+                const uint32_t i2 = i1 | j;
+                const bool asc = (i1 & k) == 0u;
+                const uint32_t a = arr[i1], b = arr[i2];
+                if ((a > b) == asc) {
+                    arr[i1] = b;
+                    arr[i2] = a;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+// Shared exact refinement + ascending-cell emit (0 HBM2 reads of scores): used by both 1-CTA and multi-CTA compact.
+__device__ __forceinline__ void tc_refine_and_emit(TcShared& sh, int64_t n_bid, int64_t n_kv, int64_t width,
+                                                   uint32_t rem_init, int32_t* out, int64_t qi) {
+    const int t = threadIdx.x;
+    auto fail = [&] { if (t == 0) g_tk_fail[qi] = 1; };
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+    const uint32_t n_cand = sh.n_cand;
+    if (sh.n_gt > (uint32_t) TC_SEL_CAP || n_cand == 0u || n_cand > (uint32_t) TC_CAND) { fail(); return; }
+    uint32_t prefix = 0u;
+    uint32_t rem = rem_init;
+#pragma unroll
+    for (int pass = 0; pass < 4; ++pass) {
+        const int shift = 24 - 8 * pass;
+        if (t < 256) sh.hist[t] = 0u;
+        if (t == 0) { sh.sel = 0u; sh.above = 0u; sh.bucket = 0u; }
+        __syncthreads();
+        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        for (uint32_t i = (uint32_t) t; i < n_cand; i += (uint32_t) TK_T) {
+            const uint32_t k = sh.u.c.cand_key[i];
+            if ((k & hi_mask) == (prefix & hi_mask))
+                atomicAdd(&sh.hist[(k >> shift) & 255u], (unsigned) weight(sh.u.c.cand_blk[i]));
+        }
+        __syncthreads();
+        tc_choose_byte(sh.hist, sh.s_warp, rem, sh.sel, sh.above, sh.bucket);
+        __syncthreads();
+        if (sh.bucket == 0u || sh.above >= rem) { fail(); return; }
+        prefix |= sh.sel << shift;
+        rem -= sh.above;
+        __syncthreads();   // all warps must finish reading sh.{sel,above,bucket} before pass+1 zeroes them
+    }
+    const uint32_t pivot = prefix;
+    const uint32_t eq_budget = rem;
+    // Split candidates into > pivot (added to sel_packed) and == pivot (4 scalar regs so cand_key can be reused, 0 stack).
+    static_assert(TC_CAND / TK_T == 4, "scalar unroll assumes 4 candidates per thread");
+    int32_t eq0 = -1, eq1 = -1, eq2 = -1, eq3 = -1;
+#pragma unroll
+    for (int m = 0; m < 4; ++m) {
+        const uint32_t i = (uint32_t) t + (uint32_t) m * (uint32_t) TK_T;
+        if (i < n_cand) {
+            const uint32_t k = sh.u.c.cand_key[i];
+            const int32_t b = sh.u.c.cand_blk[i];
+            if (k > pivot) {
+                const uint32_t slot = atomicAdd(&sh.n_gt, 1u);
+                if (slot < (uint32_t) TC_SEL_CAP)
+                    sh.sel_packed[slot] = ((uint32_t) b << 2) | (uint32_t) (weight(b) - 1);
+            } else if (k == pivot) {
+                if (m == 0) eq0 = b;
+                else if (m == 1) eq1 = b;
+                else if (m == 2) eq2 = b;
+                else eq3 = b;
+            }
+        }
+    }
+    if (t == 0) sh.n_eq = 0u;
+    __syncthreads();   // u.c.cand_key is now dead; reuse as u.e.eq_blk
+    if (eq0 >= 0) { const uint32_t slot = atomicAdd(&sh.n_eq, 1u); if (slot < (uint32_t) TC_CAND) sh.u.e.eq_blk[slot] = (uint32_t) eq0; }
+    if (eq1 >= 0) { const uint32_t slot = atomicAdd(&sh.n_eq, 1u); if (slot < (uint32_t) TC_CAND) sh.u.e.eq_blk[slot] = (uint32_t) eq1; }
+    if (eq2 >= 0) { const uint32_t slot = atomicAdd(&sh.n_eq, 1u); if (slot < (uint32_t) TC_CAND) sh.u.e.eq_blk[slot] = (uint32_t) eq2; }
+    if (eq3 >= 0) { const uint32_t slot = atomicAdd(&sh.n_eq, 1u); if (slot < (uint32_t) TC_CAND) sh.u.e.eq_blk[slot] = (uint32_t) eq3; }
+    __syncthreads();
+    const uint32_t n_eq = sh.n_eq;
+    const uint32_t n_gt = sh.n_gt;
+    if (n_eq == 0u || n_eq > (uint32_t) TC_CAND || n_gt > (uint32_t) TC_SEL_CAP) { fail(); return; }
+    tc_bitonic_sort_u32(sh.u.e.eq_blk, n_eq);
+    // In strictly ascending eq_blk[0..n_eq-1], only the largest block can be the partial tail n_bid;
+    // every preceding block has weight R, so cells before index i is exactly i * R.
+    const uint32_t n_eq_take = (eq_budget + (uint32_t) R - 1u) / (uint32_t) R;
+    if (n_eq_take > n_eq || n_gt + n_eq_take > (uint32_t) TC_SEL_CAP) { fail(); return; }
+    if ((uint32_t) t < n_eq_take) {
+        const int32_t b = (int32_t) sh.u.e.eq_blk[t];
+        const int w = weight(b);
+        const int left = (int) eq_budget - (int) ((uint32_t) t * (uint32_t) R);
+        const int take = left < w ? left : w;
+        sh.sel_packed[n_gt + (uint32_t) t] = ((uint32_t) b << 2) | (uint32_t) (take - 1);
+    }
+    const uint32_t n_sel = n_gt + n_eq_take;
+    __syncthreads();
+    tc_bitonic_sort_u32(sh.sel_packed, n_sel);
+    const int my_take = (uint32_t) t < n_sel ? (int) ((sh.sel_packed[t] & 3u) + 1u) : 0;
+    int total = 0;
+    const int wpos = block_excl_scan(my_take, sh.s_warp, total);
+    if (total != (int) width) { fail(); return; }
+    if ((uint32_t) t < n_sel) {
+        const int32_t b = (int32_t) (sh.sel_packed[t] >> 2);
+        for (int c = 0; c < my_take; ++c) out[wpos + c] = b * R + c;
+    }
+    if (t == 0) g_tk_fail[qi] = 0;
+}
+
+__global__ void __launch_bounds__(TK_T) block_topk_compact_kernel(const float* __restrict__ scores,
+                                                                  const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                                  int64_t cap, int32_t* __restrict__ ids) {
+    __shared__ TcShared sh;
+    const int64_t qi = blockIdx.x;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    int32_t* out = ids + qi * cap;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    auto fail = [&] { if (t == 0) g_tk_fail[qi] = 1; };
+    if (n_kv <= width) {
+        for (int64_t j = t; j < n_kv; j += TK_T) out[j] = (int32_t) j;
+        if (t == 0) g_tk_fail[qi] = 0;
+        return;
+    }
+    const float* sc = scores + qi * max_blocks;
+    const int64_t nb = n_bid + 1;
+    auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+    if (n_bid < 1024 || n_kv < TC_MIN_CELLS || width > 2051 || nb > (1LL << 29)) { fail(); return; }
+    // 1. 1,024-sample probe: decline visibly concentrated or NaN rows early.
+    if (t == 0) sh.invalid = 0;
+    __syncthreads();
+    const int64_t pb = (int64_t) warp * (n_bid >> 5) + lane;
+    const float probe = __ldg(sc + pb);
+    if (!(probe == probe)) atomicExch(&sh.invalid, 1);
+    const uint32_t pk = tc_coarse_key(probe);
+    uint32_t pmin = pk, pmax = pk;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        pmin = min(pmin, __shfl_xor_sync(0xffffffffu, pmin, o));
+        pmax = max(pmax, __shfl_xor_sync(0xffffffffu, pmax, o));
+    }
+    if (lane == 0) { sh.s_pmin[warp] = (int) pmin; sh.s_pmax[warp] = (int) pmax; }
+    __syncthreads();
+    if (t == 0) {
+        int mn = 0x7fffffff, mx = 0;
+        for (int w2 = 0; w2 < TK_T / 32; ++w2) {
+            mn = sh.s_pmin[w2] < mn ? sh.s_pmin[w2] : mn;
+            mx = sh.s_pmax[w2] > mx ? sh.s_pmax[w2] : mx;
+        }
+        if (mn == mx) sh.invalid |= 2;
+    }
+    __syncthreads();
+    if (sh.invalid) { fail(); return; }
+    __syncthreads();
+    // 2. Pass 1 over scores: weighted 4,096-bin coarse histogram + NaN check.
+    for (int i = t; i < TC_CBINS; i += TK_T) sh.u.coarse[i] = 0u;
+    if (t == 0) { sh.invalid = 0; sh.sel = 0u; sh.above = 0u; sh.bucket = 0u; }
+    __syncthreads();
+    for (int64_t b = t; b < nb; b += TK_T) {
+        const int w = weight(b);
+        if (w == 0) continue;
+        const float s = __ldg(sc + b);
+        if (!(s == s)) atomicExch(&sh.invalid, 1);
+        atomicAdd(&sh.u.coarse[tc_coarse_key(s)], (unsigned) w);
+    }
+    __syncthreads();
+    if (sh.invalid) { fail(); return; }
+    tc_choose_coarse(sh.u.coarse, sh.s_warp, (uint32_t) width, sh.sel, sh.above, sh.bucket);
+    __syncthreads();
+    if (sh.above >= (uint32_t) width || sh.bucket == 0u || sh.bucket > (uint32_t) (TC_CAND * R - 3) ||
+        sh.above + sh.bucket < (uint32_t) width) {
+        fail();
+        return;
+    }
+    const uint32_t coarse_bin = sh.sel;
+    const uint32_t rem_init = (uint32_t) width - sh.above;
+    if (t == 0) { sh.n_gt = 0u; sh.n_cand = 0u; }
+    __syncthreads();   // sh.u.coarse is dead; reuse union as sh.u.c.{cand_blk, cand_key}
+    // 3. Pass 2 (final HBM2 read of scores): collect > coarse_bin and == coarse_bin.
+    for (int64_t b = t; b < nb; b += TK_T) {
+        const int w = weight(b);
+        if (w == 0) continue;
+        const float s = __ldg(sc + b);
+        const uint32_t ck = tc_coarse_key(s);
+        if (ck > coarse_bin) {
+            const uint32_t slot = atomicAdd(&sh.n_gt, 1u);
+            if (slot < (uint32_t) TC_SEL_CAP)
+                sh.sel_packed[slot] = ((uint32_t) b << 2) | (uint32_t) (w - 1);
+        } else if (ck == coarse_bin) {
+            const uint32_t slot = atomicAdd(&sh.n_cand, 1u);
+            if (slot < (uint32_t) TC_CAND) {
+                sh.u.c.cand_blk[slot] = (int32_t) b;
+                sh.u.c.cand_key[slot] = order_key(s);
+            }
+        }
+    }
+    __syncthreads();
+    // 4. Exact 32-bit pivot refinement + ascending-cell emit in shared memory.
+    tc_refine_and_emit(sh, n_bid, n_kv, width, rem_init, out, qi);
+}
+
+// ---- Multi-CTA 2-pass compact for decode-sized calls (nq <= TCM_MAXQ = 16): saturates all 80 SMs on Volta with
+// fixed grid dim3(M, nq) (CUDA-Graph-safe, 0 cudaMemsetAsync: choose self-zeros coarse[], finish self-zeros meta[0]).
+__device__ uint32_t g_tcm_coarse[TCM_MAXQ][TC_CBINS];
+__device__ int32_t g_tcm_cand_blk[TCM_MAXQ][TC_CAND];
+__device__ uint32_t g_tcm_cand_key[TCM_MAXQ][TC_CAND];
+__device__ uint32_t g_tcm_gt[TCM_MAXQ][TC_SEL_CAP];
+__device__ uint32_t g_tcm_meta[TCM_MAXQ][6];   // [0]=status(0 ok,1 fail,2 ident), [1]=bin, [2]=above, [3]=rem, [4]=n_gt, [5]=n_cand
+
+__global__ void __launch_bounds__(TCM_T) block_topk_cm_hist_kernel(const float* __restrict__ scores,
+                                                                   const int32_t* __restrict__ steps,
+                                                                   int64_t max_blocks) {
+    __shared__ uint32_t s_coarse[TC_CBINS];
+    __shared__ int s_invalid;
+    const int64_t qi = blockIdx.y;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+    if (n_kv <= width) return;
+    const int t = threadIdx.x;
+    const int64_t nb = n_bid + 1;
+    if (n_bid < 1024 || n_kv < TC_MIN_CELLS || width > 2051 || nb > (1LL << 29)) {
+        if (blockIdx.x == 0 && t == 0) g_tcm_meta[qi][0] = 1u;
+        return;
+    }
+    const int64_t m = (int64_t) gridDim.x;
+    const int64_t per_cta = (nb + m - 1) / m;
+    const int64_t b0 = (int64_t) blockIdx.x * per_cta;
+    if (b0 >= nb) return;
+    const int64_t b1 = b0 + per_cta < nb ? b0 + per_cta : nb;
+    for (int i = t; i < TC_CBINS; i += TCM_T) s_coarse[i] = 0u;
+    if (t == 0) s_invalid = 0;
+    __syncthreads();
+    const float* sc = scores + qi * max_blocks;
+    for (int64_t b = b0 + t; b < b1; b += TCM_T) {
+        const int w = b < n_bid ? R : (int) (n_kv - n_bid * R);
+        if (w == 0) continue;
+        const float s = __ldg(sc + b);
+        if (!(s == s)) atomicExch(&s_invalid, 1);
+        atomicAdd(&s_coarse[tc_coarse_key(s)], (unsigned) w);
+    }
+    __syncthreads();
+    if (s_invalid) {
+        if (t == 0) atomicExch(&g_tcm_meta[qi][0], 1u);
+        return;
+    }
+    for (int i = t; i < TC_CBINS; i += TCM_T) {
+        const uint32_t c = s_coarse[i];
+        if (c) atomicAdd(&g_tcm_coarse[qi][i], c);
+    }
+}
+
+__global__ void __launch_bounds__(TK_T) block_topk_cm_choose_kernel(const int32_t* __restrict__ steps, int64_t cap,
+                                                                    int32_t* __restrict__ ids) {
+    __shared__ int s_warp[33];
+    __shared__ uint32_t s_sel, s_above, s_bucket;
+    const int64_t qi = blockIdx.x;
+    const int t = threadIdx.x;
+    uint32_t v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int idx = TC_CBINS - 1 - 4 * t - i;
+        v[i] = g_tcm_coarse[qi][idx];
+        g_tcm_coarse[qi][idx] = 0u;
+    }
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], width = st[kStepWidth];
+    const uint32_t st0 = g_tcm_meta[qi][0];
+    __syncthreads();   // all warps read st0 before t==0 writes g_tcm_meta[qi][0]
+    if (n_kv <= width) {
+        int32_t* out = ids + qi * cap;
+        for (int64_t j = t; j < n_kv; j += TK_T) out[j] = (int32_t) j;
+        if (t == 0) {
+            g_tcm_meta[qi][0] = 2u;
+            g_tk_fail[qi] = 0;
+        }
+        return;
+    }
+    if (st0 != 0u) {
+        if (t == 0) g_tk_fail[qi] = 1;
+        return;
+    }
+    if (t == 0) { s_sel = 0u; s_above = 0u; s_bucket = 0u; }
+    __syncthreads();
+    const uint32_t sum = v[0] + v[1] + v[2] + v[3];
+    int total = 0;
+    const uint32_t before = (uint32_t) block_excl_scan((int) sum, s_warp, total);
+    (void) total;
+    __syncthreads();
+    const uint32_t rem = (uint32_t) width;
+    if (before < rem && before + sum >= rem) {
+        uint32_t cum = before;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (cum + v[i] >= rem) {
+                s_sel = (uint32_t) (TC_CBINS - 1 - 4 * t - i);
+                s_above = cum;
+                s_bucket = v[i];
+                break;
+            }
+            cum += v[i];
+        }
+    }
+    __syncthreads();
+    if (t == 0) {
+        if (s_above >= rem || s_bucket == 0u || s_bucket > (uint32_t) (TC_CAND * R - 3) ||
+            s_above + s_bucket < rem) {
+            g_tcm_meta[qi][0] = 1u;
+            g_tk_fail[qi] = 1;
+        } else {
+            g_tcm_meta[qi][0] = 0u;
+            g_tcm_meta[qi][1] = s_sel;
+            g_tcm_meta[qi][2] = s_above;
+            g_tcm_meta[qi][3] = rem - s_above;
+            g_tcm_meta[qi][4] = 0u;
+            g_tcm_meta[qi][5] = 0u;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(TCM_T) block_topk_cm_gather_kernel(const float* __restrict__ scores,
+                                                                     const int32_t* __restrict__ steps,
+                                                                     int64_t max_blocks) {
+    const int64_t qi = blockIdx.y;
+    if (g_tcm_meta[qi][0] != 0u) return;
+    const int32_t* st = steps + qi * kStepCount;
+    const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid];
+    const int64_t nb = n_bid + 1;
+    const int64_t m = (int64_t) gridDim.x;
+    const int64_t per_cta = (nb + m - 1) / m;
+    const int64_t b0 = (int64_t) blockIdx.x * per_cta;
+    if (b0 >= nb) return;
+    const int64_t b1 = b0 + per_cta < nb ? b0 + per_cta : nb;
+    const uint32_t coarse_bin = g_tcm_meta[qi][1];
+    const float* sc = scores + qi * max_blocks;
+    for (int64_t b = b0 + threadIdx.x; b < b1; b += TCM_T) {
+        const int w = b < n_bid ? R : (int) (n_kv - n_bid * R);
+        if (w == 0) continue;
+        const float s = __ldg(sc + b);
+        const uint32_t ck = tc_coarse_key(s);
+        if (ck > coarse_bin) {
+            const uint32_t slot = atomicAdd(&g_tcm_meta[qi][4], 1u);
+            if (slot < (uint32_t) TC_SEL_CAP)
+                g_tcm_gt[qi][slot] = ((uint32_t) b << 2) | (uint32_t) (w - 1);
+        } else if (ck == coarse_bin) {
+            const uint32_t slot = atomicAdd(&g_tcm_meta[qi][5], 1u);
+            if (slot < (uint32_t) TC_CAND) {
+                g_tcm_cand_blk[qi][slot] = (int32_t) b;
+                g_tcm_cand_key[qi][slot] = order_key(s);
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(TK_T) block_topk_cm_finish_kernel(const int32_t* __restrict__ steps, int64_t cap,
+                                                                    int32_t* __restrict__ ids) {
+    __shared__ TcShared sh;
+    const int64_t qi = blockIdx.x;
+    const int t = threadIdx.x;
+    const uint32_t status = g_tcm_meta[qi][0];
+    __syncthreads();   // all warps must read status before t==0 clears g_tcm_meta[qi][0]
+    if (t == 0) g_tcm_meta[qi][0] = 0u;
+    if (status != 0u) return;
+    const uint32_t rem_init = g_tcm_meta[qi][3];
+    const uint32_t n_gt = g_tcm_meta[qi][4];
+    const uint32_t n_cand = g_tcm_meta[qi][5];
+    if (t == 0) {
+        sh.n_gt = n_gt;
+        sh.n_cand = n_cand;
+    }
+    if (n_gt > (uint32_t) TC_SEL_CAP || n_cand == 0u || n_cand > (uint32_t) TC_CAND) {
+        if (t == 0) g_tk_fail[qi] = 1;
+        return;
+    }
+    for (uint32_t i = (uint32_t) t; i < n_gt; i += (uint32_t) TK_T) sh.sel_packed[i] = g_tcm_gt[qi][i];
+    for (uint32_t i = (uint32_t) t; i < n_cand; i += (uint32_t) TK_T) {
+        sh.u.c.cand_blk[i] = g_tcm_cand_blk[qi][i];
+        sh.u.c.cand_key[i] = g_tcm_cand_key[qi][i];
+    }
+    __syncthreads();
+    const int32_t* st = steps + qi * kStepCount;
+    tc_refine_and_emit(sh, st[kStepNBid], st[kStepNKv], st[kStepWidth], rem_init, ids + qi * cap, qi);
+}
+
+std::atomic<int> g_topk_compact_hook{-1};
+
+int topk_compact_env_raw() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_TOPK_COMPACT");
+        if (!v || !*v) v = std::getenv("STRATA_QSA_TOPK_FP16");
+        if (!v || !*v) return -1;
+        const int m = std::atoi(v);
+        return m <= 0 ? 0 : (m == 2 ? 2 : 1);
+    }();
+    return env;
+}
+
+int topk_compact_mode_impl() {
+    const int h = g_topk_compact_hook.load(std::memory_order_relaxed);
+    if (h >= 0) return h == 0 ? 0 : (h == 2 ? 2 : 1);
+    const int env = topk_compact_env_raw();
+    if (env >= 0) return env;
+    // Default ON (mode 1: multi-CTA decode + 1-CTA prefill) on Volta sm_70 CUDA.
+    static int sm70_ok[64] = {};   // 0 unknown, 1 yes, 2 no
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0; }
+    if (sm70_ok[dev] == 0) {
+        int major = 0, minor = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+                        strata::cc_major_of(major) == 7 && minor == 0;
+        cudaGetLastError();
+        sm70_ok[dev] = ok ? 1 : 2;
+    }
+    return sm70_ok[dev] == 1 ? 1 : 0;
+}
+
+bool topk_compact_forced_on() {
+    const int h = g_topk_compact_hook.load(std::memory_order_relaxed);
+    if (h > 0) return true;
+    return h < 0 && topk_compact_env_raw() > 0;
+}
+#endif  // !__HIPCC__
+
 
 // Block scores with every key block read ONCE for all of a call's queries (block_scores_kernel's grid is
 // (max_blocks / 8) x nq: ~24,600 mostly-idle blocks per layer at a decode window, each key re-read per query).  A fixed
@@ -2593,6 +3115,22 @@ int qsa_score_v70_mode() {
 #endif
 }
 
+void qsa_set_topk_compact(int mode) {
+#if !defined(__HIPCC__)
+    g_topk_compact_hook.store(mode, std::memory_order_relaxed);
+#else
+    (void) mode;
+#endif
+}
+
+int qsa_topk_compact_mode() {
+#if !defined(__HIPCC__)
+    return topk_compact_mode_impl();
+#else
+    return 0;
+#endif
+}
+
 bool qsa_block_scores_slots(const float* const* pooled, const float* const* dead, const float* q_idx,
                             const int32_t* steps, int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores,
                             void* stream) {
@@ -3667,9 +4205,26 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
     }();
     if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
 #if !defined(__HIPCC__)
-        if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
+        const int compact_mode = nq <= TS_MAXQ ? topk_compact_mode_impl() : 0;
+        if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on() && !topk_compact_forced_on()) {
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
             block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+        } else if (compact_mode != 0) {
+            const cudaStream_t st = (cudaStream_t) stream;
+            if (compact_mode == 1 && nq <= TCM_MAXQ) {
+                int64_t m = 80 / nq;
+                if (m < 4) m = 4;
+                if (m > 64) m = 64;
+                const dim3 grid((unsigned) m, (unsigned) nq);
+                block_topk_cm_hist_kernel<<<grid, TCM_T, 0, st>>>(scores, steps, max_blocks);
+                block_topk_cm_choose_kernel<<<(unsigned) nq, TK_T, 0, st>>>(steps, cap, ids);
+                block_topk_cm_gather_kernel<<<grid, TCM_T, 0, st>>>(scores, steps, max_blocks);
+                block_topk_cm_finish_kernel<<<(unsigned) nq, TK_T, 0, st>>>(steps, cap, ids);
+                block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, st>>>(scores, steps, max_blocks, cap, ids);
+            } else {
+                block_topk_compact_kernel<<<(unsigned) nq, TK_T, 0, st>>>(scores, steps, max_blocks, cap, ids);
+                block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, st>>>(scores, steps, max_blocks, cap, ids);
+            }
         } else
 #endif
         block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
