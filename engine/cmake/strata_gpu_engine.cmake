@@ -1004,6 +1004,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gr_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME gr_parity COMMAND gr_parity --selftest)
+  add_test(NAME gr_parity_plain COMMAND gr_parity --selftest)
+  set_tests_properties(gr_parity_plain PROPERTIES ENVIRONMENT "STRATA_TSUM=0;STRATA_GR_Q8_PFS=0")
 
   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
