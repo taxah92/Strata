@@ -31,7 +31,7 @@ public:
     bool on_host() const { return host_ != nullptr; }
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
-    bool loaded() const { return weights_ != nullptr; }
+    bool loaded() const { return weights_ != nullptr || bitplane_ != nullptr; }
     /// Plan v0.3 P6: the GGUF blocks, for the verify window's multi-column head.
     const void* weights() const { return weights_; }
     const void* scratch() const { return scratch_; }   ///< the activation scratch the head's GEMV reads (captured with the weights)
@@ -40,7 +40,7 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
-    /// Exact 2-stage bit-plane LM head handle (Q8_0 / Q6_K on sm_80+; nullptr if unavailable or disabled).
+    /// Exact 2-stage bit-plane LM head handle (Q8_0 / Q6_K on sm_70 or sm_80+; nullptr if unavailable or disabled).
     strata::kernels::BitplaneHeadHandle* bitplane() const { return bitplane_; }
 
 private:

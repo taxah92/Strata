@@ -9,6 +9,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/vhead_bitplane.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -423,7 +424,15 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
                 return false;
             }
             cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
-            kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), tmp, nullptr);
+            if (hw != nullptr) {
+                kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), tmp, nullptr);
+            } else if (head->bitplane() != nullptr) {
+                kernels::vhead_bitplane_gather_raw(head->bitplane(), dv, (int64_t) vocab.size(), tmp, nullptr);
+            } else {
+                cudaFree(dv); cudaFree(tmp);
+                err = "dflash2: main head has no weights";
+                return false;
+            }
             cudaDeviceSynchronize();
             cudaFree(dv);
         }
@@ -446,7 +455,15 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
             return false;
         }
         cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
-        kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
+        if (hw != nullptr) {
+            kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
+        } else if (head->bitplane() != nullptr) {
+            kernels::vhead_bitplane_gather_raw(head->bitplane(), dv, (int64_t) vocab.size(), dhead_, nullptr);
+        } else {
+            cudaFree(dv);
+            err = "dflash2: main head has no weights";
+            return false;
+        }
         cudaDeviceSynchronize();
         cudaFree(dv);
         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);

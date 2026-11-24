@@ -33,6 +33,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
@@ -850,9 +851,15 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                            cudaMalloc((void**) &dv, raw.size()) == cudaSuccess &&
                            cudaMemcpy(dv, raw.data(), raw.size(), cudaMemcpyHostToDevice) == cudaSuccess;
                     if (ok_x) {
-                        strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
-                                                     (uint8_t*) tmp, nullptr);
-                        ok_x = cudaDeviceSynchronize() == cudaSuccess;
+                        if (head->weights() != nullptr) {
+                            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
+                                                         (uint8_t*) tmp, nullptr);
+                        } else if (head->bitplane() != nullptr) {
+                            strata::kernels::vhead_bitplane_gather_raw(head->bitplane(), dv, n_dvocab_, tmp, nullptr);
+                        } else {
+                            ok_x = false;
+                        }
+                        if (ok_x) ok_x = cudaDeviceSynchronize() == cudaSuccess;
                     }
                 }
                 ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
@@ -863,7 +870,14 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 }
                 if (!ok_x) { err = "mtp: the draft head's rows could not be copied from the head's card"; return false; }
             } else {
-                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+                if (head->weights() != nullptr) {
+                    strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
+                } else if (head->bitplane() != nullptr) {
+                    strata::kernels::vhead_bitplane_gather_raw(head->bitplane(), dvocab_, n_dvocab_, dhead_, nullptr);
+                } else {
+                    err = "mtp: the main head has no weights to gather the draft head from";
+                    return false;
+                }
             }
             cudaDeviceSynchronize();
             vram_ += (uint64_t) (n_dvocab_ * head_cap) + raw.size();
@@ -1391,8 +1405,12 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (!q8_head) native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
-                    (int) nv, T, cs);
+        if (!sub && head_->weights() == nullptr && head_->bitplane() != nullptr) {
+            vhead_bitplane_logits(head_->bitplane(), xq_, T, head_logits_, cs);
+        } else {
+            native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                        (int) nv, T, cs);
+        }
         g_mp.stamp(14, cs);
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
