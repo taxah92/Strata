@@ -50,6 +50,7 @@ int main(int argc, char** argv) {
         std::vector<float> yref;
         std::vector<int> vars = {1, 2, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23};
         if (q4) for (int v = 24; v <= 45; ++v) vars.push_back(v);
+        vars.push_back(50);   // Volta sm_70 mma.m8n8k4 TC kernel
         for (int var : vars) {
             strata::kernels::df2_gemm_variant(var);
             const int ncols = 8;
