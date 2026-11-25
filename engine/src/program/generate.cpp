@@ -5063,7 +5063,8 @@ int main(int argc, char** argv) {
     // builds (HIP, 16 rows), a layer split, --batch, DFlash2 and --lookup-chain keep the old windows.
     if (o.lookup_max_t < 0) {
         const char* lme = std::getenv("STRATA_LOOKUP_MAX_T");
-        const bool env_off = lme != nullptr && lme[0] == '0';
+        const char* df2_lme = std::getenv("STRATA_DF2_LOOKUP_MAX_T");
+        const bool env_off = (lme != nullptr && lme[0] == '0') || (o.draft == "dflash2" && df2_lme != nullptr && df2_lme[0] == '0');
         const bool narrow = strata::kernels::kVerifyMaxT == strata::kernels::kVerifyNarrowT;
         strata::core::LookupDefaultIn ld;
         ld.env_off = env_off, ld.narrow_window = narrow, ld.serve = o.serve, ld.multi_gpu = multi_gpu;
@@ -8211,10 +8212,18 @@ int main(int argc, char** argv) {
                         const size_t card_bytes = dp.totalGlobalMem;
 #endif
                         const int cap = o.draft_cap > 0 ? o.draft_cap : strata::core::dflash2_auto_cap(uma, cc_major, cc_minor, card_bytes);
-                        if (cap > 0 && o.spec > cap) {
-                            std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
-                                         o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
-                            o.spec = cap;
+                        if (cap > 0) {
+                            if (o.lookup_max_t > 0 && o.suffix_draft > 0) {
+                                if (o.mtp_max_t == 0 || o.mtp_max_t > cap) {
+                                    std::fprintf(stderr, "strata generate: --draft dflash2: draft windows capped at %d tokens (lookup up to %d; %s; --draft-cap N changes it)\n", cap,
+                                                 o.spec, o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
+                                    o.mtp_max_t = cap;
+                                }
+                            } else if (o.spec > cap) {
+                                std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
+                                             o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
+                                o.spec = cap;
+                            }
                         }
 #if !defined(STRATA_USE_HIP)
                         if (o.draft_cap == 0 && strata::core::dflash2_small_nvidia(true, dp.totalGlobalMem))
@@ -22810,7 +22819,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
             const int df2_skip_min = strata::spec::df2_lookup_skip_min(8);
 #else
-            const int df2_skip_min = strata::spec::df2_lookup_skip_min(0);
+            const int df2_skip_min = strata::spec::df2_lookup_skip_min(4);
 #endif
             bool df2_deferred = false;
             int dfr_n = 0;
@@ -22869,11 +22878,13 @@ int main(int argc, char** argv) {
                     const strata::spec::DraftPolicy::Pick pk = kd > 0 ? policy.choose(S_mtp, kd, md) : strata::spec::DraftPolicy::Pick{};
                     if (kd > 0 && pk.lookup) {
                         dfr_lookup = true; dfr_T = pk.t; dfr_match = md;
-                        if (!df2.context(ver.tap_dev(), dfr_n, dfr_pos, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        const float* tp = df2_win_taps(dfr_n, err);
+                        if (tp == nullptr || !df2.context(tp, dfr_n, dfr_pos, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                     } else {
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!df2.draft(ver.tap_dev(), dfr_n, dfr_pos, dfr_anchor, dd, pp, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        const float* tp = df2_win_taps(dfr_n, err);
+                        if (tp == nullptr || !df2.draft(tp, dfr_n, dfr_pos, dfr_anchor, dd, pp, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                     }
                 }
@@ -22901,7 +22912,7 @@ int main(int argc, char** argv) {
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                     // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
-                    if (o.suffix_draft > 0 && !first_window) {
+                    if (o.suffix_draft > 0 && !first_window && !dfr_lookup) {
                         const int k = sfx.propose(S_look - 1, sbuf.data());
                         sfx_match = sfx.last_match();
                         if (df2_trace != nullptr) {
@@ -23281,8 +23292,11 @@ int main(int argc, char** argv) {
                     const Clock::time_point tk0 = Clock::now();
                     // queued on the idle drafter's own stream, overlapped with the other's draft; keep_sync() below waits before the next window rewrites the taps / rows
                     if (!req_df2) {
-                        if (!df2.context_async(ver.tap_dev(), a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
-                        keep_pending = true;
+                        const bool ok_ctx = (a + 1 > strata::core::Dflash2Drafter::kRows)
+                                                ? df2.context(ver.tap_dev(), a + 1, p, err)
+                                                : df2.context_async(ver.tap_dev(), a + 1, p, err);
+                        if (!ok_ctx) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
+                        keep_pending = (a + 1 <= strata::core::Dflash2Drafter::kRows);
                     } else if (use_mtp) {
                         if (!mtp.prefill(ver.final_R_all(), outv.data(), a + 1, p, err, false)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                         keep_pending = true;
@@ -25087,7 +25101,7 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
         const int df2_skip_min = strata::spec::df2_lookup_skip_min(8);
 #else
-        const int df2_skip_min = strata::spec::df2_lookup_skip_min(0);
+        const int df2_skip_min = strata::spec::df2_lookup_skip_min(4);
 #endif
         bool df2_deferred = false;
         int dfr_n = 0;
@@ -25188,7 +25202,7 @@ int main(int argc, char** argv) {
             if (first_window) T = 1;
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
-            if (o.suffix_draft > 0 && !first_window) {
+            if (o.suffix_draft > 0 && !first_window && !dfr_lookup) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the

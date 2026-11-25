@@ -20,9 +20,14 @@ int main() {
     wide.narrow_window = false;
     assert(default_lookup_max_t(wide) == 0);
 
+    // DFlash2 on CUDA now supports --lookup-max-t 12 (block-only exec_[0] after context() for n_new > 8)
+    LookupDefaultIn df2 = cuda;
+    df2.dflash2 = true;
+    assert(default_lookup_max_t(df2) == 12);
+
     // every other condition turns it off on its own
     bool LookupDefaultIn::*off_when_true[] = {&LookupDefaultIn::env_off, &LookupDefaultIn::multi_gpu, &LookupDefaultIn::layer_split,
-                                              &LookupDefaultIn::batch, &LookupDefaultIn::dflash2, &LookupDefaultIn::lookup_chain};
+                                              &LookupDefaultIn::batch, &LookupDefaultIn::lookup_chain};
     for (auto m : off_when_true) {
         LookupDefaultIn x = cuda;
         x.*m = true;

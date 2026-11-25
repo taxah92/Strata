@@ -22,7 +22,7 @@ struct LookupDefaultIn {
 
 inline int default_lookup_max_t(const LookupDefaultIn& in) {
     return !in.env_off && in.narrow_window && !in.metal_build && in.serve && !in.multi_gpu && !in.layer_split && !in.batch &&
-                   !in.dflash2 && !in.lookup_chain && in.suffix_draft && in.spec_at_least_2
+                   !in.lookup_chain && in.suffix_draft && in.spec_at_least_2
                ? 12
                : 0;
 }

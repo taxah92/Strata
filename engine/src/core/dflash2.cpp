@@ -625,25 +625,33 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (exec_[n]) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
-    kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
-    // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
-    // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
+    bool ok = true;
+    if (n == 0) {
+        // Block-only graph (used after context() already updated the ring for n_new > kRows, e.g. long lookup windows).
+        kernels::df2_rope_table_inv(d_meta_ + 8, kRows, rope_inv_, rt_blk_, cs_);
+        fork_ = false;
+        ok = record_block(cs_, err, false);
+    } else {
+        kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
+        // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
+        // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
 #if defined(STRATA_USE_HIP)
-    static const bool fork_default = false;
+        static const bool fork_default = false;
 #else
-    static const bool fork_default = true;
+        static const bool fork_default = true;
 #endif
-    static const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
-    fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
-    if (fork_) {
-        cudaEventRecord(ev_fork_, cs_);
-        cudaStreamWaitEvent(cs2_, ev_fork_, 0);
+        static const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
+        fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
+        if (fork_) {
+            cudaEventRecord(ev_fork_, cs_);
+            cudaStreamWaitEvent(cs2_, ev_fork_, 0);
+        }
+        ok = record_context(taps, n, fork_ ? cs2_ : cs_, err, false);
+        if (fork_) cudaEventRecord(ev_join_, cs2_);
+        if (ok) ok = record_block(cs_, err, false);
+        if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
+        fork_ = false;
     }
-    bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err, false);
-    if (fork_) cudaEventRecord(ev_join_, cs2_);
-    if (ok) ok = record_block(cs_, err, false);
-    if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
-    fork_ = false;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
@@ -1177,15 +1185,24 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (!context_wait(err)) return false;
-    if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
+    if (n_new < 1) { err = "dflash2: draft rows out of range"; return false; }
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }
-    if (!prof_ && !exec_[n_new]) {
+    const bool big_ctx = n_new > kRows;
+    if (big_ctx) {
+        // Long lookup windows (e.g. --lookup-max-t 12) can commit 9..12 rows in one round: update the ring and ring_log
+        // via context() first, then run the block-only graph exec_[0] for the anchor without touching graph_taps_.
+        if (!context(taps, n_new, pos0, err)) return false;
+    } else if (graph_taps_ != nullptr && graph_taps_ != taps) {
+        err = "dflash2: the taps buffer moved after capture";
+        return false;
+    }
+    const int n_graph = big_ctx ? 0 : n_new;
+    if (!prof_ && !exec_[n_graph]) {
         // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks
-        for (int i = 0; i < 8; ++i) h_meta_[i] = (int32_t) (pos0 + i);
-        if (!capture(n_new, taps, err)) return false;
-        graph_taps_ = taps;
+        for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + i); h_meta_[8 + i] = (int32_t) (pos0 + n_new + i); }
+        if (!capture(n_graph, taps, err)) return false;
+        if (!big_ctx) graph_taps_ = taps;
     }
     const int64_t s = pos0 + n_new;
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
@@ -1196,7 +1213,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    log_stage(pos0, n_new);
+    if (!big_ctx) log_stage(pos0, n_new);
     if (timing_) cudaEventRecord(ev_a_, cs_);
     if (prof_) {   // the same round without its graph, an event after every stage
         cudaStreamSynchronize(cs_);
@@ -1205,10 +1222,11 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
         prof_->name.clear();
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         stamp("start");
-        if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
+        if (!big_ctx && !record_context(taps, n_new, cs_, err)) return false;
+        if (!record_block(cs_, err)) return false;
         prof_collect();
     } else
-    if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (cudaGraphLaunch(exec_[n_graph], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     if (timing_) cudaEventRecord(ev_b_, cs_);
     (void) cudaStreamQuery(cs_);
     launch_t0_ = t0;
