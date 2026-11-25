@@ -22,6 +22,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <chrono>
 #include <thread>
 
 // Loader fix: `fseek`/`ftell` are 32-bit on Windows by default (and the pack is 42.9 GB), and the 64-bit
@@ -39,6 +40,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #ifdef __linux__
@@ -146,8 +148,26 @@ uint64_t free_huge_bytes() {
 // A non-empty shared_file instead maps one file whose first 4 KiB identify the pack and whose remaining bytes
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
+struct SharedArenaLock {
+    int fd = -1;
+    ~SharedArenaLock() {
+#ifndef _WIN32
+        if (fd >= 0) {
+            (void) flock(fd, LOCK_UN);
+            close(fd);
+        }
+#endif
+    }
+};
+
+bool shared_arena_flock_on() {
+    const char* e = std::getenv("STRATA_SHARED_ARENA_FLOCK");
+    return !(e != nullptr && std::string(e) == "0");
+}
+
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes,
+              int* lock_fd_out = nullptr) {
     mapping_base = nullptr;
     mapping_bytes = 0;
 
@@ -312,6 +332,10 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
             note = "cannot open shared arena " + shared_file + ": " + std::strerror(errno);
             return nullptr;
         }
+        const bool lock_shared = shared_arena_flock_on();
+        if (lock_shared) {
+            while (flock(fd, LOCK_EX) != 0 && errno == EINTR) {}
+        }
         struct stat st{};
         if (fstat(fd, &st) != 0) {
             const int e = errno;
@@ -413,19 +437,25 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                         return nullptr;
                     }
                 }
-                const int fe = posix_fallocate(fd, 0, (off_t) file_bytes);
-                if (fe != 0 && fe != EOPNOTSUPP && fe != EINVAL) {
-                    close(fd);
-                    note = "not enough room for the shared arena " + shared_file + " (" +
-                           std::to_string((unsigned long long) (file_bytes >> 20)) + " MiB): " + std::strerror(fe);
-                    return nullptr;
+                if (!lock_shared || need > 0) {
+                    const int fe = posix_fallocate(fd, 0, (off_t) file_bytes);
+                    if (fe != 0 && fe != EOPNOTSUPP && fe != EINVAL) {
+                        close(fd);
+                        note = "not enough room for the shared arena " + shared_file + " (" +
+                               std::to_string((unsigned long long) (file_bytes >> 20)) + " MiB): " + std::strerror(fe);
+                        return nullptr;
+                    }
                 }
             }
         }
 #endif
         void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
         const int e = errno;
-        close(fd);
+        if (map != MAP_FAILED && lock_shared && lock_fd_out != nullptr) {
+            *lock_fd_out = fd;
+        } else {
+            close(fd);
+        }
         if (map == MAP_FAILED) {
             note = "cannot map shared arena " + shared_file + ": " + std::strerror(e);
             return nullptr;
@@ -786,7 +816,8 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    SharedArenaLock shared_lock;
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, &shared_lock.fd);
     if (!shared_file.empty() && base != nullptr && mapping_base != nullptr)
         shared_state = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<char*>(mapping_base) +
                                                                 offsetof(SharedArenaHeader, reserved));
@@ -838,8 +869,13 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
             cap_why = "by STRATA_ARENA_PIN_GIB";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
-        const cudaError_t e = capped ? cudaSuccess :
+        cudaError_t e = capped ? cudaSuccess :
             register_range(*this, base, bytes);
+        if (!capped && e != cudaSuccess && !shared_file.empty() && shared_arena_flock_on()) {
+            (void) cudaGetLastError();
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            e = register_range(*this, base, bytes);
+        }
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
@@ -923,7 +959,8 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
                          uint64_t shared_pack_hash) : capacity(bytes) {
     by_need = true;
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
+    SharedArenaLock shared_lock;
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes, &shared_lock.fd);
     if (!shared_file.empty() && base != nullptr && mapping_base != nullptr)
         shared_state = reinterpret_cast<std::atomic<uint64_t>*>(static_cast<char*>(mapping_base) +
                                                                 offsetof(SharedArenaHeader, reserved));
