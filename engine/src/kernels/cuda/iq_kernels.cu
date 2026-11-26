@@ -6,6 +6,7 @@
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/nvfp4_decode_sm120.hpp"
+#include "strata/kernels/iq4nl_volta_tc.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -6937,6 +6938,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         return;
     }
 #endif
+    if (L.d_type == 20 && !(expdec_mode() && expdec_down_ok(L)) &&
+        iq4nl_volta_down_grouped(L, gy, grp_ptr, grp_start, n_groups, ent_dst, hq, out, s)) {
+        check("native_expert_grouped/down v70");
+        return;
+    }
 #if STRATA_EXP_LAYOUTS
     const int em0d = sm75_down_em(em0, cap_groups);
     int dev_d = 0;
@@ -7322,28 +7328,33 @@ __device__ __forceinline__ void w2_raw_st(const uint32_t (&R)[w2_nl<TY>()], uint
     }
 }
 
-// sub-block `sb` (0..7) of the IQ2_S super-block at rr -> 32 halves at o, natural order, bit for bit dq_iq2_s's values:
-// cvt<__half>(dl * grid[j] * +-1) with dl = d * (0.5 + scale) * 0.25 in FP32 (the sign flips the rounded half, which is the same)
-__device__ __forceinline__ float w2_b2f(uint32_t w, int j) { return __int_as_float(0x4B000000 | ((w >> 8 * j) & 0xff)) - 8388608.0f; }
+// Ported from jmnargi/Strata-V100 (MIT, commit 0cdb0d64): pack Volta prompt IQ2_S dequantization into half2.
+// Each grid byte times an odd block multiplier (1..31) is <= 1922 (exact in FP16), so only the last multiply rounds.
+__device__ __forceinline__ uint32_t w2_scale_pair(uint32_t w, int sel, half2 d, half2 mul, half2 bias) {
+    const half2 grid = w2_h2(__byte_perm(w, 0x64646464u, sel));
+    return w2_u32(__hmul2(d, __hfma2(grid, mul, bias)));
+}
 __device__ __forceinline__ void w2_dq_iq2_s(const uint8_t* rr, int sb, __half* o, const uint2* __restrict__ tab) {
     const uint2* sgn = tab + 1024;
     const uint32_t sc = rr[2 + 64 + 8 + sb], qh = rr[2 + 64 + sb];
     const uint32_t qs = w2_ld_b2(rr + 2 + 4 * sb), sg = w2_ld_b2(rr + 2 + 32 + 4 * sb);
-    const float d = __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(rr)));
-    const float dl0 = d * (0.5f + (float) (sc & 0xf)) * 0.25f;
-    const float dl1 = d * (0.5f + (float) (sc >> 4)) * 0.25f;
+    const half2 d = __half2half2(__ushort_as_half(*reinterpret_cast<const uint16_t*>(rr)));
+    const half2 mul0 = __float2half2_rn(0.125f * (float) (1 + 2 * (sc & 15)));
+    const half2 mul1 = __float2half2_rn(0.125f * (float) (1 + 2 * (sc >> 4)));
+    const half2 neg_base = __float2half2_rn(-1024.0f);
+    const half2 bias0 = __hmul2(mul0, neg_base), bias1 = __hmul2(mul1, neg_base);
 #pragma unroll
     for (int il = 0; il < 4; ++il) {
-        const float dl = il < 2 ? dl0 : dl1;
+        const half2 mul = il < 2 ? mul0 : mul1, bias = il < 2 ? bias0 : bias1;
         const int idx = (int) (((qs >> 8 * il) & 0xff) | ((qh << (8 - 2 * il)) & 0x300));
         const uint2 gw = tab[idx];
         const uint32_t sbits = (sg >> 8 * il) & 0xff;
         const uint2 s0 = sgn[sbits & 15], s1 = sgn[sbits >> 4];
         uint4 out;
-        out.x = w2_u32(__floats2half2_rn(dl * w2_b2f(gw.x, 0), dl * w2_b2f(gw.x, 1))) ^ s0.x;
-        out.y = w2_u32(__floats2half2_rn(dl * w2_b2f(gw.x, 2), dl * w2_b2f(gw.x, 3))) ^ s0.y;
-        out.z = w2_u32(__floats2half2_rn(dl * w2_b2f(gw.y, 0), dl * w2_b2f(gw.y, 1))) ^ s1.x;
-        out.w = w2_u32(__floats2half2_rn(dl * w2_b2f(gw.y, 2), dl * w2_b2f(gw.y, 3))) ^ s1.y;
+        out.x = w2_scale_pair(gw.x, 0x4140, d, mul, bias) ^ s0.x;
+        out.y = w2_scale_pair(gw.x, 0x4342, d, mul, bias) ^ s0.y;
+        out.z = w2_scale_pair(gw.y, 0x4140, d, mul, bias) ^ s1.x;
+        out.w = w2_scale_pair(gw.y, 0x4342, d, mul, bias) ^ s1.y;
         *reinterpret_cast<uint4*>(o + 8 * il) = out;
     }
 }
@@ -7480,6 +7491,91 @@ __global__ void __launch_bounds__(W2_NT, 2) gemm_iq_f16_w2_kernel(const uint8_t*
 #endif
 }
 
+// Ported from jmnargi/Strata-V100 PR #114 (MIT, commits 4d0f35fd/fa984808/25d7c1f6/19175f8c):
+// Register-fed sm_70 mma.m8n8k4 IQ4_NL skinny down projection (max_rows <= 8, 8 warps when n_out % 256 == 0).
+template <bool Paired>
+__global__ void w2_iq4_skinny(const uint8_t* W, size_t expert_bytes, size_t row_bytes, int K,
+                              const __half* X, int ldx, const int32_t* bounds,
+                              float* Y, int ldy) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
+    const int e = (int) blockIdx.y, first = bounds[e], rows = bounds[e + 1] - first;
+    if (!rows) return;
+    const int lane = (int) threadIdx.x & 31, q = (lane >> 2) & 3;
+    const int mr = (lane & 3) | ((lane >> 2) & 4);
+    const int n0 = (int) blockDim.x * (int) blockIdx.x + 32 * ((int) threadIdx.x >> 5) + 8 * q;
+    const int row = mr < rows ? first + mr : 0;
+    const __half* x = X + (size_t) row * ldx;
+    const uint8_t* w = W + (size_t) e * expert_bytes + (size_t) (n0 + mr) * row_bytes;
+    __shared__ half2 lut[Paired ? 16 : 256];
+    for (int i = (int) threadIdx.x; i < (Paired ? 16 : 256); i += (int) blockDim.x) {
+        const __half lo = __int2half_rn(kvalues_iq4nl[i & 15]);
+        lut[i] = __halves2half2(lo, Paired ? lo : __int2half_rn(kvalues_iq4nl[i >> 4]));
+    }
+    __syncthreads();
+    float c[8] = {};
+    for (int k = 0; k < K; k += Paired ? 64 : 32, w += Paired ? 36 : 18) {
+        const auto* words = reinterpret_cast<const uint32_t*>(w);
+        uint32_t carry = Paired ? words[0] : 0;
+#pragma unroll
+        for (int b = 0; b < (Paired ? 2 : 1); ++b) {
+            const uint16_t scale = Paired ? uint16_t(b ? carry >> 16 : carry)
+                                          : *reinterpret_cast<const uint16_t*>(w);
+            const half2 d = __half2half2(__ushort_as_half(scale));
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint32_t codes;
+                if constexpr (Paired) {
+                    const uint32_t next = words[1 + j + 4 * b];
+                    codes = b ? next : __byte_perm(carry, next, 0x5432);
+                    carry = next;
+                } else {
+                    codes = w2_ld_b2(w + 2 + 4 * j);
+                }
+                auto lookup = [&](unsigned v) {
+                    if constexpr (Paired)
+                        return __halves2half2(__low2half(lut[v & 15]), __low2half(lut[(v >> 4) & 15]));
+                    else return lut[v & 255];
+                };
+                const half2 t0 = lookup(codes), t1 = lookup(codes >> 8);
+                const half2 t2 = lookup(codes >> 16), t3 = lookup(codes >> 24);
+#pragma unroll
+                for (int hi = 0; hi < 2; ++hi) {
+                    const uint2 a = mr < rows ? *reinterpret_cast<const uint2*>(x + k + 32 * b + 4 * j + 16 * hi)
+                                              : make_uint2(0, 0);
+                    const uint32_t b0 = w2_u32(__hmul2(d, hi ? __highs2half2(t0, t1) : __lows2half2(t0, t1)));
+                    const uint32_t b1 = w2_u32(__hmul2(d, hi ? __highs2half2(t2, t3) : __lows2half2(t2, t3)));
+                    asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
+                        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                        : "r"(a.x), "r"(a.y), "r"(b0), "r"(b1));
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int r = (i & 2) | ((lane >> 2) & 4) | (lane & 1);
+        const int col = (i & 1) | (lane & 2) | ((i >> 2) * 4);
+        if (r < rows) Y[(size_t) (first + r) * ldy + n0 + col] = c[i];
+    }
+#else
+    (void) W; (void) expert_bytes; (void) row_bytes; (void) K; (void) X; (void) ldx; (void) bounds; (void) Y; (void) ldy;
+#endif
+}
+
+bool w2_skinny_on(int dev) {
+    static const bool on = [] { const char* e = std::getenv("STRATA_PF_WMMA_SKINNY"); return e == nullptr || e[0] != '0'; }();
+    if (!on) return false;
+    static thread_local int arch[64] = {};
+    if (!arch[dev]) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        arch[dev] = (major == 7 && minor == 0) ? 1 : -1;
+    }
+    return arch[dev] == 1;
+}
+
 bool w2_on() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PF_WMMA2"); return e && e[0] == '1'; }();
     return v;
@@ -7503,6 +7599,16 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
         if (rb % 4 == 0 && (long long) n_experts * ch <= 65535) {
             const dim3 grid2((unsigned) (n_out / W2_RB), (unsigned) (n_experts * ch));
             cudaStream_t s2 = (cudaStream_t) stream;
+            int w2_dev = 0;
+            if (ty == 20 && max_rows <= 8 && cudaGetDevice(&w2_dev) == cudaSuccess && w2_dev >= 0 && w2_dev < 64 && w2_skinny_on(w2_dev)) {
+                const int threads = (n_out % 256 == 0) ? 256 : 128;
+                const dim3 gsk((unsigned) (n_out / threads), (unsigned) n_experts);
+                if (expert_bytes % 4 == 0)
+                    w2_iq4_skinny<true><<<gsk, threads, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, Y, ldy);
+                else
+                    w2_iq4_skinny<false><<<gsk, threads, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, Y, ldy);
+                return cudaGetLastError() == cudaSuccess;
+            }
             if (ty == 22)
                 gemm_iq_f16_w2_kernel<22><<<grid2, W2_NT, 0, s2>>>((const uint8_t*) W, expert_bytes, rb, K, (const __half*) X, ldx, bounds, ch, Y, ldy);
             else
