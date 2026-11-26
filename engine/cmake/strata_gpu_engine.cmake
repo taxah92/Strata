@@ -101,6 +101,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/megakernel_gdn.cu
                           src/kernels/cuda/vhead_bitplane.cu
                           src/kernels/cuda/dense_i8_tc.cu
+                          src/kernels/cuda/q8_volta_tc.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -557,6 +558,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(dflash2_gemm_bench EXCLUDE_FROM_ALL src/core/dflash2_gemm_bench.cpp)
   target_include_directories(dflash2_gemm_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_gemm_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  if(STRATA_ENABLE_CUDA)
+    add_executable(q8_volta_tc_parity src/kernels/q8_volta_tc_parity.cpp)
+    target_include_directories(q8_volta_tc_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(q8_volta_tc_parity PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME q8_volta_tc_parity COMMAND q8_volta_tc_parity)
+    set_tests_properties(q8_volta_tc_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_executable(q8_volta_tc_bench EXCLUDE_FROM_ALL src/kernels/q8_volta_tc_bench.cpp)
+    target_include_directories(q8_volta_tc_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(q8_volta_tc_bench PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
+  endif()
   add_executable(dflash2_launch_bench EXCLUDE_FROM_ALL src/core/dflash2_launch_bench.cu)
   target_include_directories(dflash2_launch_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_launch_bench PRIVATE ${_strata_gpu_runtime_target})

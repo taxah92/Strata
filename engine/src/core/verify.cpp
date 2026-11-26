@@ -53,6 +53,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_volta_tc.hpp"
 #include "strata/kernels/megakernel.hpp"
 #include "strata/kernels/vhead_bitplane.hpp"
 #include "strata/core/dispatch_stats.hpp"
@@ -1893,7 +1894,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
-                if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
+                bool gdn_qkv_z_seg = false;
+                if (!br && wqkv->native_type == 8 && wg->native_type == 8 && n >= 2 && n <= 16 &&
+                    strata::kernels::q8_volta_decode_seg_enabled()) {
+                    const strata::kernels::Q8VoltaSeg segs[2] = {
+                        {wqkv->native_data, qkv + (size_t) tb * C, (int) C},
+                        {wg->native_data, z_ + (size_t) tb * ZV, (int) ZV},
+                    };
+                    gdn_qkv_z_seg = strata::kernels::q8_volta_decode_seg(segs, 2, xq_, (int) N, n, cs);
+                }
+                if (!gdn_qkv_z_seg && side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
                     // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
                     // output), and qkv is recorded before the branch's launch, so its grid is dispatched first and the
                     // conv / recurrence that wait for it start sooner (z is read only after the recurrence)
@@ -1921,7 +1931,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!gdn_qkv_z_seg && !side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1954,9 +1964,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!gdn_qkv_z_seg && !side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
-                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                if (!gdn_qkv_z_seg && side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
                     return false;
                 }
@@ -2145,8 +2155,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // split with norm and RoPE, the rotation
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
+                bool qsa_q_seg_done = false;
                 auto q_chain = [&](cudaStream_t ns) -> bool {
-                    if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    if (ns == cs) {
+                        if (!qsa_q_seg_done) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    }
                     else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
@@ -2200,8 +2213,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                bool qsa_kv_seg = false;
+                if (wk->native_type == 8 && wv->native_type == 8 && n >= 1 && n <= 16 &&
+                    strata::kernels::q8_volta_decode_seg_enabled()) {
+                    if (!side_proj && !qbr && n >= 2 && wq->native_type == 8) {
+                        const strata::kernels::Q8VoltaSeg segs[3] = {
+                            {wq->native_data, qfull_ + tb * NH * 2 * HD, (int) (NH * 2 * HD)},
+                            {wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                            {wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        };
+                        qsa_kv_seg = strata::kernels::q8_volta_decode_seg(segs, 3, xq_, (int) N, n, cs);
+                        qsa_q_seg_done = qsa_kv_seg;
+                    } else {
+                        const strata::kernels::Q8VoltaSeg segs[2] = {
+                            {wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                            {wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        };
+                        qsa_kv_seg = strata::kernels::q8_volta_decode_seg(segs, 2, xq_, (int) N, n, cs);
+                    }
+                }
+                if (!qsa_kv_seg) {
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)

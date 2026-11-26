@@ -27,6 +27,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_volta_tc.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -236,11 +237,18 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_q8_1_interleave(x_q8_1, nw.q8_1_il, (int) n_embd, n_tok, stream);
         native_mmvq_il(nw.gate_type, nw.gate_data, x_q8_1, nw.q8_1_il, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq_il(nw.up_type, nw.up_data, x_q8_1, nw.q8_1_il, up, (int) n_embd, (int) n_ff, n_tok, stream);
-    } else if (!(pair && nw.gate_type == nw.up_type &&
-                 native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff,
-                                  n_tok, stream))) {
-        native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-        native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    } else {
+        bool gu_done = false;
+        if (nw.gate_type == 8 && nw.up_type == 8 && n_tok >= 1 && n_tok <= 16 && q8_volta_decode_seg_enabled()) {
+            const Q8VoltaSeg segs[2] = {{nw.gate_data, gate, (int) n_ff}, {nw.up_data, up, (int) n_ff}};
+            gu_done = q8_volta_decode_seg(segs, 2, x_q8_1, (int) n_embd, n_tok, stream);
+        }
+        if (!gu_done && !(pair && nw.gate_type == nw.up_type &&
+                          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff,
+                                           n_tok, stream))) {
+            native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+            native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+        }
     }
     const int n = (int) (n_ff * n_tok);
     if (fused_swiglu_q81_enabled()) {

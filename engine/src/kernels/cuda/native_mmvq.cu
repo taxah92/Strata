@@ -25,6 +25,7 @@
 
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/dense_i8_tc.hpp"
+#include "strata/kernels/q8_volta_tc.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -3594,6 +3595,15 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
             strata::dispatch::kernel(strata::dispatch::kDense, 30, ggml_type, n_in, n_out, ncols);
             return;
         }
+    }
+    // Clean-room MIT Volta (sm_70) FP16 Tensor Core Q8_0 path (PR 5.1, STRATA_DEC_SEG_V70=0 disables).
+    // Preserves bitwise equality between ncols=1 and ncols=2..16 under g_multi_exact.
+    if (ggml_type == 8 && g_multi_exact && n_in >= 1024 && n_out >= 1024 &&
+        ncols >= (n_out >= 4096 ? 2 : 5) && ncols <= 16 &&
+        q8_volta_decode_enabled() &&
+        q8_volta_decode_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        strata::dispatch::kernel(strata::dispatch::kDense, 31, ggml_type, n_in, n_out, ncols);
+        return;
     }
     // more columns than one launch takes: ceil(ncols / MAX_NCOLS) passes over the same weights.  Every column of a
     // multi-column pass is bitwise the single-column result (bench/micro/native_mmvq_multi.cpp), so the split changes no
