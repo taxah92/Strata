@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #if !defined(__HIPCC__)
 #include "strata/prefill/dense_fp4_tc.hpp"
+#include "strata/kernels/q8_volta_tc.hpp"
 #endif
 #if !defined(__HIPCC__) && defined(STRATA_CUBLASLT_MXFP8)
 #include "gemm_mxfp8.cuh"
@@ -1471,6 +1472,11 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 #if !defined(__HIPCC__)
     if (ggml_type == 40 && (ldx == 0 || ldx == K) &&
         strata::prefill::dense_fp4_tc::gemm_f16_nvfp4(X, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
+        return;
+    }
+    if (ggml_type == 8 && (ldx == 0 || ldx == K) &&
+        strata::kernels::q8_volta_prefill_should_use(T, N, K) &&
+        strata::kernels::q8_volta_prefill_gemm(X, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
         return;
     }
 #endif
