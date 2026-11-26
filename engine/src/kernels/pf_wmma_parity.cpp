@@ -81,8 +81,8 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
 }
 
 
-int run(int ty, int n_out, int K, std::mt19937& rng) {
-    const std::vector<int> rows = {0, 1, 63, 64, 65, 200, 300};
+int run(int ty, int n_out, int K, std::mt19937& rng, bool skinny = false) {
+    const std::vector<int> rows = skinny ? std::vector<int>{0, 1, 2, 4, 8, 3} : std::vector<int>{0, 1, 63, 64, 65, 200, 300};
     const int E = (int) rows.size(), base = 5;
     std::vector<int32_t> bounds(E + 1);
     bounds[0] = base;
@@ -150,7 +150,8 @@ int run(int ty, int n_out, int K, std::mt19937& rng) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool skinny = argc >= 2 && std::strcmp(argv[1], "--skinny") == 0;
     // every sm_70+ card in one process, in turn: a layer split launches the tiles on its second card after the first
     int n_dev = 0, ran = 0, fails = 0;
     cudaGetDeviceCount(&n_dev);
@@ -162,10 +163,17 @@ int main() {
         std::printf("device %d\n", dev);
         ++ran;
         std::mt19937 rng(70);
-        for (int ty : {16, 22, 29}) fails += run(ty, 1280, 2560, rng);
-        fails += run(42, 2560, 640, rng);
-        for (int ty : {20, 21, 23}) fails += run(ty, 1280, 2560, rng);   // this pack's gate/up formats, generic WK=256 path
-        fails += run(20, 2560, 640, rng);                                // the IQ4_NL down, the new WK=128 lane
+        if (skinny) {
+            fails += run(20, 2560, 640, rng, true);
+            fails += run(20, 384, 640, rng, true);
+        } else {
+            for (int ty : {16, 22, 29}) fails += run(ty, 1280, 2560, rng);
+            fails += run(42, 2560, 640, rng);
+            for (int ty : {20, 21, 23}) fails += run(ty, 1280, 2560, rng);
+            fails += run(20, 2560, 640, rng);
+            fails += run(20, 2560, 640, rng, true);
+            fails += run(20, 384, 640, rng, true);
+        }
     }
     if (!ran) { std::printf("pf_wmma_parity: needs sm_70+, skipped\n"); return 77; }
     std::printf("pf_wmma_parity: %d failures on %d devices\n", fails, ran);
