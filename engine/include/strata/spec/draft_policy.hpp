@@ -302,6 +302,18 @@ public:
     /// After a round of the MTP window T whose drafts were p[0..T-1): `accepted` of them held.  Teaches draft_rate().
     void observe_probs(const float* p, int n_window_drafts, int accepted);
     double draft_rate(double p) const;     // acceptance of an MTP draft that came with probability p
+    /// PR 6.2c (EcoSpec, STRATA_ECOSPEC=1, kill-switch 0): track instantaneous VRAM expert cache hit rate and CPU
+    /// miss slope so cost_ms(t) reacts immediately when r0/r1 cache warms up or cools down.
+    void set_ecospec(bool on) { ecospec_on_ = on; }
+    bool ecospec() const { return ecospec_on_; }
+    void observe_hit_rate(double hit_rate, int64_t miss_entries, double cpu_ms);
+    double eco_hit_rate() const { return eco_miss_ema_ >= 0.0 ? (1.0 - eco_miss_ema_) : 1.0; }
+    double eco_ms_per_miss() const { return eco_ms_per_miss_; }
+    double raw_cost_ms(int t) const;
+
+    /// PR 6.2a: export the current context bucket's cost/calibration tables for Zero-D2H GPU keep_draft.
+    void fill_gpu_ctrl(int cap, float* cost_ms_out, float* cost_n_out, float* pa_ok_out, float* pa_n_out,
+                       float& margin_out, int& fixed_out) const;
 
 private:
     static int bucket(int match);
@@ -351,6 +363,12 @@ private:
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> delayed_n_{};  // of cost_n_: times applied by apply_costs (not new probes)
     struct HeldCost { int64_t end; int bucket; int t; double ms; double age; };
     std::vector<HeldCost> held_;                                          // defer_cost, oldest first
+    // PR 6.2c EcoSpec: hit-rate-aware cost delta
+    bool ecospec_on_ = false;
+    double eco_miss_ema_ = -1.0;         // fast EMA of (1 - resident_hit_rate)
+    double eco_last_miss_ = -1.0;        // last window's (1 - resident_hit_rate), paired with observe()
+    double eco_ms_per_miss_ = 0.028;     // EMA of CPU ms per missed routed entry
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> eco_miss_cost_{}; // EMA miss rate at which cost_[bk][t] was measured
 };
 
 }  // namespace strata::spec

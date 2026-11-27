@@ -3,6 +3,7 @@
 // The per-token arithmetic of every kernel here is transcribed from its single-token original (fused_gdn.cu,
 // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/qsa.hpp"
 #include "strata/core/bw_dense_defaults.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/core/emulate.hpp"
@@ -2093,5 +2094,755 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 #endif
 }
 #endif
+
+
+// ---- PR 6.2a: single-pass fused MTP top-4 + online-softmax prob + select & Zero-D2H GPU gate (clean-room MIT)
+namespace {
+
+constexpr int kMtpTopBlocks = 128;
+constexpr int kMtpTopThreads = 256;
+
+struct MtpTopRow {
+    unsigned counter;
+    unsigned pad[3];
+    float m[kMtpTopBlocks];
+    float l[kMtpTopBlocks];
+    float v0[kMtpTopBlocks], v1[kMtpTopBlocks], v2[kMtpTopBlocks], v3[kMtpTopBlocks];
+    int32_t i0[kMtpTopBlocks], i1[kMtpTopBlocks], i2[kMtpTopBlocks], i3[kMtpTopBlocks];
+};
+
+__device__ __forceinline__ bool mtp_better(float vx, int ix, float vy, int iy) {
+    return (vx > vy) || (vx == vy && ix < iy);
+}
+
+__device__ __forceinline__ void mtp_top4_push(float& v0, int& i0, float& v1, int& i1,
+                                              float& v2, int& i2, float& v3, int& i3,
+                                              float x, int idx) {
+    if (!(x == x)) return;
+    if (!mtp_better(x, idx, v3, i3)) return;
+    if (idx == i0 || idx == i1 || idx == i2 || idx == i3) return;
+    if (mtp_better(x, idx, v0, i0)) {
+        v3 = v2; i3 = i2;
+        v2 = v1; i2 = i1;
+        v1 = v0; i1 = i0;
+        v0 = x;  i0 = idx;
+    } else if (mtp_better(x, idx, v1, i1)) {
+        v3 = v2; i3 = i2;
+        v2 = v1; i2 = i1;
+        v1 = x;  i1 = idx;
+    } else if (mtp_better(x, idx, v2, i2)) {
+        v3 = v2; i3 = i2;
+        v2 = x;  i2 = idx;
+    } else {
+        v3 = x;  i3 = idx;
+    }
+}
+
+__device__ __forceinline__ void mtp_online_merge(float& m, float& l, float m2, float l2) {
+    if (l2 == 0.0f) return;
+    if (l == 0.0f) {
+        m = m2;
+        l = l2;
+        return;
+    }
+    if (m2 > m) {
+        l = l * __expf(m - m2) + l2;
+        m = m2;
+    } else {
+        l += l2 * __expf(m2 - m);
+    }
+}
+
+__device__ __forceinline__ void mtp_warp_reduce(float& m, float& l,
+                                                float& v0, int& i0, float& v1, int& i1,
+                                                float& v2, int& i2, float& v3, int& i3,
+                                                int start_offset) {
+#pragma unroll
+    for (int o = start_offset; o > 0; o >>= 1) {
+        const float om = __shfl_xor_sync(0xffffffffu, m, o);
+        const float ol = __shfl_xor_sync(0xffffffffu, l, o);
+        mtp_online_merge(m, l, om, ol);
+        const float ov0 = __shfl_xor_sync(0xffffffffu, v0, o);
+        const int   oi0 = __shfl_xor_sync(0xffffffffu, i0, o);
+        const float ov1 = __shfl_xor_sync(0xffffffffu, v1, o);
+        const int   oi1 = __shfl_xor_sync(0xffffffffu, i1, o);
+        const float ov2 = __shfl_xor_sync(0xffffffffu, v2, o);
+        const int   oi2 = __shfl_xor_sync(0xffffffffu, i2, o);
+        const float ov3 = __shfl_xor_sync(0xffffffffu, v3, o);
+        const int   oi3 = __shfl_xor_sync(0xffffffffu, i3, o);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov0, oi0);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov1, oi1);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov2, oi2);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov3, oi3);
+    }
+}
+
+__global__ void __launch_bounds__(kMtpTopThreads) mtp_topk_prob_select_kernel(
+    const float* __restrict__ logits, int n_vocab, int per_block, const int32_t* __restrict__ dvocab,
+    const float* __restrict__ R_src, int64_t R_stride, const int32_t* __restrict__ row_dev,
+    float* __restrict__ R_dst, int32_t* __restrict__ tok_dst, int32_t* __restrict__ out_ids,
+    float* __restrict__ out_probs, int32_t* m_out, float* m_prob,
+    int32_t* __restrict__ top4_ids, float* __restrict__ top4_probs, int step_j,
+    MtpTopRow* __restrict__ rows) {
+    const int row_idx = (int) blockIdx.y;
+    const int b = (int) blockIdx.x;
+    const int nb = (int) gridDim.x;
+    const int tid = (int) threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    const float* lptr = logits + (size_t) row_idx * (size_t) n_vocab;
+    const int lo = b * per_block;
+    const int hi = min(n_vocab, lo + per_block);
+
+    const float ninf = __int_as_float(0xff800000);
+    float m = ninf, lsum = 0.0f;
+    float v0 = ninf, v1 = ninf, v2 = ninf, v3 = ninf;
+    int i0 = n_vocab, i1 = n_vocab + 1, i2 = n_vocab + 2, i3 = n_vocab + 3;
+
+    // Fast 1-pass top-4 + max scan (no expf in inner loop!), then block-wide max -> branch-free expf sum from L2!
+    for (int idx = lo + tid; idx < hi; idx += kMtpTopThreads) {
+        const float x = __ldg(lptr + idx);
+        if (x == x) {
+            if (x > m) m = x;
+            mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, x, idx);
+        }
+    }
+    // Block-wide max so every thread computes expf(x - block_max) with zero rescale branches
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    __shared__ float sm[8], sl[8];
+    __shared__ float sv0[8], sv1[8], sv2[8], sv3[8];
+    __shared__ int   si0[8], si1[8], si2[8], si3[8];
+    if (lane == 0) sm[warp] = m;
+    __syncthreads();
+    if (warp == 0) {
+        float bm = (lane < 8) ? sm[lane] : ninf;
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, o));
+        if (lane == 0) sm[0] = bm;
+    }
+    __syncthreads();
+    const float bmax = sm[0];
+    if (bmax > ninf) {
+        for (int idx = lo + tid; idx < hi; idx += kMtpTopThreads) {
+            const float x = __ldg(lptr + idx);
+            if (x == x) lsum += __expf(x - bmax);
+        }
+    }
+    m = bmax;
+
+    // Warp reduction (m is identical across all threads in block -> simple sum for lsum + top-4 merge!)
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        lsum += __shfl_xor_sync(0xffffffffu, lsum, o);
+        const float ov0 = __shfl_xor_sync(0xffffffffu, v0, o);
+        const int   oi0 = __shfl_xor_sync(0xffffffffu, i0, o);
+        const float ov1 = __shfl_xor_sync(0xffffffffu, v1, o);
+        const int   oi1 = __shfl_xor_sync(0xffffffffu, i1, o);
+        const float ov2 = __shfl_xor_sync(0xffffffffu, v2, o);
+        const int   oi2 = __shfl_xor_sync(0xffffffffu, i2, o);
+        const float ov3 = __shfl_xor_sync(0xffffffffu, v3, o);
+        const int   oi3 = __shfl_xor_sync(0xffffffffu, i3, o);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov0, oi0);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov1, oi1);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov2, oi2);
+        mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov3, oi3);
+    }
+    if (lane == 0) {
+        sl[warp] = lsum;
+        sv0[warp] = v0; si0[warp] = i0;
+        sv1[warp] = v1; si1[warp] = i1;
+        sv2[warp] = v2; si2[warp] = i2;
+        sv3[warp] = v3; si3[warp] = i3;
+    }
+    __syncthreads();
+
+    __shared__ bool last;
+    if (warp == 0) {
+        if (lane < 8) {
+            lsum = sl[lane];
+            v0 = sv0[lane]; i0 = si0[lane];
+            v1 = sv1[lane]; i1 = si1[lane];
+            v2 = sv2[lane]; i2 = si2[lane];
+            v3 = sv3[lane]; i3 = si3[lane];
+        } else {
+            lsum = 0.0f;
+            v0 = ninf; v1 = ninf; v2 = ninf; v3 = ninf;
+            i0 = n_vocab + 4 + lane; i1 = n_vocab + 40 + lane;
+            i2 = n_vocab + 80 + lane; i3 = n_vocab + 120 + lane;
+        }
+#pragma unroll
+        for (int o = 4; o > 0; o >>= 1) {
+            lsum += __shfl_xor_sync(0xffffffffu, lsum, o);
+            const float ov0 = __shfl_xor_sync(0xffffffffu, v0, o);
+            const int   oi0 = __shfl_xor_sync(0xffffffffu, i0, o);
+            const float ov1 = __shfl_xor_sync(0xffffffffu, v1, o);
+            const int   oi1 = __shfl_xor_sync(0xffffffffu, i1, o);
+            const float ov2 = __shfl_xor_sync(0xffffffffu, v2, o);
+            const int   oi2 = __shfl_xor_sync(0xffffffffu, i2, o);
+            const float ov3 = __shfl_xor_sync(0xffffffffu, v3, o);
+            const int   oi3 = __shfl_xor_sync(0xffffffffu, i3, o);
+            mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov0, oi0);
+            mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov1, oi1);
+            mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov2, oi2);
+            mtp_top4_push(v0, i0, v1, i1, v2, i2, v3, i3, ov3, oi3);
+        }
+        if (lane == 0) {
+            MtpTopRow& r = rows[row_idx];
+            r.m[b] = bmax; r.l[b] = lsum;
+            r.v0[b] = v0; r.i0[b] = i0;
+            r.v1[b] = v1; r.i1[b] = i1;
+            r.v2[b] = v2; r.i2[b] = i2;
+            r.v3[b] = v3; r.i3[b] = i3;
+            __threadfence();
+            last = (atomicAdd(&r.counter, 1u) == (unsigned) (nb - 1));
+        }
+    }
+    __syncthreads();
+    if (!last) return;
+
+    __threadfence();
+    if (row_idx == 0 && R_src != nullptr && R_dst != nullptr && R_stride > 0) {
+        const int rsrc = row_dev ? *row_dev : 0;
+        const float* src_row = R_src + (size_t) rsrc * (size_t) R_stride;
+        if (((R_stride & 3) == 0) && ((((uintptr_t)src_row) & 15u) == 0) && ((((uintptr_t)R_dst) & 15u) == 0)) {
+            const float4* s4 = reinterpret_cast<const float4*>(src_row);
+            float4* d4 = reinterpret_cast<float4*>(R_dst);
+            const int64_t n4 = R_stride >> 2;
+            for (int64_t k = tid; k < n4; k += kMtpTopThreads) d4[k] = s4[k];
+        } else {
+            for (int64_t k = tid; k < R_stride; k += kMtpTopThreads) R_dst[k] = src_row[k];
+        }
+    }
+
+    // Final merge across nb <= 128 blocks using first 4 warps (128 threads), then warp 0 across 4 warps!
+    if (tid < 128) {
+        MtpTopRow& r = rows[row_idx];
+        if (tid < nb) {
+            m = ((volatile const float*) r.m)[tid];
+            lsum = ((volatile const float*) r.l)[tid];
+            v0 = ((volatile const float*) r.v0)[tid]; i0 = ((volatile const int32_t*) r.i0)[tid];
+            v1 = ((volatile const float*) r.v1)[tid]; i1 = ((volatile const int32_t*) r.i1)[tid];
+            v2 = ((volatile const float*) r.v2)[tid]; i2 = ((volatile const int32_t*) r.i2)[tid];
+            v3 = ((volatile const float*) r.v3)[tid]; i3 = ((volatile const int32_t*) r.i3)[tid];
+        } else {
+            m = ninf; lsum = 0.0f;
+            v0 = ninf; v1 = ninf; v2 = ninf; v3 = ninf;
+            i0 = n_vocab + 160 + tid; i1 = n_vocab + 300 + tid;
+            i2 = n_vocab + 440 + tid; i3 = n_vocab + 580 + tid;
+        }
+        mtp_warp_reduce(m, lsum, v0, i0, v1, i1, v2, i2, v3, i3, 16);
+        if (lane == 0) {
+            sm[warp] = m; sl[warp] = lsum;
+            sv0[warp] = v0; si0[warp] = i0;
+            sv1[warp] = v1; si1[warp] = i1;
+            sv2[warp] = v2; si2[warp] = i2;
+            sv3[warp] = v3; si3[warp] = i3;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (lane < 4) {
+            m = sm[lane]; lsum = sl[lane];
+            v0 = sv0[lane]; i0 = si0[lane];
+            v1 = sv1[lane]; i1 = si1[lane];
+            v2 = sv2[lane]; i2 = si2[lane];
+            v3 = sv3[lane]; i3 = si3[lane];
+        } else {
+            m = ninf; lsum = 0.0f;
+            v0 = ninf; v1 = ninf; v2 = ninf; v3 = ninf;
+            i0 = n_vocab + 720 + lane; i1 = n_vocab + 760 + lane;
+            i2 = n_vocab + 800 + lane; i3 = n_vocab + 840 + lane;
+        }
+        mtp_warp_reduce(m, lsum, v0, i0, v1, i1, v2, i2, v3, i3, 2);
+        if (lane == 0) {
+            const float M_tot = m;
+            const float L_tot = lsum;
+            const float invL = L_tot > 0.0f ? (1.0f / L_tot) : 0.0f;
+            const int r0 = i0, r1 = i1, r2 = i2, r3 = i3;
+            const int32_t t0 = (r0 >= 0 && r0 < n_vocab) ? (dvocab ? dvocab[r0] : r0) : 0;
+            const int32_t t1 = (r1 >= 0 && r1 < n_vocab) ? (dvocab ? dvocab[r1] : r1) : -1;
+            const int32_t t2 = (r2 >= 0 && r2 < n_vocab) ? (dvocab ? dvocab[r2] : r2) : -1;
+            const int32_t t3 = (r3 >= 0 && r3 < n_vocab) ? (dvocab ? dvocab[r3] : r3) : -1;
+            const float p0 = (r0 >= 0 && r0 < n_vocab && invL > 0.0f) ? (__expf(v0 - M_tot) * invL) : 0.0f;
+            const float p1 = (r1 >= 0 && r1 < n_vocab && invL > 0.0f) ? (__expf(v1 - M_tot) * invL) : 0.0f;
+            const float p2 = (r2 >= 0 && r2 < n_vocab && invL > 0.0f) ? (__expf(v2 - M_tot) * invL) : 0.0f;
+            const float p3 = (r3 >= 0 && r3 < n_vocab && invL > 0.0f) ? (__expf(v3 - M_tot) * invL) : 0.0f;
+
+            if (out_ids != nullptr) out_ids[row_idx] = t0;
+            if (out_probs != nullptr) out_probs[row_idx] = p0;
+            if (row_idx == 0 && tok_dst != nullptr) *tok_dst = t0;
+            if (top4_ids != nullptr) {
+                const int base = (step_j + row_idx) * 4;
+                top4_ids[base + 0] = t0;
+                top4_ids[base + 1] = t1;
+                top4_ids[base + 2] = t2;
+                top4_ids[base + 3] = t3;
+            }
+            if (top4_probs != nullptr) {
+                const int base = (step_j + row_idx) * 4;
+                top4_probs[base + 0] = p0;
+                top4_probs[base + 1] = p1;
+                top4_probs[base + 2] = p2;
+                top4_probs[base + 3] = p3;
+            }
+            if (row_idx == 0 && m_prob != nullptr) ((volatile float*) m_prob)[step_j] = p0;
+            if (row_idx == 0 && m_out != nullptr) {
+                __threadfence_system();
+                ((volatile int32_t*) m_out)[step_j] = t0;
+            }
+            rows[row_idx].counter = 0;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(32) mtp_zero_d2h_gate_kernel(
+    int step_j, unsigned long long cond_handle, const MtpZeroD2hCtrl* __restrict__ ctrl,
+    MtpZeroD2hState* __restrict__ st, const float* __restrict__ step_prob,
+    int32_t* m_n_gen, int32_t* m_best_rows) {
+    if (threadIdx.x != 0) return;
+    if (step_j == 0) {
+        st->q = 1.0;
+        st->e = 1.0;
+        const double c1 = (double) ctrl->cost_ms[1];
+        st->best_v = c1 > 0.0 ? (1.0 / c1) : 0.0;
+        st->best_rows = 1;
+        st->n_generated = 0;
+    }
+    st->n_generated = step_j + 1;
+    const float pj = *step_prob;
+    bool keep = false;
+    const int max_steps = ctrl->max_steps;
+    const int cap = ctrl->cap < 1 ? 1 : (ctrl->cap > MtpZeroD2hCtrl::kMaxT ? MtpZeroD2hCtrl::kMaxT : ctrl->cap);
+
+    if (ctrl->mode == 0) {
+        st->best_rows = min(cap, step_j + 2);
+        keep = (step_j + 1 < max_steps);
+    } else if (ctrl->mode == 1) {
+        st->best_rows = min(cap, step_j + 2);
+        keep = (step_j + 1 < max_steps) && (pj >= ctrl->min_p);
+    } else {
+        int b = (int) ((double) pj * 8.0);
+        if (b < 0) b = 0;
+        else if (b > 7) b = 7;
+        const double centre = pj < 0.0f ? 0.0 : (pj > 1.0f ? 1.0 : (double) pj);
+        const double a = ((double) ctrl->pa_ok[b] + 4.0 * centre) / ((double) ctrl->pa_n[b] + 4.0);
+        st->q *= a;
+        st->e += st->q;
+        const int rows = step_j + 2;
+        const double m3 = 1.0 + (double) ctrl->margin / 3.0;
+        if (rows <= cap) {
+            const double v = st->e / (double) ctrl->cost_ms[rows];
+            if (v > st->best_v * m3) {
+                st->best_v = v;
+                st->best_rows = rows;
+            }
+            if (!ctrl->fixed && (double) ctrl->cost_n[rows] < 3.0 && st->q >= 0.15)
+                st->best_rows = rows;
+        }
+        if (step_j + 1 < max_steps && rows + 1 <= cap) {
+            const double v1 = (st->e + st->q * a) / (double) ctrl->cost_ms[rows + 1];
+            const double v2 = (rows + 2 <= cap)
+                ? (st->e + st->q * a + st->q * a * a) / (double) ctrl->cost_ms[rows + 2]
+                : 0.0;
+            const double vm = v1 > v2 ? v1 : v2;
+            keep = (vm > st->best_v * m3) ||
+                   (!ctrl->fixed && (double) ctrl->cost_n[rows + 1] < 3.0 && st->q * a >= 0.15);
+        }
+    }
+
+    if (m_best_rows != nullptr) ((volatile int32_t*) m_best_rows)[0] = st->best_rows;
+    if (m_n_gen != nullptr) {
+        __threadfence_system();
+        ((volatile int32_t*) m_n_gen)[0] = st->n_generated;
+    }
+#if !defined(__HIPCC__) && defined(CUDART_VERSION) && CUDART_VERSION >= 12040
+    if (cond_handle != 0) {
+        static_assert(sizeof(cudaGraphConditionalHandle) <= sizeof(unsigned long long), "handle fits in u64");
+        cudaGraphSetConditional((cudaGraphConditionalHandle) cond_handle, keep ? 1u : 0u);
+    }
+#endif
+}
+
+}  // namespace
+
+uint64_t mtp_topk_prob_select_scratch_bytes(int n_rows) {
+    return (uint64_t) std::max(1, n_rows) * sizeof(MtpTopRow);
+}
+
+void mtp_topk_prob_select(const float* logits, int n_rows, int n_vocab, const int32_t* dvocab, const float* R_src,
+                          int64_t R_stride, const int32_t* row_dev, float* R_dst, int32_t* tok_dst, int32_t* out_ids,
+                          float* out_probs, int32_t* m_out, float* m_prob, int32_t* top4_ids, float* top4_probs,
+                          int step_j, void* scratch, void* stream) {
+    if (n_rows <= 0 || n_vocab <= 0) return;
+    int nb = std::min(kMtpTopBlocks, std::max(1, (n_vocab + 511) / 512));
+    int per_block = ((n_vocab + nb - 1) / nb + 3) & ~3;
+    nb = std::max(1, (n_vocab + per_block - 1) / per_block);
+    mtp_topk_prob_select_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kMtpTopThreads, 0, (cudaStream_t) stream>>>(
+        logits, n_vocab, per_block, dvocab, R_src, R_stride, row_dev, R_dst, tok_dst, out_ids, out_probs, m_out,
+        m_prob, top4_ids, top4_probs, step_j, (MtpTopRow*) scratch);
+    check("mtp_topk_prob_select");
+}
+
+bool mtp_zero_d2h_supported() {
+#if !defined(__HIPCC__) && defined(CUDART_VERSION) && CUDART_VERSION >= 12040
+    return true;
+#else
+    return false;
+#endif
+}
+
+void mtp_zero_d2h_gate(int step_j, unsigned long long cond_handle, const MtpZeroD2hCtrl* ctrl, MtpZeroD2hState* st,
+                       const float* step_prob, int32_t* m_n_gen, int32_t* m_best_rows, void* stream) {
+    mtp_zero_d2h_gate_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(
+        step_j, cond_handle, ctrl, st, step_prob, m_n_gen, m_best_rows);
+    check("mtp_zero_d2h_gate");
+}
+
+
+// ---- PR 6.2b: Tree Speculative Verification & Commit Kernels (clean-room MIT, STACK:0 LOCAL:0, 0 extra VRAM)
+namespace {
+
+__global__ void __launch_bounds__(S) gdn_conv_l2_tree_kernel(const float* __restrict__ hist,
+                                                             const float* __restrict__ qkv,
+                                                             const float* __restrict__ w,
+                                                             float* __restrict__ h, int C, int qk_heads, float eps,
+                                                             const TreeVerifyMeta* __restrict__ meta) {
+    __shared__ float part[S / 32];
+    const int bx = (int) blockIdx.x;
+    const int t = (int) blockIdx.y;
+    const int c = bx * S + (int) threadIdx.x;
+    const int s0 = meta->gdn_conv_src[t][0];
+    const int s1 = meta->gdn_conv_src[t][1];
+    const int s2 = meta->gdn_conv_src[t][2];
+    const float v0 = s0 < 0 ? hist[c * 3 + (3 + s0)] : qkv[(size_t) s0 * C + c];
+    const float v1 = s1 < 0 ? hist[c * 3 + (3 + s1)] : qkv[(size_t) s1 * C + c];
+    const float v2 = s2 < 0 ? hist[c * 3 + (3 + s2)] : qkv[(size_t) s2 * C + c];
+    const float x = qkv[(size_t) t * C + c];
+    const float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+    float y = sum / (1.0f + __expf(-sum));
+    if (bx < qk_heads) {
+        float sq = y * y;
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+        __syncthreads();
+        const float ss = part[0] + part[1] + part[2] + part[3];
+        y *= rsqrtf(ss + eps);
+    }
+    h[(size_t) t * C + c] = y;
+}
+
+// 128 threads/CTA (GS_COLS=32 x RG=4), 32 KiB dynamic smem 2-slot DFS state stack -> 2 CTA/SM on sm_70, 0 extra VRAM.
+__global__ void __launch_bounds__(GS_COLS * RG, 2) gdn_step_split_tree_kernel(
+    const float* __restrict__ state, const float* __restrict__ hbuf, int C,
+    const float* __restrict__ gate, const float* __restrict__ beta,
+    float* __restrict__ y, int h_k, int h_v, int T,
+    const TreeVerifyMeta* __restrict__ meta) {
+    extern __shared__ float s_stk[];   // [kTreeMaxGdnStack][RG * GS_COLS * RPG] = 32768 bytes
+    __shared__ float sk[S], sq[S];
+    __shared__ float red_kv[RG][GS_COLS], red_o[RG][GS_COLS];
+    const int head = (int) blockIdx.x;
+    const int c0 = (int) blockIdx.y * GS_COLS;
+    const int lc = (int) threadIdx.x;
+    const int col = c0 + lc;
+    const int rg = (int) threadIdx.y;
+    const int tid = rg * GS_COLS + lc;    // 0..127
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    const int value_dim = S * h_v;
+    const int n = min(T, meta->T);
+    float s[RPG];
+    const float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = __ldg(&base[r * row_stride]);
+
+    for (int t = 0; t < n; ++t) {
+        const int rslot = (int) meta->gdn_restore[t];
+        if (rslot >= 0) {
+            const float* src = s_stk + (size_t) rslot * (RG * GS_COLS * RPG) + (size_t) tid * RPG;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = src[r];
+        }
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();
+        sk[tid] = ht[qk + qh * S + tid];
+        sq[tid] = ht[qh * S + tid];
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red_kv[rg][lc] = kv;
+        __syncthreads();
+        const float kv_col = red_kv[0][lc] + red_kv[1][lc] + red_kv[2][lc] + red_kv[3][lc];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        red_o[rg][lc] = o;
+        __syncthreads();
+        if (rg == 0) {
+            y[(size_t) t * value_dim + head * S + col] =
+                (red_o[0][lc] + red_o[1][lc] + red_o[2][lc] + red_o[3][lc]) * rsqrtf((float) S);
+        }
+        const int sslot = (int) meta->gdn_save[t];
+        if (sslot >= 0) {
+            float* dst = s_stk + (size_t) sslot * (RG * GS_COLS * RPG) + (size_t) tid * RPG;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) dst[r] = s[r];
+        }
+    }
+}
+
+__global__ void __launch_bounds__(32) qsa_tree_filter_sel_kernel(int32_t* __restrict__ sel,
+                                                                 int32_t* __restrict__ steps,
+                                                                 int64_t cap,
+                                                                 const TreeVerifyMeta* __restrict__ meta) {
+    if (threadIdx.x != 0) return;
+    const int t = (int) blockIdx.x;
+    const int p0 = steps[kStepPos];   // root node 0 physical KV slot
+    int32_t* st = steps + t * kStepCount;
+    const int n_ids = st[kStepWidth];
+    int32_t* ids = sel + (size_t) t * (size_t) cap;
+    int lo = 0, hi = n_ids;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (ids[mid] < p0) lo = mid + 1;
+        else hi = mid;
+    }
+    const uint32_t mask = meta->anc_mask[t];
+    const int n_anc = meta->depth[t] + 1;
+    int base = lo;
+    if (base + n_anc > (int) cap) base = (int) cap - n_anc;
+    int w = 0;
+    for (int j = 0; j <= t; ++j) {
+        if ((mask >> j) & 1u) ids[base + (w++)] = p0 + j;
+    }
+    st[kStepWidth] = base + w;
+}
+
+__global__ void __launch_bounds__(256) gdn_conv_commit_tree_layers_kernel(
+    float* __restrict__ hist0, long long hist_stride, const float* __restrict__ qkv0, long long qkv_stride,
+    int C, const int32_t* __restrict__ n_keep, const int32_t* __restrict__ path) {
+    const int c = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (c >= C) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    float* hist = hist0 + (long long) blockIdx.y * hist_stride;
+    const float* qkv = qkv0 + (long long) blockIdx.y * qkv_stride;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;   // last 3 of [hist(3) | qkv[path[0..n-1]]]
+        seq[j] = src < 3 ? hist[c * 3 + src] : qkv[(size_t) path[src - 3] * C + c];
+    }
+    hist[c * 3] = seq[0];
+    hist[c * 3 + 1] = seq[1];
+    hist[c * 3 + 2] = seq[2];
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_tree_layers_kernel(
+    float* __restrict__ state0, long long state_stride, const float* __restrict__ hbuf0, long long h_stride,
+    int C, const float* __restrict__ gate0, const float* __restrict__ beta0, long long gb_stride,
+    int h_k, int h_v, const int32_t* __restrict__ n_keep, const int32_t* __restrict__ path) {
+    const int n = *n_keep;
+    if (n <= 0) return;
+    const long long z = (long long) blockIdx.z;
+    float* state = state0 + z * state_stride;
+    const float* hbuf = hbuf0 + z * h_stride;
+    const float* gate = gate0 + z * gb_stride;
+    const float* beta = beta0 + z * gb_stride;
+
+    __shared__ float sk[S];
+    __shared__ float red[RG][32];
+    const int head = (int) blockIdx.x;
+    const int col_local = (int) threadIdx.x;
+    const int col = (int) blockIdx.y * 32 + col_local;
+    const int rg = (int) threadIdx.y;
+    const int tid = rg * 32 + col_local;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int k = 0; k < n; ++k) {
+        const int t = path[k];
+        const float* ht = hbuf + (size_t) t * C;
+        __syncthreads();
+        sk[tid] = ht[qk + qh * S + tid];
+        __syncthreads();
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][col_local] = kv;
+        __syncthreads();
+        const float kv_col = red[0][col_local] + red[1][col_local] + red[2][col_local] + red[3][col_local];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+}
+
+__device__ __forceinline__ void kv_copy_bytes(void* dst_base, long long dst_row, const void* src_base, long long src_row,
+                                              int row_bytes, int tid, int nthreads) {
+    uint8_t* d = static_cast<uint8_t*>(dst_base) + dst_row * (long long) row_bytes;
+    const uint8_t* s = static_cast<const uint8_t*>(src_base) + src_row * (long long) row_bytes;
+    for (int i = tid; i < row_bytes; i += nthreads) d[i] = s[i];
+}
+
+__global__ void __launch_bounds__(128) qsa_kv_compact_tree_layers_kernel(
+    QsaKvCompactLayers layers, const int32_t* __restrict__ pos0_dev, const int32_t* __restrict__ n_keep,
+    const int32_t* __restrict__ path, const int32_t* __restrict__ need_compact) {
+    if (need_compact != nullptr && *need_compact == 0) return;
+    const int n = *n_keep;
+    if (n <= 1) return;
+    const int li = (int) blockIdx.y;
+    const int h = (int) blockIdx.x;
+    if (li >= layers.n) return;
+    const QsaKvCompactLayer& L = layers.layer[li];
+    if (h >= L.n_kv_heads) return;
+    const int tid = (int) threadIdx.x;
+    const int nt = (int) blockDim.x;
+    const long long p0 = (long long) (*pos0_dev);
+    const int ps = L.page_size;
+    const int hd = L.head_dim;
+    const int k_bytes = (L.kv_mode == 0) ? (hd * 2) : ((L.kv_mode == 2) ? ((hd / 32) * 18) : hd);
+    const int v_bytes = (L.kv_mode == 0) ? (hd * 2) : ((L.kv_mode == 2 || L.kv_mode == 3) ? ((hd / 32) * 18) : hd);
+    const int sc_bytes = (hd / 64) * 2;
+
+    for (int k = 1; k < n; ++k) {
+        const int src_idx = path[k];
+        if (src_idx == k) continue;
+        const long long sp = p0 + (long long) src_idx;
+        const long long dp = p0 + (long long) k;
+        const long long spg = (long long) L.page_table[sp / ps];
+        const long long dpg = (long long) L.page_table[dp / ps];
+        if (spg >= 0 && dpg >= 0) {
+            const long long srow = (spg * L.n_kv_heads + h) * ps + (sp % ps);
+            const long long drow = (dpg * L.n_kv_heads + h) * ps + (dp % ps);
+            if (L.k_pool) kv_copy_bytes(L.k_pool, drow, L.k_pool, srow, k_bytes, tid, nt);
+            if (L.v_pool) kv_copy_bytes(L.v_pool, drow, L.v_pool, srow, v_bytes, tid, nt);
+            if (L.k_scale) kv_copy_bytes(L.k_scale, drow, L.k_scale, srow, sc_bytes, tid, nt);
+            if (L.v_scale) kv_copy_bytes(L.v_scale, drow, L.v_scale, srow, sc_bytes, tid, nt);
+        }
+        if (L.h_k_pool != nullptr || L.h_v_pool != nullptr) {
+            const long long srow = ((sp / ps) * L.n_kv_heads + h) * ps + (sp % ps);
+            const long long drow = ((dp / ps) * L.n_kv_heads + h) * ps + (dp % ps);
+            if (L.h_k_pool) kv_copy_bytes(L.h_k_pool, drow, L.h_k_pool, srow, k_bytes, tid, nt);
+            if (L.h_v_pool) kv_copy_bytes(L.h_v_pool, drow, L.h_v_pool, srow, v_bytes, tid, nt);
+            if (L.h_k_scale) kv_copy_bytes(L.h_k_scale, drow, L.h_k_scale, srow, sc_bytes, tid, nt);
+            if (L.h_v_scale) kv_copy_bytes(L.h_v_scale, drow, L.h_v_scale, srow, sc_bytes, tid, nt);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void __launch_bounds__(256) gather_rows_f32_path_kernel(
+    const float* __restrict__ src0, float* __restrict__ dst0, int64_t row_floats, int64_t layer_stride,
+    const int32_t* __restrict__ n_keep, const int32_t* __restrict__ path, const int32_t* __restrict__ need_compact) {
+    if (need_compact != nullptr && *need_compact == 0) return;
+    const int n = *n_keep;
+    if (n <= 0) return;
+    const int li = (int) blockIdx.y;
+    const float* src = src0 + (size_t) li * (size_t) layer_stride;
+    float* dst = dst0 + (size_t) li * (size_t) layer_stride;
+    const int64_t tid = (int64_t) blockIdx.x * (int64_t) blockDim.x + (int64_t) threadIdx.x;
+    const int64_t st = (int64_t) gridDim.x * (int64_t) blockDim.x;
+    for (int k = 0; k < n; ++k) {
+        const int srow = path[k];
+        if (src == dst && srow == k) continue;
+        const float* sp = src + (size_t) srow * (size_t) row_floats;
+        float* dp = dst + (size_t) k * (size_t) row_floats;
+        for (int64_t i = tid; i < row_floats; i += st) dp[i] = sp[i];
+        __syncthreads();
+    }
+}
+
+}  // namespace
+
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                      int qk_heads, float eps, int n_tok, const TreeVerifyMeta* meta, void* stream) {
+    if (n_tok <= 0) return;
+    const dim3 grid((unsigned) (channels / S), (unsigned) n_tok);
+    gdn_conv_l2_tree_kernel<<<grid, S, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, channels, qk_heads, eps, meta);
+    check("gdn_conv_l2_tree");
+}
+
+void gdn_step_norm_tree(const float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const TreeVerifyMeta* meta, void* stream, void* xq_out) {
+    if (n_tok <= 0) return;
+    constexpr size_t kSmemBytes = (size_t) kTreeMaxGdnStack * (size_t) (RG * GS_COLS * RPG) * sizeof(float);
+    static std::once_flag attr_once;
+    std::call_once(attr_once, [] {
+        (void) cudaFuncSetAttribute(gdn_step_split_tree_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int) kSmemBytes);
+        (void) cudaGetLastError();
+    });
+    cudaStream_t cs = (cudaStream_t) stream;
+    const dim3 grid_split((unsigned) h_v, (unsigned) (S / GS_COLS));
+    gdn_step_split_tree_kernel<<<grid_split, dim3(GS_COLS, RG), kSmemBytes, cs>>>(
+        state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, meta);
+    check("gdn_step_split_tree");
+    const dim3 grid_norm((unsigned) h_v, (unsigned) n_tok);
+    if (xq_out != nullptr)
+        gdn_out_norm_kernel<true><<<grid_norm, dim3(S, RG), 0, cs>>>(z, gamma, eps, y, h_v, n_tok, nullptr, 0,
+                                                                     (GdnQ81*) xq_out);
+    else
+        gdn_out_norm_kernel<false><<<grid_norm, dim3(S, RG), 0, cs>>>(z, gamma, eps, y, h_v, n_tok, nullptr, 0, nullptr);
+    check("gdn_out_norm (tree)");
+}
+
+void qsa_tree_filter_sel(int32_t* sel, int32_t* steps, int n_tok, int64_t cap, const TreeVerifyMeta* meta, void* stream) {
+    if (n_tok <= 0) return;
+    qsa_tree_filter_sel_kernel<<<(unsigned) n_tok, 32, 0, (cudaStream_t) stream>>>(sel, steps, cap, meta);
+    check("qsa_tree_filter_sel");
+}
+
+void gdn_commit_tree_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                            const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                            int conv_channels, int h_k, int h_v, int n_layers, const int32_t* n_keep,
+                            const int32_t* path, void* stream) {
+    if (n_layers <= 0) return;
+    cudaStream_t cs = (cudaStream_t) stream;
+    const dim3 gc((unsigned) ((conv_channels + 255) / 256), (unsigned) n_layers);
+    gdn_conv_commit_tree_layers_kernel<<<gc, 256, 0, cs>>>(
+        state + conv_off, state_stride, qkv, qkv_stride, conv_channels, n_keep, path);
+    check("gdn_conv_commit_tree_layers");
+    const dim3 gs((unsigned) h_v, (unsigned) (S / 32), (unsigned) n_layers);
+    gdn_step_commit_tree_layers_kernel<<<gs, dim3(32, RG), 0, cs>>>(
+        state, state_stride, h, h_stride, conv_channels, gate, beta, gb_stride, h_k, h_v, n_keep, path);
+    check("gdn_step_commit_tree_layers");
+}
+
+void qsa_kv_compact_tree_layers(const QsaKvCompactLayers& layers, const int32_t* pos0_dev, const int32_t* n_keep,
+                                const int32_t* path, const int32_t* need_compact, void* stream) {
+    if (layers.n <= 0) return;
+    int max_h = 1;
+    for (int i = 0; i < layers.n; ++i) max_h = std::max(max_h, layers.layer[i].n_kv_heads);
+    const dim3 grid((unsigned) max_h, (unsigned) layers.n);
+    qsa_kv_compact_tree_layers_kernel<<<grid, 128, 0, (cudaStream_t) stream>>>(
+        layers, pos0_dev, n_keep, path, need_compact);
+    check("qsa_kv_compact_tree_layers");
+}
+
+void gather_rows_f32_path(const float* src, float* dst, int64_t row_floats, int64_t layer_stride, int n_layers,
+                          const int32_t* n_keep, const int32_t* path, const int32_t* need_compact, void* stream) {
+    if (n_layers <= 0 || row_floats <= 0) return;
+    const unsigned bx = (src == dst) ? 1u : (unsigned) std::min<int64_t>(16, (row_floats + 255) / 256);
+    gather_rows_f32_path_kernel<<<dim3(bx, (unsigned) n_layers), 256, 0, (cudaStream_t) stream>>>(
+        src, dst, row_floats, layer_stride, n_keep, path, need_compact);
+    check("gather_rows_f32_path");
+}
 
 }  // namespace strata::kernels

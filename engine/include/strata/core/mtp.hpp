@@ -32,6 +32,9 @@
 #include <string>
 #include <vector>
 
+namespace strata::spec { class DraftPolicy; }
+namespace strata::kernels { struct MtpZeroD2hCtrl; struct MtpZeroD2hState; }
+
 namespace strata::core {
 
 class NativeHead;
@@ -77,7 +80,21 @@ public:
     bool draft_head_view(const NativeHead* head, const std::string& vocab_path, DraftHeadView& out) const;
     /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
     static bool top2_env();
-    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
+    int32_t top2(int j) const {
+        if (h_top4_ids_ != nullptr && j >= 0 && j < 16) return h_top4_ids_[j * 4 + 1];
+        return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1;
+    }
+    int32_t top4_id(int j, int k) const {
+        return (h_top4_ids_ != nullptr && j >= 0 && j < 16 && k >= 0 && k < 4) ? h_top4_ids_[j * 4 + k] : -1;
+    }
+    float top4_prob(int j, int k) const {
+        return (h_top4_probs_ != nullptr && j >= 0 && j < 16 && k >= 0 && k < 4) ? h_top4_probs_[j * 4 + k] : 0.0f;
+    }
+    const int32_t* top4_ids_host() const { return h_top4_ids_; }
+    const float* top4_probs_host() const { return h_top4_probs_; }
+    /// PR 6.2b: continue a second branch from the saved root residual `R_root_` with `alt_tok` for `n_steps` (1..2).
+    bool draft_alt_branch(int32_t alt_tok, int64_t cell0, int max_steps, int32_t* out_toks, float* out_probs,
+                          int* n_out, std::string& err);
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
 
@@ -147,6 +164,12 @@ public:
     /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
     /// Also called once for the last step of a chain that reached its length (so the rule sees every draft). Empty: min_p decides.
     void set_chain_rule(std::function<bool(int, float)> f) { chain_rule_ = std::move(f); }
+    /// PR 6.2a: bind DraftPolicy for Zero-D2H GPU keep_draft inside a single conditional CUDA Graph.
+    void set_cost_policy(const strata::spec::DraftPolicy* pol, int* chain_rows_out, int cap) {
+        cost_policy_ = pol;
+        chain_rows_out_ = chain_rows_out;
+        cost_cap_ = cap;
+    }
 
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
@@ -249,13 +272,17 @@ private:
     bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
     /// The rest for row 0 at step row `step_row`: the attention from the q projection, the MLP, the final mixer,
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
-    bool record_rest(int step_row, cudaStream_t cs, std::string& err);
+    bool record_rest(int step_row, cudaStream_t cs, std::string& err, int fused_select_j = -1);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
+    bool capture_zero_d2h(int T, std::string& err);
+    cudaGraphExec_t zero_d2h_exec_[9] = {};
+    bool capture_alt_branch(int n_steps, std::string& err);
+    cudaGraphExec_t alt_branch_exec_[3] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
@@ -340,6 +367,16 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr, *h_row_ = nullptr, *m_row_ = nullptr;
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
+    // PR 6.2a: fused top-4 mapped outputs & Zero-D2H conditional graph control/state
+    int32_t *h_top4_ids_ = nullptr, *m_top4_ids_ = nullptr;
+    float *h_top4_probs_ = nullptr, *m_top4_probs_ = nullptr;
+    strata::kernels::MtpZeroD2hCtrl *h_zctrl_ = nullptr, *m_zctrl_ = nullptr;
+    int32_t *h_zout_ = nullptr, *m_zout_ = nullptr;
+    strata::kernels::MtpZeroD2hState* zstate_ = nullptr;
+    uint8_t* topk_scratch_ = nullptr;
+    const strata::spec::DraftPolicy* cost_policy_ = nullptr;
+    int* chain_rows_out_ = nullptr;
+    int cost_cap_ = 1;
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
@@ -359,6 +396,8 @@ private:
     // device
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
+    float* R_root_ = nullptr;
+    int32_t *h_alt_tok_ = nullptr, *m_alt_tok_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
     float* xn_ = nullptr;
     /// gr_read's scratch of the drafter's own (not the session's ss.block.gr: the last stage's verifier uses that one,

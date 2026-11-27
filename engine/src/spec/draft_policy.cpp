@@ -446,6 +446,9 @@ void mark_learned_real(CostFile& cf) {
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
     : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
+    const char* eco_e = std::getenv("STRATA_ECOSPEC");
+    ecospec_on_ = (eco_e == nullptr || eco_e[0] == '\0' || eco_e[0] != '0');
+    for (auto& row : eco_miss_cost_) row.fill(-1.0);
     const FixedEnv& f = fixed_env();
     if (f.on)
         for (int k = 0; k < kCtxBuckets; ++k) set_fixed_costs(f.n > 0 ? f.ms : nullptr, f.n, k);
@@ -492,7 +495,27 @@ double DraftPolicy::lookup_rate(int match) const {
     return (ok_[b] + kPriorN * kPriorQ[b]) / (ok_[b] + bad_[b] + kPriorN);
 }
 
-double DraftPolicy::cost_ms(int t) const {
+namespace {
+double eco_u_scale(int t) {
+    static constexpr double kU[DraftPolicy::kMaxT + 1] = {
+        0.0, 1.00, 1.70, 2.31, 2.88, 3.40, 3.89, 4.35, 4.80,
+        5.20, 5.58, 5.94, 6.28, 6.60, 6.90, 7.18, 7.45};
+    return kU[std::clamp(t, 1, DraftPolicy::kMaxT)];
+}
+}  // namespace
+
+void DraftPolicy::observe_hit_rate(double hit_rate, int64_t miss_entries, double cpu_ms) {
+    if (!std::isfinite(hit_rate)) return;
+    const double m = std::clamp(1.0 - hit_rate, 0.0, 1.0);
+    eco_last_miss_ = m;
+    eco_miss_ema_ = (eco_miss_ema_ < 0.0) ? m : (0.75 * eco_miss_ema_ + 0.25 * m);
+    if (miss_entries >= 48 && cpu_ms > 0.05 && std::isfinite(cpu_ms)) {
+        const double rate = std::clamp(cpu_ms / (double) miss_entries, 0.005, 0.15);
+        eco_ms_per_miss_ = 0.85 * eco_ms_per_miss_ + 0.15 * rate;
+    }
+}
+
+double DraftPolicy::raw_cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
     if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
     // scale from the measured sizes, weighting each by how often it was seen
@@ -506,9 +529,21 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
+double DraftPolicy::cost_ms(int t) const {
+    t = std::clamp(t, 1, kMaxT);
+    const double base = raw_cost_ms(t);
+    if (!ecospec_on_ || fixed_ || eco_miss_ema_ < 0.0 || cost_n_[bk_][t] <= 0) return base;
+    const double ref_m = eco_miss_cost_[bk_][t];
+    if (ref_m < 0.0) return base;
+    const double dm = eco_miss_ema_ - ref_m;
+    if (std::fabs(dm) < 0.01) return base;
+    const double delta_ms = dm * (480.0 * eco_u_scale(t)) * eco_ms_per_miss_;
+    return std::max(0.55 * base, base + delta_ms);
+}
+
 double DraftPolicy::clamp_sample(int t, double ms) const {
     if (!robust_) return ms;
-    const double known = cost_ms(t);           // the measured value, or the scaled guess from the other widths
+    const double known = raw_cost_ms(t);       // the measured value, or the scaled guess from the other widths
     if (cost_n_[bk_][t] == 0) {
         // the first use of a width captures its graph: that round says nothing about its cost, the guess from the other widths stands in
         for (int u = 1; u <= kMaxT; ++u)
@@ -653,6 +688,7 @@ void DraftPolicy::observe_forced(int t, double round_ms) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        if (eco_last_miss_ >= 0.0) eco_miss_cost_[bk_][t] = (cost_n_[bk_][t] > 0 && eco_miss_cost_[bk_][t] >= 0.0) ? (1.0 - alpha) * eco_miss_cost_[bk_][t] + alpha * eco_last_miss_ : eco_last_miss_;
         cost_n_[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;
     }
@@ -673,6 +709,7 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        if (eco_last_miss_ >= 0.0) eco_miss_cost_[bk_][t] = (cost_n_[bk_][t] > 0 && eco_miss_cost_[bk_][t] >= 0.0) ? (1.0 - alpha) * eco_miss_cost_[bk_][t] + alpha * eco_last_miss_ : eco_last_miss_;
         cost_n_[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;
     }
@@ -972,6 +1009,24 @@ void DraftPolicy::observe_probs(const float* p, int n, int accepted) {
     }
 }
 
+void DraftPolicy::fill_gpu_ctrl(int cap, float* cost_ms_out, float* cost_n_out, float* pa_ok_out, float* pa_n_out,
+                                float& margin_out, int& fixed_out) const {
+    const int n = std::clamp(cap, 1, kMaxT);
+    cost_ms_out[0] = 0.0f;
+    cost_n_out[0] = 0.0f;
+    for (int t = 1; t <= kMaxT; ++t) {
+        cost_ms_out[t] = (float) cost_ms(t);
+        cost_n_out[t] = (float) cost_n_[bk_][t];
+    }
+    (void) n;
+    for (int b = 0; b < kPBuckets; ++b) {
+        pa_ok_out[b] = (float) pa_ok_[b];
+        pa_n_out[b] = (float) pa_n_[b];
+    }
+    margin_out = (float) margin_;
+    fixed_out = fixed_ ? 1 : 0;
+}
+
 bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
     cap = std::clamp(cap, 1, max_t_);
     if (idx == 0) {
@@ -1039,6 +1094,7 @@ void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, doubl
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        if (eco_last_miss_ >= 0.0) eco_miss_cost_[bk_][t] = (cost_n_[bk_][t] > 0 && eco_miss_cost_[bk_][t] >= 0.0) ? (1.0 - alpha) * eco_miss_cost_[bk_][t] + alpha * eco_last_miss_ : eco_last_miss_;
         cost_n_[bk_][t] += 1.0;
         last_[bk_][t] = rounds_;
     }

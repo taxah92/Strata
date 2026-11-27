@@ -42,4 +42,11 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
 void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                                    float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
 
+
+/// PR 6.2b: Tree verify PLE postops: uses dilated conv taps `ple_tap[T][3]` and writes history snapshots `snap`
+/// using `ple_hist_src[T][9]` without modifying `history` (committed later from `snap[path[n_keep-1]]`).
+void native_ple_postops_tree_snap(float* key, float* hidden, const float* value, const float* history,
+                                  const PleWeights& w, float* query_norm, float* gated, float* gate, int T,
+                                  const int32_t* ple_tap, const int32_t* ple_hist_src, float* snap, void* stream);
+
 } // namespace strata::kernels

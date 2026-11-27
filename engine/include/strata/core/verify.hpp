@@ -228,6 +228,11 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// PR 6.2b: Tree speculative verification (<= kTreeMaxNodes DFS-ordered nodes, 0 extra buffer VRAM).
+    bool tree_supported() const;
+    bool run_tree(int T, const int32_t* tokens, const int32_t* parent, int64_t pos0, PoolMultiFn pool, void* user,
+                  int32_t* out, std::string& err);
+    bool commit_tree(const int32_t* path, int n_keep, std::string& err);
 
     /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
     /// window that advanced the state itself (see commit), and on every stage of a chain.  serve_skip_stopped_window asks this
@@ -637,6 +642,7 @@ private:
     bool staged_ = false;
     bool copy_used_ = false;
     bool capture_commit(std::string& err);
+    bool capture_commit_tree(std::string& err);
     bool record_window(int T, cudaStream_t cs, std::string& err);
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)
@@ -695,6 +701,17 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     bool capture_oom_ = false;          // the last capture's instantiate found no VRAM (prepare)
     cudaGraphExec_t commit_exec_ = nullptr;
+    // PR 6.2b: Tree Verify / Commit graphs & mapped metadata (0 extra arena buffer VRAM)
+    cudaGraphExec_t tree_exec_[2][strata::kernels::kTreeMaxNodes + 1] = {};
+    cudaGraphExec_t tree_exec_nr_[2][strata::kernels::kTreeMaxNodes + 1] = {};
+    bool launched_tree_[2][strata::kernels::kTreeMaxNodes + 1] = {}, launched_tree_nr_[2][strata::kernels::kTreeMaxNodes + 1] = {};
+    bool graph_head_bp_tree_[2][strata::kernels::kTreeMaxNodes + 1] = {}, graph_head_bp_tree_nr_[2][strata::kernels::kTreeMaxNodes + 1] = {};
+    cudaGraphExec_t commit_tree_exec_ = nullptr;
+    bool tree_active_ = false;
+    bool tree_rec_ = false;
+    strata::kernels::TreeVerifyMeta *h_tree_ = nullptr, *m_tree_ = nullptr;
+    strata::kernels::TreeVerifyMeta *tree_dev_ = nullptr;
+    int32_t *h_tcommit_ = nullptr, *m_tcommit_ = nullptr, *tcommit_ = nullptr;
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
