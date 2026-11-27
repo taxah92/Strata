@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -270,6 +271,110 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
     for (size_t r = 0; r < n; ++r)
         ranked[r] = {(int32_t) (order[r] / n_expert), (int32_t) (order[r] % n_expert)};
     return ranked;
+}
+
+std::vector<SessionExpertEntry> extract_session_expert_hist(
+    const float* counts, int64_t n_layers, int64_t n_expert, size_t max_entries) {
+    std::vector<SessionExpertEntry> out;
+    if (counts == nullptr || n_layers <= 0 || n_expert <= 0 || max_entries == 0) return out;
+    const size_t total = (size_t) n_layers * (size_t) n_expert;
+    out.reserve(std::min<size_t>(total, max_entries * 2));
+    for (int64_t l = 0; l < n_layers; ++l) {
+        const float* row = counts + (size_t) l * (size_t) n_expert;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            const float w = row[e];
+            if (w > 0.0f && std::isfinite(w)) {
+                out.push_back(SessionExpertEntry{(uint16_t) l, (uint16_t) e, w});
+            }
+        }
+    }
+    auto cmp = [](const SessionExpertEntry& a, const SessionExpertEntry& b) {
+        if (a.weight != b.weight) return a.weight > b.weight;
+        if (a.layer != b.layer) return a.layer < b.layer;
+        return a.expert < b.expert;
+    };
+    if (out.size() > max_entries) {
+        std::nth_element(out.begin(), out.begin() + (ptrdiff_t) max_entries, out.end(), cmp);
+        out.resize(max_entries);
+    }
+    std::sort(out.begin(), out.end(), cmp);
+    return out;
+}
+
+std::vector<SessionWarmupSwap> plan_session_warmup(
+    const std::vector<SessionExpertEntry>& hist,
+    const int32_t* residency,
+    const float* current_usage,
+    int64_t n_layers,
+    int64_t n_expert,
+    int64_t max_swaps) {
+    std::vector<SessionWarmupSwap> plan;
+    if (hist.empty() || residency == nullptr || n_layers <= 0 || n_expert <= 0 || max_swaps <= 0) return plan;
+    const size_t total = (size_t) n_layers * (size_t) n_expert;
+    std::vector<float> sess_w(total, 0.0f);
+    for (const auto& entry : hist) {
+        if (entry.layer < n_layers && entry.expert < n_expert && entry.weight > 0.0f && std::isfinite(entry.weight)) {
+            const size_t idx = (size_t) entry.layer * (size_t) n_expert + (size_t) entry.expert;
+            if (entry.weight > sess_w[idx]) sess_w[idx] = entry.weight;
+        }
+    }
+    struct Cand {
+        float gain;
+        SessionWarmupSwap sw;
+    };
+    std::vector<Cand> all;
+    std::vector<std::pair<float, int32_t>> incoming;
+    struct Victim { float sess_w; float cur_u; int32_t slot; int32_t expert; };
+    std::vector<Victim> victims;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        incoming.clear();
+        victims.clear();
+        const size_t base = (size_t) l * (size_t) n_expert;
+        for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
+            const int32_t slot = residency[base + (size_t) e];
+            const float sw = sess_w[base + (size_t) e];
+            if (slot < 0) {
+                if (sw > 0.0f) incoming.emplace_back(sw, e);
+            } else {
+                const float cu = current_usage != nullptr ? current_usage[base + (size_t) e] : 0.0f;
+                victims.push_back(Victim{sw, cu, slot, e});
+            }
+        }
+        if (incoming.empty() || victims.empty()) continue;
+        std::sort(incoming.begin(), incoming.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first > b.first : a.second < b.second;
+        });
+        const size_t k = std::min(incoming.size(), victims.size());
+        std::partial_sort(victims.begin(), victims.begin() + (ptrdiff_t) k, victims.end(),
+                          [](const Victim& a, const Victim& b) {
+                              if (a.sess_w != b.sess_w) return a.sess_w < b.sess_w;
+                              if (a.cur_u != b.cur_u) return a.cur_u < b.cur_u;
+                              return a.slot > b.slot;
+                          });
+        for (size_t i = 0; i < k; ++i) {
+            if (incoming[i].first <= victims[i].sess_w) break;
+            const float gain = incoming[i].first - victims[i].sess_w;
+            all.push_back(Cand{gain, SessionWarmupSwap{(int32_t) l, incoming[i].second, victims[i].expert,
+                                                       victims[i].slot, incoming[i].first}});
+        }
+    }
+    auto cmp_cand = [](const Cand& a, const Cand& b) {
+        if (a.gain != b.gain) return a.gain > b.gain;
+        if (a.sw.layer != b.sw.layer) return a.sw.layer < b.sw.layer;
+        return a.sw.in_expert < b.sw.in_expert;
+    };
+    const size_t cap = (size_t) max_swaps;
+    if (all.size() > cap) {
+        std::nth_element(all.begin(), all.begin() + (ptrdiff_t) cap, all.end(), cmp_cand);
+        all.resize(cap);
+    }
+    std::sort(all.begin(), all.end(), [](const Cand& a, const Cand& b) {
+        if (a.sw.layer != b.sw.layer) return a.sw.layer < b.sw.layer;
+        return a.sw.slot < b.sw.slot;
+    });
+    plan.reserve(all.size());
+    for (const auto& c : all) plan.push_back(c.sw);
+    return plan;
 }
 
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,

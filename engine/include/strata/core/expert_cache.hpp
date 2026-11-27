@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/vmm.hpp"
 
 namespace strata::core {
@@ -71,6 +72,29 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 /// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+
+/// PR 6.3c: Planned same-layer VRAM slot swap for session-aware warmup during KV restore.
+struct SessionWarmupSwap {
+    int32_t layer = 0;
+    int32_t in_expert = 0;
+    int32_t out_expert = 0;
+    int32_t slot = -1;
+    float weight = 0.0f;
+};
+
+/// PR 6.3c: Extract top-`max_entries` (default 3500 = 28 KB) routed experts from `counts[n_layers * n_expert]`.
+std::vector<SessionExpertEntry> extract_session_expert_hist(
+    const float* counts, int64_t n_layers, int64_t n_expert, size_t max_entries = kMaxSessionExpertHist);
+
+/// PR 6.3c: Plan up to `max_swaps` same-layer replacements to warm `residency` from `hist`.
+/// Pairs hottest missing session experts with coldest resident experts in the same layer (strict gain).
+std::vector<SessionWarmupSwap> plan_session_warmup(
+    const std::vector<SessionExpertEntry>& hist,
+    const int32_t* residency,
+    const float* current_usage,
+    int64_t n_layers,
+    int64_t n_expert,
+    int64_t max_swaps);
 
 /// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
 /// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those

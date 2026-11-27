@@ -1,6 +1,7 @@
 #include "strata/core/conversation_file.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <bit>
 #include <cerrno>
 #include <chrono>
@@ -49,6 +50,7 @@ constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeader = 64, kTrailer = 16;
 constexpr uint64_t kFlagTrustedNoHash = uint64_t{1} << 1;
+constexpr uint64_t kFlagExpertHistogram = uint64_t{1} << 2;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -725,12 +727,16 @@ void put_payload(Writer& o, const SavedConversation& s, const std::vector<Sessio
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
-        return;
+    } else {
+        o.u64(s.kv.size());
+        for (const auto& k : s.kv) {
+            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+            o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+        }
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+    if (!s.expert_hist.empty()) {
+        o.u64(s.expert_hist.size());
+        o.raw(s.expert_hist.data(), s.expert_hist.size() * sizeof(SessionExpertEntry));
     }
 }
 
@@ -796,7 +802,7 @@ bool get_checkpoint(Reader& in, ConversationCheckpoint& c) {
 }
 
 template<class Reader>
-bool get_payload(Reader& in, SavedConversation& s) {
+bool get_payload(Reader& in, SavedConversation& s, bool has_expert_hist = false) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -846,6 +852,12 @@ bool get_payload(Reader& in, SavedConversation& s) {
                 !in.buffer(k.pooled, 4)) return false;
         }
     }
+    if (has_expert_hist) {
+        if (!in.vec(s.expert_hist, (uint64_t) kMaxSessionExpertHist * sizeof(SessionExpertEntry))) return false;
+        for (const auto& e : s.expert_hist) {
+            if (!std::isfinite(e.weight) || e.weight < 0.0f) return in.fail("invalid expert histogram weight");
+        }
+    }
     return true;
 }
 
@@ -881,7 +893,7 @@ bool validate_header(const uint8_t* h, uint64_t size, const SessionFileIdentity&
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r1 != 0 || (r0 & ~kFlagTrustedNoHash) != 0) {
+    if (hsize != kHeader || r1 != 0 || (r0 & ~(kFlagTrustedNoHash | kFlagExpertHistogram)) != 0) {
         error = "session file: invalid header fields";
         return false;
     }
@@ -1098,6 +1110,7 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
         n = sat_add(n, 7 * 8);
         for (uint64_t b : l.max_kv_bytes[(size_t) i]) n = sat_add(n, sat_add(8, b));
     }
+    n = sat_add(n, 8 + (uint64_t) kMaxSessionExpertHist * sizeof(SessionExpertEntry));
     return std::min(n, l.max_file_bytes);
 }
 
@@ -1115,6 +1128,10 @@ bool measure_impl(const SavedConversation& image, const std::vector<SessionKvSou
                   std::string& error) {
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (image.expert_hist.size() > kMaxSessionExpertHist) {
+        error = "session file: expert histogram exceeds maximum entries";
+        return false;
+    }
     Out sizing;
     put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
@@ -1142,7 +1159,8 @@ bool write_stream(RawFile& raw, const SavedConversation& image, const std::vecto
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    const uint64_t flags = image.expert_hist.empty() ? 0 : kFlagExpertHistogram;
+    header_bytes(h, id, payload, flags);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1318,7 +1336,7 @@ bool read_body(RawFile& raw, uint64_t size, const SessionFileIdentity& id, Saved
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!get_payload(in, parsed, (flags & kFlagExpertHistogram) != 0)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1551,7 +1569,8 @@ bool write_fd_mmap(int fd, uint64_t cur_size, uint64_t total, uint64_t payload, 
     MmapWriteGuard guard{mapped, (size_t) total};
     uint8_t* const base = static_cast<uint8_t*>(mapped);
     if (opt.progress) opt.progress(0, total);
-    header_bytes(base, id, payload, kFlagTrustedNoHash);
+    const uint64_t flags = kFlagTrustedNoHash | (image.expert_hist.empty() ? 0 : kFlagExpertHistogram);
+    header_bytes(base, id, payload, flags);
 
     MemOut out;
     out.cur = base + kHeader;
@@ -1640,10 +1659,11 @@ bool read_fd_mmap(int fd, uint64_t size, const SessionFileIdentity& id, SavedCon
         }
     }
 
+    const bool has_hist = (flags & kFlagExpertHistogram) != 0;
     // Dry-validate metadata + bounds before admission so admit charges only metadata+checkpoints, not mapped KV.
     MemIn<true> dry{base + kHeader, trailer, nullptr, error, limits};
     SavedConversation dummy;
-    if (!get_payload(dry, dummy)) return false;
+    if (!get_payload(dry, dummy, has_hist)) return false;
     if (dry.left() != 0) {
         error = "session file: payload has " + std::to_string(dry.left()) + " unparsed bytes";
         return false;
@@ -1661,7 +1681,7 @@ bool read_fd_mmap(int fd, uint64_t size, const SessionFileIdentity& id, SavedCon
 
     SavedConversation parsed;
     MemIn<false> in{base + kHeader, trailer, &owner_view, error, limits};
-    if (!get_payload(in, parsed)) return false;
+    if (!get_payload(in, parsed, has_hist)) return false;
     if (in.left() != 0) {
         error = "session file: payload has " + std::to_string(in.left()) + " unparsed bytes";
         return false;

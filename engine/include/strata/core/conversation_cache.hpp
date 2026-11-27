@@ -190,6 +190,16 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+/// PR 6.3c: Top routed experts of a session (up to 3500 entries = 28 KB) stored alongside
+/// parked state so a peer replica (e.g. 16 GB r1) can warm its VRAM expert cache while restoring KV.
+struct SessionExpertEntry {
+    uint16_t layer = 0;
+    uint16_t expert = 0;
+    float weight = 0.0f;
+};
+static_assert(sizeof(SessionExpertEntry) == 8, "SessionExpertEntry must be 8 bytes");
+inline constexpr size_t kMaxSessionExpertHist = 3500;
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
@@ -209,6 +219,8 @@ struct SavedConversation {
     /// --conversation-cache-dir: the disk tier's copy of this conversation (conversation_disk.hpp), 0 = none yet,
     /// UINT64_MAX = a write was tried and failed (not tried again until the entry is evicted).  Run-time only.
     uint64_t disk_id = 0;
+    /// PR 6.3c: optional <= 28 KB top-3500 routed expert histogram of this session (serialized when non-empty).
+    std::vector<SessionExpertEntry> expert_hist;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -218,7 +230,8 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) +
+                   expert_hist.capacity() * sizeof(SessionExpertEntry);
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();

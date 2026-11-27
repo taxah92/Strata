@@ -1708,9 +1708,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_PLE_BATCH");
                 return !e || e[0] != '0';
             }();
+            static const bool ple_fused_v70_env = [] {
+                const char* e = std::getenv("STRATA_PLE_FUSED_V70");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
             const bool ple_has_key = ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr;
             const bool ple_batch_kv = (ple_batch_env || tree_rec_) && dec_batch && n > 1 &&
-                                      (tree_rec_ ? ple_has_key : ss.ple.w.key_bf16 != nullptr) &&
+                                      ((tree_rec_ || ple_fused_v70_env) ? ple_has_key : ss.ple.w.key_bf16 != nullptr) &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
             // S25 (STRATA_PLE_BATCH=1): the key and value projections depend only on each row's n-gram embedding, so
@@ -1758,7 +1762,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // hyper-connection read's `lo_`, which the read below rewrites.
             static const bool ple_post_env = [] {
                 const char* e = std::getenv("STRATA_DF_PLE");
-                return e != nullptr && std::atoi(e) != 0;
+                if (e != nullptr) return std::atoi(e) != 0;
+                return ple_fused_v70_env;
             }();
             const bool ple_post = ple_batch_kv && (ple_post_env || tree_rec_) && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
@@ -3752,7 +3757,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 else if (p2 < 0) { prev[0] = ss.ple_prev[1]; prev[1] = tokens[p1]; }
                 else { prev[0] = tokens[p2]; prev[1] = tokens[p1]; }
                 ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
-                ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
             }
         } else {
             int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
@@ -3760,9 +3764,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
                 prev[0] = prev[1];
                 prev[1] = tokens[t];
-                ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
             }
         }
+        ss.ple.table->prefetch_batch(ple_rows, (size_t) T);
     }
 #if defined(STRATA_VERIFY_HGL)
     std::optional<HostGraphLaunch> launch_o;   // (not set when the previous stage launched this window already)

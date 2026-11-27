@@ -12,6 +12,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace strata::ngram {
 
@@ -33,42 +36,122 @@ constexpr size_t LATENCY_RING = 65536;
 constexpr uint32_t WAYS = 8;
 constexpr uint32_t EMPTY = 0xFFFFFFFFu;
 
-/// Set-associative row cache: 8 ways per set, round-robin replacement inside a set. Bounded by construction.
+/// PR 6.3a: 8-way set-associative exact LRU row cache with lazy anonymous backing on Linux
+/// (zero startup page-fault tax and strict RSS ceiling <= cache_bytes()).
+/// Each set keeps a 64-bit recency word `lru[s]`: byte 0 = MRU way, byte 7 = LRU victim.
+/// Initialized to 0x0706050403020100 so empty ways 7..0 are always filled before any eviction.
 struct RowCache {
+    static constexpr uint64_t kInitLru = 0x0706050403020100ull;
     uint64_t sets = 0;
     uint32_t rb = ROW_BYTES;        // bytes per row
     std::vector<uint32_t> keys;     // sets * WAYS
-    std::vector<uint8_t> data;      // sets * WAYS * rb
-    std::vector<uint8_t> next;      // per-set replacement pointer
+    std::vector<uint64_t> lru;      // sets (8 way-index bytes, byte 0 = MRU, byte 7 = LRU)
+#if defined(__linux__)
+    uint8_t* data = nullptr;        // lazy MAP_PRIVATE | MAP_ANONYMOUS backing (sets * WAYS * rb)
+    size_t data_bytes = 0;
+#else
+    std::vector<uint8_t> data_vec;
+    uint8_t* data = nullptr;
+    size_t data_bytes = 0;
+#endif
     uint64_t used = 0;
 
+    ~RowCache() { release_data(); }
+
+    void release_data() {
+#if defined(__linux__)
+        if (data != nullptr && data_bytes > 0) ::munmap(data, data_bytes);
+        data = nullptr;
+        data_bytes = 0;
+#else
+        data_vec.clear();
+        data_vec.shrink_to_fit();
+        data = nullptr;
+        data_bytes = 0;
+#endif
+    }
+
+    static uint64_t bytes_per_set(uint32_t row_bytes) {
+        return (uint64_t) WAYS * (sizeof(uint32_t) + (uint64_t) row_bytes) + sizeof(uint64_t);
+    }
+
+    uint64_t total_bytes() const {
+        return sets * bytes_per_set(rb);
+    }
+
     void init(uint64_t rows, uint32_t row_bytes = ROW_BYTES) {
+        release_data();
         sets = rows / WAYS;
         rb = row_bytes;
-        keys.assign(sets * WAYS, EMPTY);
-        data.assign(sets * WAYS * rb, 0);
-        next.assign(sets, 0);
         used = 0;
+        if (sets == 0) {
+            keys.clear(); keys.shrink_to_fit();
+            lru.clear();  lru.shrink_to_fit();
+            return;
+        }
+        const size_t db = (size_t) (sets * WAYS * (uint64_t) rb);
+#if defined(__linux__)
+        void* p = ::mmap(nullptr, db, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            sets = 0;
+            keys.clear(); lru.clear();
+            return;
+        }
+        data = static_cast<uint8_t*>(p);
+        data_bytes = db;
+#else
+        data_vec.assign(db, 0);
+        data = data_vec.data();
+        data_bytes = db;
+#endif
+        keys.assign((size_t) (sets * WAYS), EMPTY);
+        lru.assign((size_t) sets, kInitLru);
     }
     static uint64_t mix(uint32_t r) {
         uint64_t x = r * 0x9E3779B97F4A7C15ull;
         return x ^ (x >> 29);
     }
-    const uint8_t* find(uint32_t row) const {
+    static inline uint64_t touch_way(uint64_t ord, uint32_t w) {
+        if ((ord & 0xFFu) == w) return ord;
+        // Locate way `w` at byte position p (1..7), shift bytes [0..p-1] up by 8, place `w` at byte 0.
+        for (uint32_t p = 1; p < WAYS; ++p) {
+            if (((ord >> (p * 8)) & 0xFFu) == w) {
+                const uint64_t lo_mask = (1ull << (p * 8)) - 1ull;
+                const uint64_t hi_mask = (p == 7) ? 0ull : (~0ull << ((p + 1) * 8));
+                return (ord & hi_mask) | ((ord & lo_mask) << 8) | (uint64_t) w;
+            }
+        }
+        return ord;
+    }
+    const uint8_t* find(uint32_t row) {
         if (sets == 0) return nullptr;
         const uint64_t s = mix(row) % sets;
-        for (uint32_t w = 0; w < WAYS; ++w)
-            if (keys[s * WAYS + w] == row) return &data[(s * WAYS + w) * rb];
+        const uint32_t* k = keys.data() + s * WAYS;
+        for (uint32_t w = 0; w < WAYS; ++w) {
+            if (k[w] == row) {
+                lru[s] = touch_way(lru[s], w);
+                return data + (s * WAYS + w) * (size_t) rb;
+            }
+        }
         return nullptr;
     }
     void insert(uint32_t row, const uint8_t* bytes) {
-        if (sets == 0 || find(row) != nullptr) return;
+        if (sets == 0) return;
         const uint64_t s = mix(row) % sets;
-        uint32_t w = next[s];
-        next[s] = (uint8_t) ((w + 1) % WAYS);
-        if (keys[s * WAYS + w] == EMPTY) ++used;
-        keys[s * WAYS + w] = row;
-        std::memcpy(&data[(s * WAYS + w) * rb], bytes, rb);
+        uint32_t* k = keys.data() + s * WAYS;
+        for (uint32_t w = 0; w < WAYS; ++w) {
+            if (k[w] == row) {
+                lru[s] = touch_way(lru[s], w);
+                return;
+            }
+        }
+        // Evict LRU way (byte 7 of lru[s]) and promote it to MRU (byte 0).
+        const uint64_t ord = lru[s];
+        const uint32_t w = (uint32_t) (ord >> 56);
+        lru[s] = (ord << 8) | (uint64_t) w;
+        if (k[w] == EMPTY) ++used;
+        k[w] = row;
+        std::memcpy(data + (s * WAYS + w) * (size_t) rb, bytes, rb);
     }
 };
 
@@ -156,6 +239,7 @@ struct PleReader::Impl {
     }
 
     bool pump() {
+        bool submitted_any = false;
         while (!queue.empty() && !free_slots.empty()) {
             const uint32_t s = free_slots.back();
             free_slots.pop_back();
@@ -179,10 +263,16 @@ struct PleReader::Impl {
                 return false;
             }
             last_read_us = j.issued_us;
+            submitted_any = true;
             if (!j.keepalive) {                    // a keep-alive read counts when it completes (`finish`)
                 stats.submit_us += now_us() - j.issued_us;
                 ++stats.reads;
             }
+        }
+        if (submitted_any) {
+            const double t0 = now_us();
+            file.flush();
+            stats.submit_us += now_us() - t0;
         }
         return true;
     }
@@ -458,7 +548,7 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
         ts.pending = 0;
         return Ticket{id};
     }
-    constexpr size_t kStackMisses = 64;
+    constexpr size_t kStackMisses = 256;
     uint32_t n_jobs = 0;
     if (n <= kStackMisses) {
         Miss misses[kStackMisses];
@@ -619,9 +709,18 @@ void PleReader::reset_stats() {
     std::unique_lock<std::mutex> lk(m.mu, std::defer_lock);
     if (m.threaded) lk.lock();                     // the worker may be counting a keep-alive read
     m.stats = ReaderStats{};
+    m.stats.using_uring = m.file.using_uring();
     m.ring_pos = 0;
 }
 uint64_t PleReader::cache_capacity() const { return impl_->cache.sets * WAYS; }
 uint64_t PleReader::cache_size() const { return impl_->cache.used; }
+uint64_t PleReader::cache_bytes() const { return impl_->cache.total_bytes(); }
+bool PleReader::using_uring() const { return impl_->file.using_uring(); }
+uint64_t PleReader::rows_for_ram_mib(uint64_t mib, uint32_t row_bytes) {
+    if (mib == 0 || row_bytes == 0) return 0;
+    const uint64_t budget = mib << 20;
+    const uint64_t bps = RowCache::bytes_per_set(row_bytes);
+    return (budget / bps) * WAYS;
+}
 
 }  // namespace strata::ngram

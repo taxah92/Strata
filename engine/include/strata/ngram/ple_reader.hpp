@@ -39,6 +39,7 @@ struct ReaderStats {
     uint64_t late_injected = 0;   ///< reads delayed by fault injection
     uint64_t keepalive_reads = 0; ///< pages read only to keep the SSD awake (not in `reads`, `bytes` or latencies)
     double keepalive_us_max = 0;  ///< the slowest of them
+    bool using_uring = false;     ///< PR 6.3a: true when DirectFile uses Linux io_uring
     std::vector<float> read_us;   ///< last <= 65,536 read latencies, for percentiles
     double percentile(double q) const;
 };
@@ -91,6 +92,12 @@ public:
     void reset_stats();
     uint64_t cache_capacity() const;
     uint64_t cache_size() const;
+    /// Exact byte ceiling of the RAM LRU cache (keys + data + LRU metadata).
+    uint64_t cache_bytes() const;
+    /// True when DirectFile uses Linux io_uring batch-submission.
+    bool using_uring() const;
+    /// Compute the maximum row count whose LRU cache fits strictly inside `mib` MiB.
+    static uint64_t rows_for_ram_mib(uint64_t mib, uint32_t row_bytes = ROW_BYTES);
 
 private:
     struct Impl;

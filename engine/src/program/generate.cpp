@@ -815,6 +815,8 @@ struct Options {
     std::string ple_io = "direct";
     bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     int64_t ple_row_cache = 1 << 20;   ///< bounded row cache (rows of 90 B); 0 disables
+    bool ple_row_cache_explicit = false;
+    int64_t ple_ram_cache_mib = -1;    ///< PR 6.3a: --ple-ram-cache-mib N (-1 = env/auto, 0 = use --ple-row-cache)
     int ple_inflight = 256;   // the prompt path reads a chunk's rows at once: 64 left the SSD half idle (32K: 303 -> 189 ms)
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
@@ -1255,6 +1257,7 @@ void usage() {
                  "                       ram: the whole table locked in RAM at start (VirtualLock on Windows,\n"
                  "                       mlock elsewhere), so no SSD read sits on the prompt or token path\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
+                 "  --ple-ram-cache-mib N  PR 6.3a: RAM LRU cache cap in MiB (default: auto 1536 MiB when >=24 GiB RAM available; 0 = use --ple-row-cache)\n"
                  "  --ple-inflight N     outstanding SSD reads (default 256)\n"
                  "  --ple-delay-us U     fault injection: each row read completes no earlier than U us\n"
                  "  --ple-sync-submit    A/B arm: submit table reads on the token thread (default: an I/O thread)\n"
@@ -3902,7 +3905,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
-        else if (a == "--ple-row-cache") o.ple_row_cache = std::atoll(next("--ple-row-cache"));
+        else if (a == "--ple-row-cache") { o.ple_row_cache = std::atoll(next("--ple-row-cache")); o.ple_row_cache_explicit = true; }
+        else if (a == "--ple-ram-cache-mib") o.ple_ram_cache_mib = std::atoll(next("--ple-ram-cache-mib"));
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
@@ -5028,9 +5032,9 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
-        o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
-        std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
+    if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_ram_cache_mib < -1 ||
+        o.ple_inflight < 1 || o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
+        std::fprintf(stderr, "strata generate: invalid --ple-io/--ple-row-cache/--ple-ram-cache-mib/--ple-inflight/--ple-delay-us\n");
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
@@ -6251,6 +6255,18 @@ int main(int argc, char** argv) {
         const auto tpl = Clock::now();
         pio.max_inflight = (uint32_t) o.ple_inflight;
         pio.cache_rows = (uint64_t) o.ple_row_cache;
+        {
+            int64_t ram_mib = o.ple_ram_cache_mib;
+            if (ram_mib < 0) {
+                if (const char* env_mib = std::getenv("STRATA_PLE_RAM_CACHE_MIB"); env_mib != nullptr && *env_mib != '\0') {
+                    ram_mib = std::atoll(env_mib);
+                } else if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_row_cache_explicit) {
+                    const auto avail = strata::core::available_host_bytes();
+                    if (avail && *avail >= (24ull << 30)) ram_mib = 1536;
+                }
+            }
+            if (ram_mib > 0) pio.cache_ram_mib = (uint64_t) ram_mib;
+        }
         pio.io_thread = !o.ple_sync_submit;
         // Keep the SSD awake while rows are being asked for (PleReader::set_keepalive): some SSDs stall the first
         // reads 50-150 ms after ~250 ms without a command.  STRATA_SSD_KEEPALIVE = ms without a read before one
@@ -14093,6 +14109,17 @@ int main(int argc, char** argv) {
                 const strata::core::ConversationView view{src.ids, src.imgs, n_st > 0 ? cs.stage0 : checks, src.cvec};
                 if (!strata::core::conversation_snapshot_sources(metas[0], sources[0], view, src.session, g, src.draft0, e))
                     return skip(e, "capture");
+                static const bool sw_on = [] {
+                    const char* ev = std::getenv("STRATA_SESSION_WARMUP");
+                    return ev == nullptr || std::atoi(ev) != 0;
+                }();
+                if (sw_on && !drive.d.usage.empty()) {
+                    const bool has_sess = std::any_of(drive.d.session_usage.begin(), drive.d.session_usage.end(),
+                                                      [](float v) { return v > 0.0f; });
+                    const auto& src_u = has_sess ? drive.d.session_usage : drive.d.usage;
+                    metas[0].expert_hist = strata::core::extract_session_expert_hist(
+                        src_u.data(), g.n_layers, g.n_expert, strata::core::kMaxSessionExpertHist);
+                }
                 if (!strata::core::session_file_measure(metas[0], sources[0], stage_bytes[0], e))
                     return skip(e, "measure");
             }
@@ -14399,6 +14426,19 @@ int main(int argc, char** argv) {
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
+                }
+                {
+                    static const bool sw_on = [] {
+                        const char* ev = std::getenv("STRATA_SESSION_WARMUP");
+                        return ev == nullptr || std::atoi(ev) != 0;
+                    }();
+                    if (sw_on && !drive.d.usage.empty()) {
+                        const bool has_sess = std::any_of(drive.d.session_usage.begin(), drive.d.session_usage.end(),
+                                                          [](float v) { return v > 0.0f; });
+                        const auto& src_u = has_sess ? drive.d.session_usage : drive.d.usage;
+                        image.expert_hist = strata::core::extract_session_expert_hist(
+                            src_u.data(), g.n_layers, g.n_expert, strata::core::kMaxSessionExpertHist);
+                    }
                 }
                 auto mem_after = strata::core::sample_host_memory();
                 // (the park pools' idle memory is the first RAM to go back here too: a park the check refuses with the pools held would pass without them)
@@ -15112,8 +15152,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON: a missed expert that every token of a verify window routes at rank %d or "
                                  "lower is skipped (answers differ slightly); it is off when STRATA_ROUTE_TAIL_SKIP is not set or is 0\n",
                          strata::core::tail_skip_rank(), strata::core::tail_skip_rank());
-        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
+        if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident) {
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+            drive.d.session_usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        }
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
@@ -20139,9 +20181,87 @@ int main(int argc, char** argv) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
             }
+            auto session_warmup_begin = [&](const std::vector<strata::core::SessionExpertEntry>& hist,
+                                            std::vector<strata::core::SessionWarmupSwap>& swaps,
+                                            Clock::time_point& wt0) {
+                swaps.clear();
+                static const bool sw_on = [] {
+                    const char* ev = std::getenv("STRATA_SESSION_WARMUP");
+                    return ev == nullptr || std::atoi(ev) != 0;
+                }();
+                static const int64_t sw_max = [] {
+                    const char* ev = std::getenv("STRATA_SESSION_WARMUP_MAX");
+                    const int64_t v = ev && *ev ? std::atoll(ev) : 2048;
+                    return std::clamp<int64_t>(v, 0, (int64_t) strata::core::kMaxSessionExpertHist);
+                }();
+                if (!sw_on || sw_max <= 0 || hist.empty() || !stages.empty() || all_experts_resident ||
+                    !xcache.valid() || xcache.sealed() || srcp != &arena_src || host_res.empty() ||
+                    adapt_stream == nullptr || adapt_ev == nullptr)
+                    return;
+                wt0 = Clock::now();
+                adapt_quiesce();
+                swaps = strata::core::plan_session_warmup(
+                    hist, host_res.data(), drive.d.usage.empty() ? nullptr : drive.d.usage.data(),
+                    g.n_layers, g.n_expert, sw_max);
+                if (swaps.empty()) return;
+                std::vector<void*> dsts; dsts.reserve(swaps.size());
+                std::vector<const void*> srcs; srcs.reserve(swaps.size());
+                std::vector<size_t> bytes_v; bytes_v.reserve(swaps.size());
+                for (const auto& sw : swaps) {
+                    const uint8_t* b = srcp->blob(sw.layer, sw.in_expert);
+                    if (b == nullptr) { swaps.clear(); return; }
+                    dsts.push_back(xcache.device_slot(sw.slot));
+                    srcs.push_back(b);
+                    bytes_v.push_back((size_t) strata::kernels::cpu::expert_layout().blob_bytes(sw.layer));
+                }
+                if (strata::core::copy_blobs(dsts.data(), srcs.data(), bytes_v.data(), dsts.size(),
+                                             adapt_stream, /*dma=*/false) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    swaps.clear();
+                    return;
+                }
+                cudaEventRecord(adapt_ev, adapt_stream);
+                (void) cudaStreamQuery(adapt_stream);
+            };
+            auto session_warmup_finish = [&](const std::vector<strata::core::SessionExpertEntry>& hist,
+                                             std::vector<strata::core::SessionWarmupSwap>& swaps,
+                                             Clock::time_point wt0) {
+                if (!swaps.empty()) {
+                    cudaEventSynchronize(adapt_ev);
+                    for (const auto& sw : swaps) {
+                        host_res[(size_t) sw.layer * (size_t) g.n_expert + (size_t) sw.out_expert] = strata::core::kNotResident;
+                        host_res[(size_t) sw.layer * (size_t) g.n_expert + (size_t) sw.in_expert] = sw.slot;
+                    }
+                    (void) res_upload();
+                    drive.d.res_dirty = false;
+                    drive.d.res_dirty_idx.clear();
+                    const double wms = std::chrono::duration<double, std::milli>(Clock::now() - wt0).count();
+                    std::fprintf(stderr, "strata serve: session warmup: preloaded %zu/%zu experts on %s in %.1f ms (overlapped with KV restore)\n",
+                                 swaps.size(), hist.size(),
+                                 o.conversation_parent_parking_owner.empty() ? "gpu0" : o.conversation_parent_parking_owner.c_str(), wms);
+                    swaps.clear();
+                }
+                if (!hist.empty() && !drive.d.session_usage.empty()) {
+                    std::fill(drive.d.session_usage.begin(), drive.d.session_usage.end(), 0.0f);
+                    float max_w = 0.0f;
+                    for (const auto& e : hist) if (e.weight > max_w) max_w = e.weight;
+                    const float norm = max_w > 0.0f ? (20.0f / max_w) : 0.0f;
+                    for (float& u : drive.d.usage) u *= 0.25f;
+                    for (const auto& e : hist) {
+                        if (e.layer < g.n_layers && e.expert < g.n_expert) {
+                            const size_t idx = (size_t) e.layer * (size_t) g.n_expert + (size_t) e.expert;
+                            drive.d.session_usage[idx] = e.weight;
+                            if (!drive.d.usage.empty()) drive.d.usage[idx] = std::max(drive.d.usage[idx], e.weight * norm);
+                        }
+                    }
+                }
+            };
             if (borrow) {
                 const auto t0 = Clock::now();
                 const strata::core::SavedConversation* donor = parent_mode ? &*incoming : conversations.find(parked.serial);
+                std::vector<strata::core::SessionWarmupSwap> wswaps;
+                Clock::time_point wt0;
+                if (donor != nullptr) session_warmup_begin(donor->expert_hist, wswaps, wt0);
                 if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
                                                                        use_mtp ? &mtp.kv_state() : nullptr, err,
@@ -20159,6 +20279,7 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
+                session_warmup_finish(donor->expert_hist, wswaps, wt0);
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
@@ -20181,6 +20302,9 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
+                std::vector<strata::core::SessionWarmupSwap> wswaps;
+                Clock::time_point wt0;
+                session_warmup_begin(incoming->expert_hist, wswaps, wt0);
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err,
                         pool_pfor) !=
@@ -20216,6 +20340,7 @@ int main(int argc, char** argv) {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
+                session_warmup_finish(incoming->expert_hist, wswaps, wt0);
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
                 if (stages.empty()) {
@@ -20312,6 +20437,7 @@ int main(int argc, char** argv) {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
+                    if (!drive.d.session_usage.empty()) std::fill(drive.d.session_usage.begin(), drive.d.session_usage.end(), 0.0f);
                     cudaStreamSynchronize(main_stream);
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
@@ -22858,15 +22984,16 @@ int main(int argc, char** argv) {
                     const int cap = std::min<int>(S_mtp, (int) drafts.size() + 1);
                     for (int t = 1; t < cap && (req_spec_min_p <= 0.0 || dprob[(size_t) t - 1] >= (float) req_spec_min_p); ++t) ++n_pf;
                     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-                    auto pf = [&](int32_t tok) {
-                        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                    const int n_tot = std::min(1 + n_pf, 16);
+                    uint32_t batch_rows[16 * strata::kernels::PLE_N_HEADS];
+                    for (int i = 0; i < n_tot; ++i) {
+                        const int32_t tok = (i == 0) ? outv[(size_t) a_] : drafts[(size_t) (i - 1)];
+                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts,
+                                                    batch_rows + (size_t) i * strata::kernels::PLE_N_HEADS);
                         prev[0] = prev[1];
                         prev[1] = tok;
-                        ss.ple.table->prefetch_rows(rows16);
-                    };
-                    pf(outv[(size_t) a_]);
-                    for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
+                    }
+                    ss.ple.table->prefetch_batch(batch_rows, (size_t) n_tot);
                 }
                 return true;
             };
@@ -24089,6 +24216,10 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            if (const char* iost = std::getenv("STRATA_IO_STATS"); iost != nullptr && std::atoi(iost) != 0) {
+                if (const std::string io = ple_table.io_report(); !io.empty())
+                    std::fprintf(stderr, "strata serve: %s\n", io.c_str());
+            }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
                                      "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
@@ -25254,15 +25385,16 @@ int main(int argc, char** argv) {
                         ++n_pf;
                     }
                     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-                    auto pf = [&](int32_t tok) {
-                        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                    const int n_tot = std::min(1 + n_pf, 16);
+                    uint32_t batch_rows[16 * strata::kernels::PLE_N_HEADS];
+                    for (int i = 0; i < n_tot; ++i) {
+                        const int32_t tok = (i == 0) ? outv[(size_t) a_] : drafts[(size_t) (i - 1)];
+                        strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts,
+                                                    batch_rows + (size_t) i * strata::kernels::PLE_N_HEADS);
                         prev[0] = prev[1];
                         prev[1] = tok;
-                        ss.ple.table->prefetch_rows(rows16);
-                    };
-                    pf(outv[(size_t) a_]);
-                    for (int i = 0; i < n_pf; ++i) pf(drafts[(size_t) i]);
+                    }
+                    ss.ple.table->prefetch_batch(batch_rows, (size_t) n_tot);
                 }
                 return true;
             }
