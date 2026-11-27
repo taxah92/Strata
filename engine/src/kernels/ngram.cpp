@@ -297,9 +297,12 @@ struct PleTable::Impl {
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     static constexpr size_t kMaxPrefetch = 16;
     size_t n_prefetch = 0;
+    size_t n_prefetch_tickets = 0;
     strata::ngram::PleReader::Ticket prefetch_tickets[kMaxPrefetch] = {};
     uint32_t prefetch_keys[kMaxPrefetch][PLE_N_HEADS] = {};
-    uint8_t prefetch_raw[kMaxPrefetch][PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
+    size_t prefetch_off[kMaxPrefetch] = {};
+    size_t prefetch_buf_used = 0;
+    uint8_t prefetch_buf[kMaxPrefetch * PLE_N_HEADS * PLE_ROW_BYTES_MAX] = {};
     float scale = 1.0f;               // the FP8 table's one scale
     uint32_t rb = PLE_ROW_BYTES;      // bytes per row
     void decode(const uint8_t* row, float* out160) const { fmt->dequant(row, scale, out160); }
@@ -456,7 +459,10 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         delete impl_->file;
         impl_->file = nullptr;
         impl_->data = nullptr;
-        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, io.cache_rows, err, io.io_thread,
+        const uint64_t eff_cache_rows = io.cache_ram_mib > 0
+            ? strata::ngram::PleReader::rows_for_ram_mib(io.cache_ram_mib, impl_->rb)
+            : io.cache_rows;
+        if (!impl_->reader.open(gguf_path, table_offset, n_rows, io.max_inflight, eff_cache_rows, err, io.io_thread,
                                 impl_->rb)) {
             close();
             return false;
@@ -549,36 +555,80 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
 
 void PleTable::wait_prefetches() {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
-    if (impl_->n_prefetch == 0) return;
+    if (impl_->n_prefetch_tickets == 0 && impl_->n_prefetch == 0) return;
     std::string dummy;
-    for (size_t i = 0; i < impl_->n_prefetch; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
+    for (size_t i = 0; i < impl_->n_prefetch_tickets; ++i) (void) impl_->reader.collect(impl_->prefetch_tickets[i], dummy);
     impl_->n_prefetch = 0;
+    impl_->n_prefetch_tickets = 0;
+    impl_->prefetch_buf_used = 0;
 }
 
-void PleTable::prefetch_rows(const uint32_t* rows16) {
+void PleTable::prefetch_batch(const uint32_t* rows, size_t n_tokens) {
+    if (rows == nullptr || n_tokens == 0) return;
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
-        for (size_t i = 0; i < impl_->n_prefetch; ++i)
-            if (std::memcmp(impl_->prefetch_keys[i], rows16, sizeof(uint32_t) * PLE_N_HEADS) == 0) return;
-        if (impl_->n_prefetch >= Impl::kMaxPrefetch) wait_prefetches();
-        const size_t slot = impl_->n_prefetch++;
-        std::memcpy(impl_->prefetch_keys[slot], rows16, sizeof(uint32_t) * PLE_N_HEADS);
-        impl_->prefetch_tickets[slot] = impl_->reader.issue(impl_->prefetch_keys[slot], PLE_N_HEADS, impl_->prefetch_raw[slot]);
+        const size_t tok_bytes = (size_t) PLE_N_HEADS * impl_->rb;
+        uint32_t batch_rows[Impl::kMaxPrefetch * PLE_N_HEADS];
+        size_t n_new = 0;
+        for (size_t t = 0; t < n_tokens; ++t) {
+            const uint32_t* r16 = rows + t * PLE_N_HEADS;
+            bool dup = false;
+            for (size_t i = 0; i < impl_->n_prefetch; ++i)
+                if (std::memcmp(impl_->prefetch_keys[i], r16, sizeof(uint32_t) * PLE_N_HEADS) == 0) { dup = true; break; }
+            if (dup) continue;
+            for (size_t i = 0; i < n_new; ++i)
+                if (std::memcmp(batch_rows + i * PLE_N_HEADS, r16, sizeof(uint32_t) * PLE_N_HEADS) == 0) { dup = true; break; }
+            if (dup) continue;
+            if (n_new >= Impl::kMaxPrefetch) break;
+            std::memcpy(batch_rows + n_new * PLE_N_HEADS, r16, sizeof(uint32_t) * PLE_N_HEADS);
+            ++n_new;
+        }
+        if (n_new == 0) return;
+        if (impl_->n_prefetch + n_new > Impl::kMaxPrefetch || impl_->n_prefetch_tickets >= Impl::kMaxPrefetch) {
+            wait_prefetches();
+            n_new = 0;
+            for (size_t t = 0; t < n_tokens && n_new < Impl::kMaxPrefetch; ++t) {
+                const uint32_t* r16 = rows + t * PLE_N_HEADS;
+                bool dup = false;
+                for (size_t i = 0; i < n_new; ++i)
+                    if (std::memcmp(batch_rows + i * PLE_N_HEADS, r16, sizeof(uint32_t) * PLE_N_HEADS) == 0) { dup = true; break; }
+                if (!dup) {
+                    std::memcpy(batch_rows + n_new * PLE_N_HEADS, r16, sizeof(uint32_t) * PLE_N_HEADS);
+                    ++n_new;
+                }
+            }
+        }
+        const size_t base_off = impl_->prefetch_buf_used;
+        for (size_t i = 0; i < n_new; ++i) {
+            const size_t slot = impl_->n_prefetch++;
+            std::memcpy(impl_->prefetch_keys[slot], batch_rows + i * PLE_N_HEADS, sizeof(uint32_t) * PLE_N_HEADS);
+            impl_->prefetch_off[slot] = base_off + i * tok_bytes;
+        }
+        impl_->prefetch_buf_used += n_new * tok_bytes;
+        impl_->prefetch_tickets[impl_->n_prefetch_tickets++] =
+            impl_->reader.issue(batch_rows, n_new * PLE_N_HEADS, impl_->prefetch_buf + base_off);
         return;
     }
 #if defined(_WIN32)
     if (impl_->data != nullptr && g_ple_prefetch) {
-        WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
-        ULONG_PTR n = 0;
-        for (int h = 0; h < PLE_N_HEADS; ++h) {
-            if (rows16[h] >= impl_->n_rows) continue;
-            ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
-            ranges[n].NumberOfBytes = impl_->rb;
-            ++n;
+        for (size_t t = 0; t < n_tokens; ++t) {
+            const uint32_t* rows16 = rows + t * PLE_N_HEADS;
+            WIN32_MEMORY_RANGE_ENTRY ranges[PLE_N_HEADS];
+            ULONG_PTR n = 0;
+            for (int h = 0; h < PLE_N_HEADS; ++h) {
+                if (rows16[h] >= impl_->n_rows) continue;
+                ranges[n].VirtualAddress = (PVOID) (impl_->data + (size_t) rows16[h] * impl_->rb);
+                ranges[n].NumberOfBytes = impl_->rb;
+                ++n;
+            }
+            if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
         }
-        if (n > 0) (void) PrefetchVirtualMemory(GetCurrentProcess(), n, ranges, 0);
     }
 #endif
+}
+
+void PleTable::prefetch_rows(const uint32_t* rows16) {
+    prefetch_batch(rows16, 1);
 }
 
 void PleTable::close() {
@@ -701,20 +751,25 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
             }
             if (exact_match) {
                 bool collect_ok = true;
-                for (size_t i = 0; i < impl_->n_prefetch; ++i) {
+                for (size_t i = 0; i < impl_->n_prefetch_tickets; ++i) {
                     std::string ignored;
                     if (!impl_->reader.collect(impl_->prefetch_tickets[i], collect_ok ? err : ignored))
                         collect_ok = false;   // retain the first error, but drain every output buffer
                 }
+                size_t offsets[Impl::kMaxPrefetch];
+                for (size_t t = 0; t < n_tokens; ++t) offsets[t] = impl_->prefetch_off[matched[t]];
                 impl_->n_prefetch = 0;
+                impl_->n_prefetch_tickets = 0;
+                impl_->prefetch_buf_used = 0;
                 if (!collect_ok) return false;
                 for (size_t t = 0; t < n_tokens; ++t) {
+                    const uint8_t* raw_t = impl_->prefetch_buf + offsets[t];
                     for (int h = 0; h < PLE_N_HEADS; ++h) {
-                        impl_->decode(impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
+                        impl_->decode(raw_t + (size_t) h * impl_->rb,
                                       out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
                         if (Impl::check_on())
                             impl_->check_row("gather_batch (prefetched)", rows[t * PLE_N_HEADS + (size_t) h],
-                                             impl_->prefetch_raw[matched[t]] + (size_t) h * impl_->rb,
+                                             raw_t + (size_t) h * impl_->rb,
                                              out + (t * PLE_N_HEADS + (size_t) h) * PLE_HEAD_DIM);
                     }
                 }
@@ -842,19 +897,31 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
 
 bool PleTable::gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
-    if (impl_->data == nullptr || impl_->fmt->id != PleFormat::IQ4_NL || impl_->rb != PLE_ROW_BYTES) return false;
+    if (impl_->fmt->id != PleFormat::IQ4_NL || impl_->rb != PLE_ROW_BYTES) return false;
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    auto fill_zero_row = [](uint8_t* o) {
+        for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+            uint8_t* blk = o + (size_t) b * 18;
+            std::memset(blk, 0, 2);
+            std::memset(blk + 2, 0x88, 16);
+        }
+    };
+    if (impl_->mode == PleIo::Direct && impl_->reader.is_open()) {
+        if (impl_->pending) return false;
+        const_cast<PleTable*>(this)->wait_prefetches();
+        std::string err;
+        const auto ticket = impl_->reader.issue(rows, n, out);
+        if (!impl_->reader.collect(ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (rows[i] >= impl_->n_rows) fill_zero_row(out + i * PLE_ROW_BYTES);
+        impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+        return true;
+    }
+    if (impl_->data == nullptr) return false;
     for (size_t i = 0; i < n; ++i) {
         uint8_t* o = out + i * PLE_ROW_BYTES;
-        if (rows[i] >= impl_->n_rows) {
-            // a row past the table reads as +0.0f (read_row): scale 0 and code 8 (value +1) in every nibble decode to +0.0f
-            // on the device, where all-zero bytes would decode to -0.0f (scale 0 times code 0's value -127)
-            for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
-                uint8_t* blk = o + (size_t) b * 18;
-                std::memset(blk, 0, 2);
-                std::memset(blk + 2, 0x88, 16);
-            }
-        } else std::memcpy(o, impl_->data + (size_t) rows[i] * PLE_ROW_BYTES, PLE_ROW_BYTES);
+        if (rows[i] >= impl_->n_rows) fill_zero_row(o);
+        else std::memcpy(o, impl_->data + (size_t) rows[i] * PLE_ROW_BYTES, PLE_ROW_BYTES);
     }
     impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
     return true;
@@ -865,14 +932,16 @@ void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_del
 std::string PleTable::io_report() const {
     if (impl_->mode != PleIo::Direct || !impl_->reader.is_open()) return {};
     const strata::ngram::ReaderStats s = impl_->reader.snapshot();
-    char buf[400];
+    char buf[480];
     int n = std::snprintf(buf, sizeof buf,
-                  "ple io: %llu rows, %.1f%% row-cache hits, %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
-                  "blocked %.3f ms total (submit %.3f ms), cache %llu/%llu rows",
+                  "ple io: %llu rows, %.1f%% row-cache LRU hits [%s], %llu SSD reads (%.1f MB), read p50 %.0f us p99 %.0f us, "
+                  "blocked %.3f ms total (submit %.3f ms), cache %llu/%llu rows (%.0f MiB cap)",
                   (unsigned long long) s.requests, s.requests ? 100.0 * (double) s.cache_hits / (double) s.requests : 0.0,
+                  impl_->reader.using_uring() ? "io_uring" : "pread",
                   (unsigned long long) s.reads, (double) s.bytes / 1e6, s.percentile(0.5), s.percentile(0.99),
                   s.wait_us / 1000.0, s.submit_us / 1000.0, (unsigned long long) impl_->reader.cache_size(),
-                  (unsigned long long) impl_->reader.cache_capacity());
+                  (unsigned long long) impl_->reader.cache_capacity(),
+                  (double) impl_->reader.cache_bytes() / 1048576.0);
     if (s.keepalive_reads > 0 && n > 0 && n < (int) sizeof buf)
         std::snprintf(buf + n, sizeof buf - (size_t) n, ", SSD kept awake by %llu reads (slowest %.1f ms)",
                       (unsigned long long) s.keepalive_reads, s.keepalive_us_max / 1000.0);

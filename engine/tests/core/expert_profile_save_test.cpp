@@ -74,6 +74,45 @@ int main() {
     check(!strata::core::write_expert_profile(path, L, E, {{3, 0}}, err), "a pair out of range is refused");
     check(strata::core::read_expert_profile(path, L, E, back, slots, err) && back == r0,
           "a refused save keeps the file");
+    // PR 6.3c: extract_session_expert_hist + plan_session_warmup (r0 -> r1 warmup simulation)
+    {
+        constexpr int64_t NL = 48, NE = 512;
+        std::vector<float> sess_counts((size_t) (NL * NE), 0.0f);
+        // Simulate a session whose hot experts are experts 100..199 in every layer (4800 active, top 3500 extracted)
+        for (int64_t l = 0; l < NL; ++l)
+            for (int64_t e = 100; e < 200; ++e)
+                sess_counts[(size_t) (l * NE + e)] = (float) (200 - e) + (float) l * 0.01f;
+        const auto hist = strata::core::extract_session_expert_hist(sess_counts.data(), NL, NE, 3500);
+        check(hist.size() == 3500, "PR 6.3c hist capped at 3500");
+        check(hist.front().weight >= hist.back().weight, "PR 6.3c hist sorted descending");
+        // Simulate r1 with 80 slots/layer (= 3840 slots) initially holding experts 0..79 (0% overlap with session!)
+        std::vector<int32_t> r1_res((size_t) (NL * NE), strata::core::kNotResident);
+        int32_t next_slot = 0;
+        for (int64_t l = 0; l < NL; ++l)
+            for (int64_t e = 0; e < 80; ++e)
+                r1_res[(size_t) (l * NE + e)] = next_slot++;
+        // Measure pre-warmup hit rate on session distribution (0.0%) vs post-warmup (with max_swaps=2048 and 3500)
+        const auto swaps = strata::core::plan_session_warmup(hist, r1_res.data(), nullptr, NL, NE, 3500);
+        check(swaps.size() == 3500, "PR 6.3c planned all 3500 swaps into 3840 cold slots");
+        std::vector<int32_t> warmed = r1_res;
+        for (const auto& sw : swaps) {
+            check(sw.slot >= 0 && warmed[(size_t) (sw.layer * NE + sw.out_expert)] == sw.slot, "PR 6.3c valid victim slot");
+            check(warmed[(size_t) (sw.layer * NE + sw.in_expert)] == strata::core::kNotResident, "PR 6.3c incoming was non-resident");
+            warmed[(size_t) (sw.layer * NE + sw.out_expert)] = strata::core::kNotResident;
+            warmed[(size_t) (sw.layer * NE + sw.in_expert)] = sw.slot;
+        }
+        double total_w = 0.0, hit_w = 0.0;
+        for (size_t i = 0; i < sess_counts.size(); ++i) {
+            total_w += sess_counts[i];
+            if (warmed[i] >= 0) hit_w += sess_counts[i];
+        }
+        const double hr = 100.0 * hit_w / total_w;
+        check(hr > 85.0, "PR 6.3c post-warmup weighted hit rate > 85%");
+        // Second call on already-warmed residency must plan 0 swaps (strict gain invariant!)
+        const auto swaps2 = strata::core::plan_session_warmup(hist, warmed.data(), nullptr, NL, NE, 3500);
+        check(swaps2.empty(), "PR 6.3c idempotent: 0 swaps once warmed");
+    }
+
     std::filesystem::remove_all(dir);
     if (fails == 0) std::puts("expert_profile_save_test: OK");
     return fails == 0 ? 0 : 1;

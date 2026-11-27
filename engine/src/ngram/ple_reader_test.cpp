@@ -826,6 +826,58 @@ int main(int argc, char** argv) {
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
         if (g_fail != 0) return 1;
+        // PR 6.3a: verify exact LRU retention, strict RAM MiB byte ceiling, prefetch_batch, and gather_raw_iq4nl Direct.
+        {
+            const uint64_t r1536 = ng::PleReader::rows_for_ram_mib(1536, ng::ROW_BYTES);
+            CHECK(r1536 > 16000000ull && r1536 < 17500000ull, "rows_for_ram_mib(1536, 90) = %llu", (unsigned long long) r1536);
+            const std::string fpath = write_format_table(dir, k::ple_format_info(k::PleFormat::IQ4_NL), 4096);
+            CHECK(!fpath.empty(), "PR 6.3a synthetic IQ4_NL table");
+            if (!fpath.empty()) {
+                k::PleTable td, tm;
+                std::string e;
+                k::PleIoOptions iod; iod.mode = k::PleIo::Direct; iod.cache_ram_mib = 1; iod.max_inflight = 64;
+                k::PleIoOptions iom; iom.mode = k::PleIo::Mmap;
+                CHECK(td.open(fpath, e, iod), "PR 6.3a Direct open(1 MiB): %s", e.c_str());
+                CHECK(tm.open(fpath, e, iom), "PR 6.3a Mmap open: %s", e.c_str());
+                std::vector<uint32_t> batch(6 * k::PLE_N_HEADS);
+                for (size_t i = 0; i < batch.size(); ++i) batch[i] = (uint32_t) ((i * 37 + 11) % 4096);
+                td.prefetch_batch(batch.data(), 6);
+                std::vector<float> od(6 * k::NG_N_EMBD), om(6 * k::NG_N_EMBD);
+                CHECK(td.gather_batch(batch.data(), 6, od.data(), e), "PR 6.3a prefetch_batch gather: %s", e.c_str());
+                CHECK(tm.gather_batch(batch.data(), 6, om.data(), e), "PR 6.3a mmap gather: %s", e.c_str());
+                CHECK(std::memcmp(od.data(), om.data(), od.size() * sizeof(float)) == 0, "PR 6.3a prefetch_batch bitwise match");
+                batch[7] = 999999u;
+                std::vector<uint8_t> rd(6 * k::PLE_N_HEADS * k::PLE_ROW_BYTES), rm(rd.size());
+                CHECK(td.gather_raw_iq4nl(batch.data(), 6, rd.data()), "PR 6.3a gather_raw_iq4nl Direct");
+                CHECK(tm.gather_raw_iq4nl(batch.data(), 6, rm.data()), "PR 6.3a gather_raw_iq4nl Mmap");
+                CHECK(std::memcmp(rd.data(), rm.data(), rd.size()) == 0, "PR 6.3a gather_raw_iq4nl Direct vs Mmap bitwise match");
+                CHECK(td.gather_raw_iq4nl(batch.data(), 6, rd.data()), "PR 6.3a second gather_raw_iq4nl Direct");
+                const std::string rep2 = td.io_report();
+                CHECK(rep2.find("LRU hits") != std::string::npos, "PR 6.3a io_report format: %s", rep2.c_str());
+                ng::PleReader r;
+                CHECK(r.open(fpath, 0, 64, 16, 8, e, false, ng::ROW_BYTES), "PR 6.3a 8-way LRU open: %s", e.c_str());
+                CHECK(r.cache_bytes() <= (1ull << 20), "PR 6.3a cache_bytes <= budget");
+                std::vector<uint8_t> buf(9 * ng::ROW_BYTES);
+                uint32_t init8[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+                auto t0 = r.issue(init8, 8, buf.data());
+                CHECK(r.collect(t0, e), "PR 6.3a fill 8 ways");
+                uint32_t touch0 = 0;
+                auto t1 = r.issue(&touch0, 1, buf.data());
+                CHECK(r.collect(t1, e), "PR 6.3a touch row 0");
+                const uint64_t hits_before = r.stats().cache_hits;
+                uint32_t ins8 = 8;
+                auto t2 = r.issue(&ins8, 1, buf.data());
+                CHECK(r.collect(t2, e), "PR 6.3a insert row 8");
+                auto t3 = r.issue(&touch0, 1, buf.data());
+                CHECK(r.collect(t3, e), "PR 6.3a re-read row 0");
+                CHECK(r.stats().cache_hits == hits_before + 1, "PR 6.3a LRU kept hot row 0 (hits %llu vs %llu)",
+                      (unsigned long long) r.stats().cache_hits, (unsigned long long) (hits_before + 1));
+                r.close();
+                td.close(); tm.close();
+                std::filesystem::remove(fpath);
+            }
+            if (g_fail != 0) return 1;
+        }
         const int r90 = selftest(dir, ng::ROW_BYTES);
         const int r110 = selftest(dir, 110);
         return r90 != 0 ? r90 : r110;

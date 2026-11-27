@@ -37,6 +37,12 @@ public:
     /// always produces exactly one completion.
     bool submit(uint64_t offset, void* buffer, uint32_t length, uint64_t tag, std::string& err);
 
+    /// Push any queued reads to the OS in one batch (io_uring_enter on Linux; no-op on thread-pool backends).
+    void flush();
+
+    /// True when backed by Linux io_uring (false: pread thread pool / IOCP).
+    bool using_uring() const;
+
     /// Wait for up to `max` completions; returns how many were written to `out`. `timeout_ms` < 0 waits
     /// forever; 0 polls. A `wake()` shows up as one completion with tag `WAKE_TAG`.
     int wait(Completion* out, int max, int timeout_ms);

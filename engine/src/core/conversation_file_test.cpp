@@ -1112,6 +1112,72 @@ int main() {
     }
 #endif
 
+    // PR 6.3c: session expert histogram (<= 3500 entries = 28 KB) round-trip on file + trusted_memfd & rejection checks
+    {
+        SavedConversation with_hist = sample();
+        with_hist.expert_hist.reserve(kMaxSessionExpertHist);
+        for (size_t i = 0; i < kMaxSessionExpertHist; ++i) {
+            with_hist.expert_hist.push_back(SessionExpertEntry{
+                (uint16_t) (i % 48), (uint16_t) ((i * 7) % 512), (float) (kMaxSessionExpertHist - i) * 0.5f});
+        }
+        const fs::path hp = dir / "hist.bin";
+        size_t hw = 0, hr = 0;
+        SessionStatus hst;
+        check(session_file_write(hp.string(), with_hist, id, hw, error, {}, &hst), "PR 6.3c hist file write ok");
+        SavedConversation back_h;
+        check(session_file_read(hp.string(), id, back_h, hr, error, {}, &hst), "PR 6.3c hist file read ok");
+        check(same(with_hist, back_h) && back_h.expert_hist.size() == kMaxSessionExpertHist,
+              "PR 6.3c hist file count preserved");
+        bool hmatch = true;
+        for (size_t i = 0; i < kMaxSessionExpertHist; ++i) {
+            if (back_h.expert_hist[i].layer != with_hist.expert_hist[i].layer ||
+                back_h.expert_hist[i].expert != with_hist.expert_hist[i].expert ||
+                back_h.expert_hist[i].weight != with_hist.expert_hist[i].weight) { hmatch = false; break; }
+        }
+        check(hmatch, "PR 6.3c hist entries match exactly");
+        // Oversized histogram (>3500) refused on write
+        SavedConversation too_big = with_hist;
+        too_big.expert_hist.push_back(SessionExpertEntry{0, 0, 1.0f});
+        check(!session_file_write((dir / "hist_big.bin").string(), too_big, id, hw, error, {}, &hst),
+              "PR 6.3c >3500 histogram rejected");
+#if defined(__linux__)
+        // trusted_memfd round-trip with SessionKvSource + histogram
+        {
+            SavedConversation meta_h = with_hist;
+            meta_h.kv.clear();
+            std::vector<SessionKvSource> srcs_h;
+            for (const auto& k : with_hist.kv) {
+                SessionKvSource s;
+                s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+                s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+                const ConversationBuffer* parts[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[p]->size();
+                s.read = [k](size_t part, size_t off, void* dst, size_t n) {
+                    const ConversationBuffer* ps[5] = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                    ps[part]->visit(off, n, [&](const uint8_t* ptr, size_t c, size_t at) { std::memcpy((uint8_t*) dst + at, ptr, c); return true; });
+                    return true;
+                };
+                srcs_h.push_back(std::move(s));
+            }
+            uint64_t meas_h = 0;
+            check(session_file_measure(meta_h, srcs_h, meas_h, error), "PR 6.3c measure memfd with hist");
+            const int mfd = memfd("strata-test-hist", (size_t) meas_h);
+            SessionWriteOptions wo; wo.durable = false; wo.trusted_memfd = true;
+            check(mfd >= 0 && session_file_write_fd(mfd, meta_h, srcs_h, id, hw, error, wo, &hst),
+                  "PR 6.3c trusted_memfd write with hist");
+            SessionReadLimits rl; rl.trusted_memfd = true;
+            SavedConversation back_m;
+            check(session_file_read_fd(mfd, id, back_m, hr, error, rl, &hst),
+                  "PR 6.3c trusted_memfd read with hist");
+            check(same(with_hist, back_m) && back_m.expert_hist.size() == kMaxSessionExpertHist &&
+                  back_m.expert_hist[0].weight == with_hist.expert_hist[0].weight &&
+                  back_m.expert_hist.back().expert == with_hist.expert_hist.back().expert,
+                  "PR 6.3c trusted_memfd hist matches exactly");
+            ::close(mfd);
+        }
+#endif
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);
     return 0;

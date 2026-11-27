@@ -169,6 +169,7 @@ struct PleIoOptions {
     uint32_t max_inflight = 256;     ///< outstanding SSD reads (decode needs 16; a prompt chunk saturates the SSD at 256)
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache, in ROWS: 1,048,576 x 90 B ~ 95 MB (IQ4_NL), ~160 MB (FP8),
                                      ///< ~335 MB (BF16); 0 disables
+    uint64_t cache_ram_mib = 0;      ///< PR 6.3a: when > 0, overrides cache_rows so RAM LRU cache <= this many MiB
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
     /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on
     /// the prompt or token path. Needs RAM for the full table (28.8 GB IQ4_NL, 51.2 GB FP8). mlock on POSIX,
@@ -199,6 +200,8 @@ public:
     bool collect(float* out2560, std::string& err);
     /// Non-blocking prefetch of 16 rows for one token into the reader's row cache while the GPU is busy.
     void prefetch_rows(const uint32_t* rows16);
+    /// PR 6.3a: batch prefetch of `n_tokens` tokens (16 rows each) in one deduplicated, offset-sorted io_uring request.
+    void prefetch_batch(const uint32_t* rows, size_t n_tokens);
     void wait_prefetches();
     /// Plan v0.3 P5: the rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
