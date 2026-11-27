@@ -103,6 +103,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dense_i8_tc.cu
                           src/kernels/cuda/q8_volta_tc.cu
                           src/kernels/cuda/iq4nl_volta_tc.cu
+                          src/kernels/cuda/moe_volta_v70.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -573,6 +574,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(iq4nl_volta_tc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME iq4nl_volta_tc_parity COMMAND iq4nl_volta_tc_parity)
     set_tests_properties(iq4nl_volta_tc_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_executable(moe_volta_v70_parity src/kernels/moe_volta_v70_parity.cpp)
+    target_include_directories(moe_volta_v70_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(moe_volta_v70_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME moe_volta_v70_parity COMMAND moe_volta_v70_parity)
+    set_tests_properties(moe_volta_v70_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   endif()
   add_executable(dflash2_launch_bench EXCLUDE_FROM_ALL src/core/dflash2_launch_bench.cu)
   target_include_directories(dflash2_launch_bench PRIVATE ${_strata_gpu_include_directories})

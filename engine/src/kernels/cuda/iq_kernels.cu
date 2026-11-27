@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/nvfp4_decode_sm120.hpp"
 #include "strata/kernels/iq4nl_volta_tc.hpp"
+#include "strata/kernels/moe_volta_v70.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm75_series.hpp"
@@ -4199,6 +4200,10 @@ bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cuda
     if (!expdec_mode() || g_old_kernels) return false;
     if (!expdec_gu_ok(L)) { expdec_note(L, true, false, s, gy, cap_groups); return false; }
     expdec_note(L, true, true, s, gy, cap_groups);
+    if ((L.gu_type == 18 || L.gu_type == 22) && expdec_r() == 1 &&
+        moe_volta_gu_unfused(L, gy, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up, s)) {
+        return true;
+    }
     switch (L.gu_type) {
         case 16: expdec_gu_t<16>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 17: expdec_gu_t<17>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
@@ -6807,11 +6812,21 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
+    if (!v1 && !nib_layout(L) && g_exp_phase == 0 && !g_old_kernels && !g_no_sub16_gu && L.had_block == 0 &&
+        (em0 == 8 || moe_volta_persist_mode() >= 2) &&
+        moe_volta_persist_grouped(L, cap_groups, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, hq, out, s)) {
+        check("native_expert_grouped/persist v70");
+        return;
+    }
     const bool fused_gu = !nib_layout(L) && em0 == 8 &&
                           ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 || L.gu_type == 21 ||
                            L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 12 || L.gu_type == 13 || L.gu_type == 40) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
+        if ((L.gu_type == 18 || L.gu_type == 22) &&
+            moe_volta_gu_fused(L, cap_groups, grp_ptr, grp_start, n_groups, ent_tok, X, hq, s)) {
+            check("native_expert_grouped/gu fused v70");
+        } else {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
         switch (L.gu_type) {
@@ -6826,6 +6841,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             default: native_gu_fused_kernel<22><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq); break;
         }
         check("native_expert_grouped/gu fused");
+        }
     }
 #endif
     // 147-verify STRATA_GU_SWIGLU=1: gate/up + SwiGLU + q8_1 in one launch where the CUDA layout's 16-lane kernel would run
