@@ -729,7 +729,7 @@ class Helpers(unittest.TestCase):
         from strata_control import own_path_fit
         self.assertEqual({m: x["context_fit"] for m, x in by.items()}, {m: own_path_fit.inputs("qwen3.6-35b-a3b", m) for m in by})
         self.assertEqual(by["UD-Q4_K_XL"]["context_fit"]["bytes_per_token"], 47104)
-        others = [x for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] != "qwen36" for x in f["sizes"]]
+        others = [x for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] not in ("qwen36", "ornith") for x in f["sizes"]]      # Ornith (#7134) has its own figures too
         self.assertTrue(others and not any("context_fit" in x for x in others))
         small = next(f for f in s.model_table({"ram_gb": 16, "gpus": []}) if f["family"] == "qwen36")
         self.assertEqual({x["on_this_pc"] for x in small["sizes"]}, {"may run slower"})        # 16 GB, no card: 21 to 36 GB of weights
@@ -781,6 +781,8 @@ class Helpers(unittest.TestCase):
             r = s.recommend({"ram_gb": ram, "gpus": gpu, "cpu": {"avx2": True}})
             self.assertEqual((r["family"], r["model"], r["context"]), want, ram)
         r = s.recommend({"ram_gb": 16, "gpus": [{**gpu[0], "vram_gb": 8.0}], "cpu": {"avx2": True}})
+        self.assertEqual((r["family"], r["model"]), ("inkling-2-mini", "SQ-10"))
+        r = s.recommend({"ram_gb": 4, "gpus": [{**gpu[0], "vram_gb": 4.0}], "cpu": {"avx2": True}})
         self.assertIsNone(r["model"])
         r = s.recommend({"ram_gb": 64, "gpus": [], "cpu": {"avx2": True}})
         self.assertIsNone(r["model"])

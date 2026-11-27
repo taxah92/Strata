@@ -74,6 +74,7 @@ public:
 
     size_t size() const { return size_; }
     bool empty() const { return size_ == 0; }
+    size_t segment_count() const { return segments_.size(); }
     size_t bytes() const {
         if (view_data_ != nullptr) return size_;
         size_t n = segments_.capacity() * sizeof(Segment);
@@ -154,6 +155,13 @@ public:
     // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
     void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
 
+    // Allocation ranges include the spare capacity in the final segment.
+    template<class Fn> bool visit_allocations(Fn fn) const {
+        for (size_t i = 0; i < segments_.size(); ++i)
+            if (!fn(segments_[i].data(), segments_[i].capacity(), i)) return false;
+        return true;
+    }
+
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
         materialize();
@@ -168,7 +176,7 @@ public:
     }
     bool read(void* target, size_t offset, size_t count) const {
         return visit(offset, count, [&](const uint8_t* p, size_t n, size_t at) {
-            std::memcpy(static_cast<uint8_t*>(target) + at - offset, p, n);
+            std::memcpy(static_cast<uint8_t*>(target) + (at - offset), p, n);
             return true;
         });
     }
@@ -238,7 +246,7 @@ private:
             const size_t end = begin + segment.size();
             if (offset < end) {
                 const size_t n = std::min(count, end - offset);
-                if (!fn(segment.data() + offset - begin, n, offset)) return false;
+                if (!fn(segment.data() + (offset - begin), n, offset)) return false;
                 offset += n; count -= n;
             }
             begin = end;
@@ -265,5 +273,50 @@ private:
     std::shared_ptr<const void> view_owner_;
     const uint8_t* view_data_ = nullptr;
 };
+
+// The caller has validated non-overlapping CPU ranges and grown `parked` to
+// max(active_bytes, parked_bytes).  No allocation or address change occurs.
+// `written` becomes true before the first destination byte is changed.
+inline bool conversation_buffer_exchange(ConversationBuffer& parked, uint8_t* active,
+                                         size_t active_bytes, size_t parked_bytes,
+                                         uint8_t* scratch, size_t block_bytes, bool& written) {
+    if (!scratch || !block_bytes || (!active && (active_bytes || parked_bytes)) ||
+        parked.size() < std::max(active_bytes, parked_bytes)) return false;
+    auto copy = [](void* dst, const void* src, size_t bytes) {
+        constexpr size_t step = size_t(1) << 20;
+        auto* d = static_cast<uint8_t*>(dst);
+        const auto* s = static_cast<const uint8_t*>(src);
+        for (size_t at = 0; at < bytes;) {
+            const size_t n = std::min(step, bytes - at);
+            std::memcpy(d + at, s + at, n);
+            at += n;
+            progress_beat();
+        }
+    };
+    const size_t common = std::min(active_bytes, parked_bytes);
+    for (size_t at = 0; at < common;) {
+        const size_t n = std::min(block_bytes, common - at);
+        copy(scratch, active + at, n);
+        if (!parked.visit(at, n, [&](uint8_t* p, size_t count, size_t pos) {
+                written = true;
+                copy(active + pos, p, count);
+                copy(p, scratch + (pos - at), count);
+                return true;
+            })) return false;
+        at += n;
+    }
+    const size_t end = std::max(active_bytes, parked_bytes);
+    for (size_t at = common; at < end;) {
+        const size_t n = std::min(block_bytes, end - at);
+        if (!parked.visit(at, n, [&](uint8_t* p, size_t count, size_t pos) {
+                written = true;
+                if (active_bytes > parked_bytes) copy(p, active + pos, count);
+                else copy(active + pos, p, count);
+                return true;
+            })) return false;
+        at += n;
+    }
+    return true;
+}
 
 } // namespace strata::core

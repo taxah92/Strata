@@ -23,12 +23,20 @@ from strata_cli.launch import access as acc
 from strata_cli.launch import params as P
 from strata_cli.launch import settings as S
 from strata_cli.launch import store
+from strata_cli.launch import custom
+from strata_cli.launch.catalog import pick_row
+
+
+def row_key(row) -> tuple:
+    """The list key of a model row: its own (a custom build has three parts), else (family, model)."""
+    return getattr(row, "key", None) or (row.family, row.model)
 from strata_cli.launch.widgets import (ACCENT, BAD, DARK, FG, LIGHT, MUTE, WARN, Cell, Item, Menu, bar)
 
 STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context", "Context"), ("pictures", "Pictures"),
          ("parallel", "Parallel"), ("tuning", "Tuning"), ("advanced", "Advanced"), ("access", "Access"), ("save", "Save"))
 
 
+CUSTOM_BADGE = custom.BADGE
 STEP_LABELS = {**dict(STEPS), "drafting": "Drafting"}
 
 
@@ -92,14 +100,16 @@ def drafting_choice_available(ctx, family: str | None = None) -> bool:
 
 def flow_for(ctx, family: str | None = None) -> list[str]:
     """The steps of this computer: the Cards step exists only when two or more graphics cards can be used; the Drafting step only for
-    Qwen3.8-Flash-Next on a computer that can run DFlash2; Tencent Hy4-Flash skips Qwen-only steps (cards, drafting, parallel, tuning, advanced)."""
+    Qwen3.8-Flash-Next on a computer that can run DFlash2; Tencent Hy4-Flash skips Qwen-only steps (drafting, parallel, tuning, advanced)."""
     fam = family if family is not None else getattr(getattr(ctx, "settings", None), "family", None)
     if fam == "hy4-flash":
+        if len(ctx.computer.usable_gpus) >= 2:
+            return ["model", "cards", "folder", "context", "pictures", "access", "save"]
         return ["model", "folder", "context", "pictures", "access", "save"]
     if fam == "inkling-2-mini":
         if len(ctx.computer.usable_gpus) >= 2:
-            return ["model", "folder", "cards", "context", "pictures", "parallel", "access", "save"]
-        return ["model", "folder", "context", "pictures", "parallel", "access", "save"]
+            return ["model", "folder", "cards", "context", "pictures", "drafting", "parallel", "access", "save"]
+        return ["model", "folder", "context", "pictures", "drafting", "parallel", "access", "save"]
     ids = [sid for sid, _ in STEPS]
     if len(ctx.computer.usable_gpus) < 2:
         ids.remove("cards")
@@ -466,14 +476,15 @@ class ModelScreen(Base):
     step_id = "model"
     hints = "↑↓ choose   Enter next   o use my own files   Esc back   ? help"
     help_text = ("Pick the model. 'Needs' is the RAM + graphics memory the model's files take (the app's figure; the n-gram table stays on your SSD and is not counted). 'fits' means they fit the RAM and "
-                 "the graphics memory together; 'may run slower' means they do not, so part is read from the SSD while it answers. Neither is a block: you can still try it.")
+                 "the graphics memory together; 'may run slower' means part streams directly from your NVMe SSD (GPU + SSD or CPU + SSD with a bounded RAM ring and 0 swap). Neither is a block: you can still try it.")
 
     BINDINGS = Base.BINDINGS + [Binding("o", "own", "Own files", show=False)]
 
     def body(self) -> ComposeResult:
         yield Static("", id="question", markup=False)
         yield Menu(id="menu", wrap_last=False)               # S2: a verdict that does not fit ends with an ellipsis (the full sentence is under the list)
-        yield Input(placeholder="Folder with the model files, or one .gguf file", id="own", classes="field", disabled=True)
+        yield Input(placeholder="Folder with the model files, or one .gguf or .strata file", id="own", classes="field", disabled=True)
+        yield Input(placeholder="Display name for your build", id="label", classes="field", disabled=True)
 
     def on_mount(self) -> None:
         self.rows = self.ctx.rows
@@ -494,7 +505,7 @@ class ModelScreen(Base):
     def build_menu(self, initial: bool = False) -> None:
         s = self.ctx.settings
         if not (s.family and s.model) and not s.model_path:
-            rec = next((r for r in self.rows if r.recommended), None) or next((r for r in self.rows if r.verdict == "fits"), None)
+            rec = next((r for r in self.rows if r.recommended), None) or next((r for r in self.rows if r.verdict == "fits" and r.offered), None)
             if rec is not None:
                 s.family, s.model = rec.family, rec.model
         items: list[Item] = []
@@ -504,16 +515,19 @@ class ModelScreen(Base):
         room = (m.size.width or self.width()) - 2 - sum(w for _t, w in cols[:-1])     # what is left of the line for the verdict (a scrollbar takes two cells: S2)
         for i, r in enumerate(self.rows):
             col = {"fits": "", "slower": WARN, "tight": WARN, "no": BAD, "disk": WARN}[r.verdict]
-            tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "")
+            tag = (" (recommended)" if r.recommended else "") + (" (installed)" if r.installed else "") + (" [experimental]" if r.experimental else "") + ("" if r.offered else " [no longer offered]") + (" [update available]" if r.update else "")
+            if r.custom:                                     # the person's own build: its name, a Custom marker and the size of its files (no download)
+                tag = f" [{CUSTOM_BADGE}]"
+                tag += " (installed)" if r.installed else ""
             need = f"{r.fit_gb:.0f} GB" if r.fit_gb else "-"
             verdict = r.words + tag
             if self.width() < 100:                           # a short verdict that fits the column; the full sentence is shown under the list
                 base = {"fits": "fits", "slower": "may run slower", "tight": "tight", "no": "too big", "disk": "no disk"}[r.verdict]
-                full, short = ((" (recommended)", " (rec.)") if r.recommended else (" (installed)", " (inst.)") if r.installed else
+                full, short = ((f" [{CUSTOM_BADGE}]", " [cust.]") if r.custom else (" (recommended)", " (rec.)") if r.recommended else (" (installed)", " (inst.)") if r.installed else
                                (" [experimental]", " [exp.]") if r.experimental else ("", ""))
                 verdict = base + (full if len(base + full) <= room else short)      # "no disk (rec.)": the mark stays visible when the long one does not fit
-            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=(r.family, r.model)))
-            if (s.family, s.model) == (r.family, r.model):
+            items.append(Item([r.title, f"{r.download_gb:.0f} GB", need, Cell(verdict, col)], key=r.key))
+            if (r.custom and s.custom_id == r.id) or (not r.custom and not s.custom_id and (s.family, s.model) == (r.family, r.model)):
                 sel = i
         m.columns = cols
         m.show_header = True
@@ -542,14 +556,20 @@ class ModelScreen(Base):
         cur = m.current if m else None
         out = Text()
         if cur is not None and hasattr(self, "rows"):
-            r = next((x for x in self.rows if (x.family, x.model) == cur.key), None)
+            r = next((x for x in self.rows if row_key(x) == cur.key), None)
             if r:
                 out.append(f"{r.title}: {r.about}.\n", style=FG)
+                if r.custom:
+                    out.append("Your own files are used where they are; nothing is copied. Remove it with `strata models remove " + r.id + "` (only the run settings go).\n", style=MUTE)
+                if r.credit:
+                    out.append(f"{r.credit}.\n", style=MUTE)
+                if r.update:
+                    out.append("A newer file of this model is available (re-run setup for it); the one you have keeps working and is not deleted.\n", style=MUTE)
                 if r.verdict != "fits":
                     out.append(f"{r.sentence}. ", style=BAD if r.verdict == "no" else WARN)
         # At 80 x 24 the box holds four lines: with a verdict sentence (three lines for a model that does not fit) this last, general sentence was cut
         # in the middle ("... stays on your SSD and is"). It stays in the help (?); a tall window shows it whole (GUI-TUI 0.2.17 QA).
-        verdict_shown = cur is not None and hasattr(self, "rows") and any((x.family, x.model) == cur.key and x.verdict != "fits" for x in self.rows)
+        verdict_shown = cur is not None and hasattr(self, "rows") and any(row_key(x) == cur.key and x.verdict != "fits" for x in self.rows)
         if not verdict_shown or self.app.size.height >= 30:
             out.append("The n-gram table stays on your SSD and is not counted above.", style=MUTE)
         for title, why in self.unavailable_lines():
@@ -581,10 +601,16 @@ class ModelScreen(Base):
         cur = self.menu().current
         if cur is not None:
             s = self.ctx.settings
-            fam, model = cur.key
-            if (s.family, s.model) != (fam, model) or s.model_path:
-                s.model_path = None
-            s.family, s.model = fam, model
+            fam, model, *more = cur.key
+            if more:                                         # a custom build of this family: its base model's settings, its own files and run config
+                entry = next((e for e in custom.entries(self.ctx.catalog) if e["id"] == more[0]), None)
+                if entry is not None:
+                    custom.use_installed(s, entry)
+            else:
+                if (s.family, s.model) != (fam, model) or s.model_path or s.custom_id:
+                    s.model_path = None
+                custom.clear(s)
+                s.family, s.model = fam, model
             self.ctx.refresh_disk()
             from strata_cli.launch import modelstate
             s.drafting = modelstate.drafting_for_family(s.drafting, fam)         # the other families have no Drafting choice: back to Auto
@@ -593,9 +619,8 @@ class ModelScreen(Base):
                     s.parallel = None
                 s.tune = "skip"
                 s.kv = None
-                s.gpu_roles = None
                 s.extra = {}
-            r = next(x for x in self.rows if (x.family, x.model) == (fam, model))
+            r = next(x for x in self.rows if row_key(x) == cur.key)
             if r.verdict == "no":
                 self.ctx.notes.append(f"{r.title} does not fit this computer; it may be slow or run out of memory.")
 
@@ -615,10 +640,13 @@ class ModelScreen(Base):
 
     # ---- own files
     def action_own(self) -> None:
-        self.open_field("own", self.ctx.settings.model_path or "", "Folder with the model files, or one .gguf file")
-        self.say("Type or paste the folder (or the first .gguf file), then press Enter.")
+        self.open_field("own", self.ctx.settings.model_path or "", "Folder with the model files, or one .gguf or .strata file")
+        self.say("Type or paste the folder (or the .gguf or .strata file of your own build), then press Enter.")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "label":
+            self.finish_custom(event.value)
+            return
         if event.input.id != "own":
             return
         path = event.value.strip().strip('"')
@@ -646,6 +674,7 @@ class ModelScreen(Base):
         if sel.get("family") and sel.get("model") and not plan.get("issues"):
             s = self.ctx.settings
             s.model_path, s.family, s.model = models.import_target(path, plan), sel["family"], sel["model"]
+            custom.clear(s)
             from strata_cli.launch import modelstate
             s.drafting = modelstate.drafting_for_family(s.drafting, s.family)
             if s.family in ("hy4-flash", "inkling-2-mini"):
@@ -653,9 +682,15 @@ class ModelScreen(Base):
                     s.parallel = None
                 s.tune = "skip"
                 s.kv = None
-                s.gpu_roles = None
                 s.extra = {}
             self.ctx.picked_in_list = False
+            self._own_plan = (plan, sel)
+            if sel.get("custom"):                            # not a build Strata has tested: the person's own build asks for the name it is listed under
+                self.close_field("own")
+                self.open_field("label", str(sel.get("suggested_label") or Path(s.model_path).stem), "Display name for your build")
+                self.say(f"These files are your own build of {sel.get('family_title') or sel['family']} ({plan['file_count']} file(s), "
+                         f"{plan.get('total_bytes', 0) / 1e9:.0f} GB); they run with the settings of {sel['model']}. Type the name to list it under, then press Enter.")
+                return
             self.ctx.refresh_disk()                          # N1: these files need no download, so the list stops marking the row (and the Save screen its "!" line)
             self.build_menu()
             self.close_field("own")
@@ -667,11 +702,30 @@ class ModelScreen(Base):
             why = models.problem_words(plan.get("issues") or [], missing=plan.get("missing_shards")) or "they are not a model Strata knows"
             holds = next((m for m in plan.get("messages") or [] if "holds" in m), "")
             self.say(f"These files cannot be used as they are ({why}). " + (holds + " " if holds else "") +
-                     "Check that every shard is in the folder, or pick a model from the list.", True)
+                     "Check that every shard is in the folder, or pick a model from the list. " + custom.UNSUPPORTED_WORDS, True)
+
+    def finish_custom(self, text: str) -> None:
+        """The person named their own build: it is used with a run config of its own (never the official one's), listed under its family."""
+        s = self.ctx.settings
+        plan, sel = getattr(self, "_own_plan", (None, None))
+        if not plan or not s.model_path:
+            self.close_field("label")
+            return
+        label = custom.clean_label(text)
+        if not label:
+            self.say("Give the build a name (letters, digits, spaces and dashes), or press Esc to go back.", True)
+            return
+        custom.use_import(s, self.ctx.catalog, label)
+        self.ctx.refresh_disk()
+        self.build_menu()
+        self.close_field("label")
+        self.say(f"Your build is called '{s.custom_label}' (settings of {s.model}). Press Enter to use it; the official {s.model} is not touched and your files are not copied.")
+        self.paint()
 
     def action_back(self) -> None:
         if self.input_open():
             self.close_field("own")
+            self.close_field("label")
             self.say("")
             return
         super().action_back()
@@ -700,7 +754,7 @@ class CardsScreen(Base):
 
     def model_memory(self) -> float:
         s = self.ctx.settings
-        r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        r = pick_row(self.ctx.rows, s)
         return float(r.memory_gb) if r is not None and r.memory_gb else 44.0
 
     def installed(self) -> list[int] | None:
@@ -1027,13 +1081,37 @@ class ContextScreen(Base):
         items.append(Item(["Custom…"], key="custom"))
         self.query_one(Menu).set_items(items, sel)
 
+    def _inkling_backend(self) -> str | None:
+        comp = getattr(self.ctx, "computer", None)
+        ev = str(getattr(comp, "engine_vendor", None) or "").lower()
+        if ev == "amd":
+            return "hip"
+        if ev == "intel":
+            return "sycl"
+        if ev == "apple":
+            return "metal"
+        if ev == "nvidia":
+            return "cuda"
+        cat = getattr(self.ctx, "catalog", None)
+        return cat.installed_backend() if cat is not None and hasattr(cat, "installed_backend") else None
+
     def refresh_body(self) -> None:
         s = self.ctx.settings
         if s.family == "hy4-flash":
             self.query_one("#kvline", Static).update(Text("Conversation memory: managed automatically by Hy4-Flash", style=MUTE))
             return
         if s.family == "inkling-2-mini":
-            self.query_one("#kvline", Static).update(Text("Conversation memory: managed automatically by Inkling-2-Mini (SWA-1024 + compact Global KV)", style=MUTE))
+            be = self._inkling_backend()
+            modes = S.inkling_kv_modes(be)
+            eff, _ = S.safe_inkling_kv(s.kv, be)
+            cur = eff or "fp16"
+            if s.kv and eff != s.kv:
+                s.kv = eff
+            label = {"fp16": "FP16 (default, lossless)", "fp8": "FP8 (half KV memory)",
+                     "k8v8": "K8V8 (8-bit K+V, CUDA)", "k8v4": "K8V4 (mixed 8/4-bit, CUDA)"}.get(cur, cur)
+            avail = "/".join(modes)
+            self.query_one("#kvline", Static).update(Text(
+                f"Conversation memory: {label} ({avail})   press m to change", style=MUTE))
             return
         kv = self.kv()
         label = {"int8": "8-bit (recommended: what the published numbers were measured with)",
@@ -1054,7 +1132,14 @@ class ContextScreen(Base):
 
     def action_memory(self) -> None:
         s = self.ctx.settings
-        if s.family in ("hy4-flash", "inkling-2-mini"):
+        if s.family == "hy4-flash":
+            return
+        if s.family == "inkling-2-mini":
+            order = list(S.inkling_kv_modes(self._inkling_backend()))
+            cur = s.kv if s.kv in order else order[0]
+            s.kv = order[(order.index(cur) + 1) % len(order)]
+            self.build()
+            self.paint()
             return
         order = ["int8", "q4_0"]
         cur = s.kv or "int8"
@@ -1116,7 +1201,7 @@ class PicturesScreen(Base):
 
     def row(self):
         s = self.ctx.settings
-        return next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        return pick_row(self.ctx.rows, s)
 
     def is_hy4(self) -> bool:
         return self.ctx.settings.family == "hy4-flash"
@@ -1157,7 +1242,8 @@ class PicturesScreen(Base):
             return Text("Pictures are on by default. They add a 0.9 GB vision shard (Hy4-Flash-Vision.strata, if it is not on this computer yet), "
                         "built directly into strata-hy4. Say No if you only chat in text.", style=MUTE)
         if self.is_inkling():
-            return Text("Pictures are on by default. They add a 0.6 GB lossless BF16 vision shard (Inkling-2-Mini-Vision.strata, if it is not on this computer yet), "
+            from strata_control import inkling_family
+            return Text(f"Pictures are on by default. They add a 0.6 GB lossless BF16 vision shard ({inkling_family.VISION_FILE}, if it is not on this computer yet), "
                         "built directly into strata-inkling. Say No if you only chat in text.", style=MUTE)
         amd = any(str(g.get("vendor")) == "amd" for g in self.ctx.computer.usable_gpus)
         on_card = self.ctx.catalog.picture_default(True) == "gpu"
@@ -1219,6 +1305,7 @@ class DraftingScreen(Base):
     help_text = "Drafting is how the model guesses the next words ahead to make answers faster. One drafter runs at a time."
 
     CHOICES = (("auto", "Auto (recommended)"), ("mtp", "MTP"), ("dflash2", "DFlash2"), ("off", "Off"))
+    INKLING_CHOICES = (("auto", "DFlash 2 (recommended)"), ("off", "Off"))
 
     def body(self) -> ComposeResult:
         yield Static(Text("How should the model guess ahead?", style=f"bold {ACCENT}"), markup=False)
@@ -1226,6 +1313,15 @@ class DraftingScreen(Base):
 
     def on_mount(self) -> None:
         s = self.ctx.settings
+        if s.family == "inkling-2-mini":
+            items = [Item([label, Cell("DFlash 2" if key == "auto" else "no drafter", MUTE)], key=key)
+                     for key, label in self.INKLING_CHOICES]
+            shown = "off" if s.drafting == "off" else "auto"
+            sel = [key for key, _ in self.INKLING_CHOICES].index(shown)
+            self.query_one(Menu).columns = [("", 30), ("", 0)]
+            self.query_one(Menu).set_items(items, sel)
+            self.paint()
+            return
         from strata_cli.launch import modelstate
         now = {"dflash2": "DFlash2", "mtp": "MTP", "off": "Off"}[modelstate.resolved_drafting(None, s.family)]
         items = [Item([label, Cell(now, "") if key == "auto" else Cell("", "")], key=key) for key, label in self.CHOICES]
@@ -1236,10 +1332,15 @@ class DraftingScreen(Base):
         self.paint()
 
     def explain(self) -> Text:
+        if self.ctx.settings.family == "inkling-2-mini":
+            return Text("DFlash 2 is the one drafter of every Inkling-2-Mini build: a 1 GB file (dflash2.safetensors) that setup downloads beside the model; without it the model runs with no drafter. Choose Off to pass --draft off (uses less VRAM and skips speculative drafting).", style=MUTE)
         return Text("")
 
     def commit(self) -> None:
         key = self.menu().current.key
+        if self.ctx.settings.family == "inkling-2-mini":
+            self.ctx.settings.drafting = "off" if key == "off" else None
+            return
         from strata_cli.launch import modelstate
         # Auto stays "nobody chose" (a saved preset writes nothing) unless the model's file or this launch holds another choice: then Auto is written, so it wins
         base = self.ctx.base_config() or {}
@@ -1268,7 +1369,7 @@ class ParallelScreen(Base):
         c, s = self.ctx.computer, self.ctx.settings
         if not c.ram_gb:
             return None
-        row = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
+        row = pick_row(self.ctx.rows, s)
         need = float(row.fit_gb or row.memory_gb or 0) if row is not None else 0.0
         if not need:
             return None
@@ -1407,6 +1508,7 @@ class AdvancedScreen(Base):
 
     BINDINGS = Base.BINDINGS + [
         Binding("e", "edit", show=False), Binding("delete", "reset", show=False), Binding("backspace", "reset", show=False),
+        Binding("ctrl+h", "reset", show=False),
         Binding("x", "experimental", show=False), Binding("slash", "filter", show=False), Binding("a", "add", show=False),
         Binding("c", "copy", show=False), Binding("n", "go_next", show=False), Binding("right", "go_next", show=False),
         Binding("tab", "scroll_command", show=False)]
@@ -1583,12 +1685,33 @@ class AdvancedScreen(Base):
         cur = self.menu().current
         if cur is None or cur.key in (None, "__add__"):
             return
-        if self.ctx.settings.extra.pop(cur.key, None) is not None:
+        key = cur.key
+        extra = self.ctx.settings.extra
+        popped = extra.pop(key, None)
+        if popped is None and isinstance(key, str) and key.startswith("--"):
+            popped = extra.pop(key[2:], None)
+        if popped is not None:
             self.ctx.invalidate_rows()
             self.rows = self.ctx.advanced_rows()
             self.build()
-            self.say(f"{cur.key} is back to the tuned value.")
+            self.say(f"{key} is back to the tuned value.")
             self.paint()
+            return
+        row = next((x for x in self.rows if x.name == key), None)
+        if row is not None and not row.known:
+            # #6519: an unknown (red-marked) flag coming from the installed or tuned config is not in s.extra yet;
+            # turning it off in s.extra removes it from this launch's command (pressing Del again puts it back).
+            extra[key] = "off"
+            self.ctx.invalidate_rows()
+            self.rows = self.ctx.advanced_rows()
+            self.build()
+            self.say(f"{key} turned off for this launch (Del again puts it back).")
+            self.paint()
+            return
+        if row is not None and row.tuned and row.tuned != row.default:
+            self.say(f"{key} is already at its tuned value.")
+        else:
+            self.say(f"{key} is already at its default value.")
 
     def action_experimental(self) -> None:
         if self.mode:
@@ -1899,14 +2022,15 @@ class SaveScreen(Base):
         is_hy4 = s.family == "hy4-flash"
         is_inkling = s.family == "inkling-2-mini"
         is_native_strata = is_hy4 or is_inkling
-        r = next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
-        cards = None if is_native_strata else self.ctx.cards_line()
+        r = pick_row(self.ctx.rows, s)
+        cards = self.ctx.cards_line()
+        ctx_kv = (f", memory {s.kv or 'fp16'}" if is_inkling else "" if is_hy4 else f", memory {s.kv or 'int8'}")
         lines = [("Model", (r.title if r else (s.model or "?")) + (" (your files)" if s.model_path else "")),
                  *([("Cards", cards)] if cards else []),                       # T8: Main / Helper / Off of each card
-                 ("Context", S.context_label(s.context) + ("" if is_native_strata else f", memory {s.kv or 'int8'}")),
+                 ("Context", S.context_label(s.context) + ctx_kv),
                  ("Pictures", "on" if s.vision not in ("off", "no") else "off"),
                  *([("Drafting", "off" if s.drafting == "off" else "DFly2 (built-in)")] if is_hy4 else
-                   [("Drafting", "off" if s.drafting == "off" else "DSpark Block-8 (built-in)")] if is_inkling else
+                   [("Drafting", "off" if s.drafting == "off" else "DFlash 2")] if is_inkling else
                    [("Drafting", dict(DraftingScreen.CHOICES).get(s.drafting or ("off" if modelstate.layer_off_without_choice(self.ctx.base_config()) else "auto"), "Auto (recommended)"))] if drafting_choice_available(self.ctx) else []),
                  *([("Parallel", f"{s.parallel} at a time" if s.parallel else f"fit to your card ({8 if (self.ctx.computer.main_vram_gb or 0) >= 22 else 4 if (self.ctx.computer.main_vram_gb or 0) >= 15 else 1})")] if is_inkling else
                    [] if is_hy4 else [
@@ -1966,7 +2090,8 @@ class SaveScreen(Base):
         if kind == "mmproj" and self.ctx.settings.family == "hy4-flash":
             return "put Hy4-Flash-Vision.strata in the hy4-flash models folder, or choose No pictures"
         if kind == "mmproj" and self.ctx.settings.family == "inkling-2-mini":
-            return "put Inkling-2-Mini-Vision.strata in the inkling-2-mini models folder, or choose No pictures"
+            from strata_control import inkling_family
+            return f"put {inkling_family.VISION_FILE} in the inkling-2-mini models folder, or choose No pictures"
         if kind == "dflash2":
             from strata_control import drafting_fetch
             return (f"copy {drafting_fetch.offline_files_phrase(tuned=bool(part.get('tuned')), variant=part.get('variant'), engine_reads_q4=part.get('reads_q4', True))} "
@@ -2036,7 +2161,7 @@ class SaveScreen(Base):
             elif s.family == "inkling-2-mini":
                 model = dict(lines)["Model"]
                 rows = [f"{model} \u00b7 {S.context_label(s.context)}",
-                        f"Pictures {'on' if s.vision not in ('off', 'no') else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Drafting {'off' if s.drafting == 'off' else 'DSpark'}",
+                        f"Pictures {'on' if s.vision not in ('off', 'no') else 'off'} \u00b7 Parallel {s.parallel or 'auto'} \u00b7 Drafting {'off' if s.drafting == 'off' else 'DFlash 2'}",
                         *self.compact_download_rows(),
                         f"Access {s.access}, port {s.port}"]
             else:

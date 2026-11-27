@@ -178,7 +178,16 @@ int main(int argc, char** argv) {
                 cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
                 cudaMemset(dqm, 0, (size_t) TM * (N / 32) * 36);
                 K::fused_gr_read_multi(a, T, dxn, s);
-                cudaStreamSynchronize(s);
+                {   // a kernel that traps (0.1.66: __ldg on a __shared__ address in the Q8_0 Tensor Core reads, #6714) must fail the bench
+                    cudaError_t e = cudaStreamSynchronize(s);
+                    if (e == cudaSuccess) e = cudaGetLastError();
+                    if (e != cudaSuccess) {
+                        std::printf("Q8 %s T %d apply %d: CUDA error %s\n", q ? "read" : "reference", T, apply, cudaGetErrorString(e));
+                        ++failures;
+                        std::printf("fused_gr_bench: %d differing\n", failures);
+                        return 1;
+                    }
+                }
                 o[q].resize((size_t) T * (LR + N + D + HC));
                 float* p = o[q].data();
                 cudaMemcpy(p, dlo, (size_t) T * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) T * LR;
@@ -273,6 +282,10 @@ int main(int argc, char** argv) {
                             same3 ? "bitwise equal" : "DIFFERS", ha[0], ha[1], ha[2]);
             }
             if (!same3) ++failures;
+            if (!(std::sqrt(num / den) < 0.01) || !(std::sqrt(nm / dm) < 0.01)) {   // 8-bit rounding is ~0.002; a wrong read is order 1
+                std::printf("Q8 vs bf16 T %d apply %d: error too large\n", T, apply);
+                ++failures;
+            }
         }
     }
     if (cold_sets > 1) {

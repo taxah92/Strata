@@ -24,9 +24,10 @@ ENV = {      # what each switch writes outside its default
     "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "1.5"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
     "route_tail_skip": {"STRATA_ROUTE_TAIL_SKIP": "7"},          # 0.2.16: a choice; 0.2.17: Off by default, On = 7 (test_tail_skip_choice.py)
+    "inkling_turbo": {"STRATA_INK_TAIL_SKIP": "turbo"},        # Inkling opt-in tail skip, Terminal only (test_turbo_flags.py)
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "route_tail_skip": "off", "qwen_defaults_026": "off"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "route_tail_skip": "off", "inkling_turbo": "off", "qwen_defaults_026": "off"}
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
 RTX4060TI16 = {"name": "NVIDIA GeForce RTX 4060 Ti 16GB", "vendor": "nvidia", "arch": "89", "vram_gb": 16.0}
@@ -172,7 +173,7 @@ class Terminal(unittest.TestCase):
             base = QWEN
             cfg = self.config(base, S.settings_from_pairs([f"{k}={v}" for k, v in entries.items()]))
             self.assertEqual(cfg["env"], {**base["env"], **entries}, sid)
-            self.assertEqual(cfg["args"], base["args"], "no engine flag changes")
+            self.assertEqual(cfg["args"], self.config(base)["args"], "no engine flag changes")
 
     def test_off_again_puts_the_default_back(self):
         cfg = self.config(QWEN, S.settings_from_pairs(["STRATA_KVA=off"]))

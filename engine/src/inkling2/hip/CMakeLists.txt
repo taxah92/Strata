@@ -4,7 +4,7 @@
 # MIT License - Copyright (c) 2026 Niko1221 and the Strata contributors.
 
 if(NOT DEFINED STRATA_HIP_ARCHS OR "${STRATA_HIP_ARCHS}" STREQUAL "")
-  set(STRATA_HIP_ARCHS "gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1030;gfx1031;gfx1032")
+  set(STRATA_HIP_ARCHS "gfx1200;gfx1201;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1153;gfx1170;gfx1171;gfx1172;gfx1250;gfx1030;gfx1031;gfx1032")
 endif()
 
 # Locate hipcc / AMD clang++ if not already configured by top-level hip_backend.cmake
@@ -50,6 +50,12 @@ endif()
 if(NOT "${_ink_rocm_root}" STREQUAL "")
   list(APPEND _ink_hip_extra_flags "--rocm-path=${_ink_rocm_root}")
 endif()
+if(DEFINED CMAKE_SYSROOT AND NOT "${CMAKE_SYSROOT}" STREQUAL "")
+  list(APPEND _ink_hip_extra_flags "--sysroot=${CMAKE_SYSROOT}")
+endif()
+if(DEFINED STRATA_INK_HIP_EXTRA_FLAGS AND NOT "${STRATA_INK_HIP_EXTRA_FLAGS}" STREQUAL "")
+  list(APPEND _ink_hip_extra_flags ${STRATA_INK_HIP_EXTRA_FLAGS})
+endif()
 if(DEFINED STRATA_ROCM_BITCODE_PATH AND NOT "${STRATA_ROCM_BITCODE_PATH}" STREQUAL "")
   list(APPEND _ink_hip_extra_flags "--rocm-device-lib-path=${STRATA_ROCM_BITCODE_PATH}")
 elseif(NOT "${_ink_rocm_root}" STREQUAL "" AND EXISTS "${_ink_rocm_root}/lib/llvm/amdgcn/bitcode")
@@ -75,12 +81,27 @@ add_custom_command(
           -Wall -Wextra -Wno-unused-function -Wno-unused-result
           "${_ink_hip_src}" -o "${_ink_hip_obj}"
   DEPENDS "${_ink_hip_src}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../ink_gguf_transcode.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_common.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_codecs.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_iq_codecs.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_rdna2_gemm.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/../cuda/ink_iq_grids.cuh"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_ops.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_tree.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_blaslt.hpp"
           "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_hybrid.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_r9700_cfg.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_r9700_attn.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_r9700_fp8.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_r9700_spec.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_r9700_state.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_strixhalo_cfg.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_strixhalo_uma.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_strixhalo_prefill.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_strixhalo_decode.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_strixhalo_megakernel.hip.h"
+          "${CMAKE_CURRENT_SOURCE_DIR}/ink_hip_df2.hip.h"
           "${CMAKE_CURRENT_SOURCE_DIR}/../../../include/strata/hip_uma_guard.hpp"
   COMMENT "Compiling strata-inkling multi-gen HIP backend (${STRATA_HIP_ARCHS})"
   VERBATIM

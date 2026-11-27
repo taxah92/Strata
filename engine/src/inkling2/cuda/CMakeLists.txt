@@ -23,19 +23,10 @@ if(NOT DEFINED STRATA_INK_CUDA_ARCHS OR "${STRATA_INK_CUDA_ARCHS}" STREQUAL "")
   endif()
 endif()
 
-# Native Blackwell block-scaled MMA (mxf4nvf4 & mxf8f6f4) requires arch-specific sm_120a / sm_121a!
-set(_ink_sm120a_archs "")
-foreach(_a IN LISTS STRATA_INK_CUDA_ARCHS)
-  if("${_a}" STREQUAL "120" OR "${_a}" STREQUAL "120a")
-    list(APPEND _ink_sm120a_archs "120a")
-  elseif("${_a}" STREQUAL "121" OR "${_a}" STREQUAL "121a")
-    list(APPEND _ink_sm120a_archs "121a")
-  endif()
-endforeach()
-if("${_ink_sm120a_archs}" STREQUAL "")
-  set(_ink_sm120a_archs "${STRATA_INK_CUDA_ARCHS}")
-endif()
-list(REMOVE_DUPLICATES _ink_sm120a_archs)
+# Native Blackwell block-scaled MMA (mxf4nvf4 & mxf8f6f4) requires arch-specific sm_120a / sm_121a! An inherited CMAKE_CUDA_ARCHITECTURES
+# ("61-real;120-real;89-real") is mapped too, suffix kept (ink_sm120a.cmake, tests/cmake/ink_sm120a_test.cmake).
+include("${CMAKE_CURRENT_SOURCE_DIR}/ink_sm120a.cmake")
+ink_sm120a_archs(_ink_sm120a_archs ${STRATA_INK_CUDA_ARCHS})
 
 set(_ink_cuda_inc
   "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -55,6 +46,7 @@ set_target_properties(strata_inkling_cuda_sm120 PROPERTIES
   CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   CUDA_ARCHITECTURES "${_ink_sm120a_archs}"
+  CUDA_RUNTIME_LIBRARY Shared
   POSITION_INDEPENDENT_CODE ON
 )
 target_compile_options(strata_inkling_cuda_sm120 PRIVATE
@@ -62,6 +54,18 @@ target_compile_options(strata_inkling_cuda_sm120 PRIVATE
 )
 
 # 2. Portable InkCudaBackend plugin implementing ink2::InkBackend (make_cuda_backend)
+# PERF-STEP: the runner TU also gets the arch-specific sm_120a / sm_121a SASS next to the plain one (the plain sm_120 / PTX stay for every other card). On sm_120a
+# the FP4 -> half2 conversion of the M=1 expert kernels is the hardware cvt.rn.f16x2.e2m1x2; plain sm_120 expands it to hundreds of integer instructions
+# (measured on a 5090: gate+up 25.7 -> 17.9 us, down 15.8 -> 9.5 us per visit, identical results). The driver picks the a-variant on an exact match.
+set(_ink_main_archs ${STRATA_INK_CUDA_ARCHS})
+if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+  foreach(_e IN LISTS STRATA_INK_CUDA_ARCHS)
+    if("${_e}" MATCHES "^(12[01])(-real)?$")
+      list(APPEND _ink_main_archs "${CMAKE_MATCH_1}a-real")
+    endif()
+  endforeach()
+endif()
+list(REMOVE_DUPLICATES _ink_main_archs)
 add_library(strata_inkling_cuda STATIC
   "${CMAKE_CURRENT_SOURCE_DIR}/ink_cuda_backend.cu"
 )
@@ -69,7 +73,8 @@ target_include_directories(strata_inkling_cuda PRIVATE ${_ink_cuda_inc})
 set_target_properties(strata_inkling_cuda PROPERTIES
   CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
-  CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}"
+  CUDA_ARCHITECTURES "${_ink_main_archs}"
+  CUDA_RUNTIME_LIBRARY Shared
   POSITION_INDEPENDENT_CODE ON
 )
 target_compile_options(strata_inkling_cuda PRIVATE
@@ -78,18 +83,33 @@ target_compile_options(strata_inkling_cuda PRIVATE
 if(WIN32)
   target_compile_definitions(strata_inkling_cuda PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
   target_compile_definitions(strata_inkling_cuda_sm120 PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX2>)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND STRATA_ISA_FLOOR STREQUAL "avx")
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/arch:AVX>)
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
-  target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx2,-mfma>)
+  # #6618: Keep host code in ink_cuda_backend.cu free of AVX2/FMA; hot host loops dispatch at runtime
+  # into ink_host_avx2.cpp and strata_quant (AVX-512 VNNI / AVX2 / AVX1 / Scalar) via CPUID!
+  if(STRATA_ISA_FLOOR STREQUAL "avx")
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-mavx,-mno-avx2,-mno-fma,-mno-f16c>)
+  else()
+    target_compile_options(strata_inkling_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-msse4.2,-mno-avx,-mno-avx2,-mno-fma,-mno-f16c>)
+  endif()
 endif()
 
 target_link_libraries(strata_inkling_cuda PUBLIC
   strata_inkling_cuda_sm120
+  strata_quant
   CUDA::cudart
   CUDA::cublas
+  ${CMAKE_DL_LIBS}   # dlopen / dlsym in the FP8 engines (glibc < 2.34 keeps them in libdl)
 )
 
 target_compile_definitions(strata-inkling PRIVATE INKLING_ENABLE_CUDA=1)
 target_link_libraries(strata-inkling PRIVATE strata_inkling_cuda)
+
+# The GPU picture reader against the CPU reference on real pictures (error, time, memory); not part of the release build
+add_executable(strata-inkling-vit-check EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/ink_vit_check.cu")
+target_include_directories(strata-inkling-vit-check PRIVATE ${_ink_cuda_inc})
+set_target_properties(strata-inkling-vit-check PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "${STRATA_INK_CUDA_ARCHS}" CUDA_RUNTIME_LIBRARY Shared)
+target_compile_options(strata-inkling-vit-check PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+target_link_libraries(strata-inkling-vit-check PRIVATE strata_inkling_core CUDA::cudart CUDA::cublas)
