@@ -247,4 +247,186 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
                       void* stream);
 
+
+// ---- PR 6.2a: single-pass fused MTP top-4 + online-softmax prob + select, and Zero-D2H CUDA Graph conditional gate
+struct MtpZeroD2hCtrl {
+    static constexpr int kMaxT = 16;
+    static constexpr int kPBuckets = 8;
+    int32_t max_steps = 0;   ///< 1..max_t-1
+    int32_t cap = 1;         ///< widest verify window rows (S_mtp)
+    int32_t mode = 0;        ///< 0 = fixed max_steps, 1 = min_p, 2 = DraftPolicy::keep_draft
+    int32_t fixed = 0;       ///< DraftPolicy::fixed()
+    float min_p = 0.0f;
+    float margin = 0.0f;
+    float cost_ms[kMaxT + 1] = {};
+    float cost_n[kMaxT + 1] = {};
+    float pa_ok[kPBuckets] = {};
+    float pa_n[kPBuckets] = {};
+};
+
+struct MtpZeroD2hState {
+    double q = 1.0;
+    double e = 1.0;
+    double best_v = 0.0;
+    int32_t best_rows = 1;
+    int32_t n_generated = 0;
+};
+
+uint64_t mtp_topk_prob_select_scratch_bytes(int n_rows);
+/// Single-pass over `logits` (n_rows x n_vocab): exact top-4 ids (mapped through optional `dvocab`) and exact
+/// online-softmax probabilities, optionally fused with R_src[row] -> R_dst copy, tok_dst update, and mapped m_out/m_prob
+/// writes (for row 0 at `step_j`). Graph-capturable, self-resetting counter, 0 dynamic alloc.
+void mtp_topk_prob_select(const float* logits, int n_rows, int n_vocab, const int32_t* dvocab, const float* R_src,
+                          int64_t R_stride, const int32_t* row_dev, float* R_dst, int32_t* tok_dst, int32_t* out_ids,
+                          float* out_probs, int32_t* m_out, float* m_prob, int32_t* top4_ids, float* top4_probs,
+                          int step_j, void* scratch, void* stream);
+/// True on CUDA >= 12.4 builds where conditional graph nodes (cudaGraphCondTypeIf) are available.
+bool mtp_zero_d2h_supported();
+/// GPU early-stop gate for step `step_j` inside a Zero-D2H conditional CUDA Graph. Evaluates mode 0/1/2 (exact
+/// DraftPolicy::keep_draft in FP64), writes n_generated and best_rows to mapped outputs, and sets `cond_handle` when != 0.
+void mtp_zero_d2h_gate(int step_j, unsigned long long cond_handle, const MtpZeroD2hCtrl* ctrl, MtpZeroD2hState* st,
+                       const float* step_prob, int32_t* m_n_gen, int32_t* m_best_rows, void* stream);
+
+
+// ---- PR 6.2b: Tree Speculative Verification & Commit (W=2..4 Adaptive Beam Tree, <= 8 nodes, 0 extra VRAM)
+inline constexpr int kTreeMaxNodes = 8;
+inline constexpr int kTreeMaxGdnStack = 2;
+
+struct TreeVerifyMeta {
+    int32_t T = 1;
+    int32_t pad0 = 0;
+    int32_t parent[kTreeMaxNodes] = {};
+    int32_t depth[kTreeMaxNodes] = {};
+    uint32_t anc_mask[kTreeMaxNodes] = {};
+    int32_t gdn_conv_src[kTreeMaxNodes][3] = {};
+    int8_t gdn_restore[kTreeMaxNodes] = {};
+    int8_t gdn_save[kTreeMaxNodes] = {};
+    int32_t ple_tap[kTreeMaxNodes][3] = {};
+    int32_t ple_hist_src[kTreeMaxNodes][9] = {};
+};
+
+/// Build `TreeVerifyMeta` from DFS-preordered `parent[0..T-1]` (parent[0] = -1, 0 <= parent[t] < t).
+/// Returns false if topology is invalid or requires > kTreeMaxGdnStack (2) simultaneous GDN branch stack slots.
+inline bool build_tree_verify_meta(const int32_t* parent, int T, TreeVerifyMeta& out) {
+    out = TreeVerifyMeta{};
+    if (!parent || T < 1 || T > kTreeMaxNodes || parent[0] != -1) return false;
+    out.T = T;
+    int child_cnt[kTreeMaxNodes] = {};
+    int rem_child[kTreeMaxNodes] = {};
+    for (int t = 0; t < T; ++t) {
+        const int p = parent[t];
+        if (t == 0 && p != -1) return false;
+        if (t > 0 && (p < 0 || p >= t)) return false;
+        out.parent[t] = p;
+        out.depth[t] = (t == 0) ? 0 : (out.depth[p] + 1);
+        out.anc_mask[t] = (t == 0 ? 0u : out.anc_mask[p]) | (1u << t);
+        if (p >= 0) { ++child_cnt[p]; ++rem_child[p]; }
+    }
+    // GDN 3-tap conv sources, PLE dilated taps (-9,-6,-3), and PLE 9-row history sources
+    for (int t = 0; t < T; ++t) {
+        // Chain of ancestors of t: chain[0]=t, chain[1]=parent[t], ..., up to root
+        int chain[kTreeMaxNodes + 1];
+        int clen = 0;
+        for (int u = t; u >= 0; u = out.parent[u]) chain[clen++] = u;
+        // GDN conv needs the 3 predecessors before t: offset 3, 2, 1 back -> j=0..2
+        for (int j = 0; j < 3; ++j) {
+            const int back = 3 - j;   // 3, 2, 1
+            if (back < clen) out.gdn_conv_src[t][j] = chain[back];
+            else out.gdn_conv_src[t][j] = -(back - (clen - 1));  // -3 -> hist[0], -2 -> hist[1], -1 -> hist[2]
+        }
+        // PLE dilated taps: back = 9, 6, 3 for k = 0, 1, 2
+        for (int k = 0; k < 3; ++k) {
+            const int back = 9 - 3 * k;
+            if (back < clen) out.ple_tap[t][k] = chain[back];
+            else out.ple_tap[t][k] = -(back - (clen - 1));       // negative -> history[9 + s]
+        }
+        // PLE 9-row history after node t: r=8 is t (back=0), r=7 is parent (back=1), ..., r=0 is back=8
+        for (int r = 0; r < 9; ++r) {
+            const int back = 8 - r;
+            if (back < clen) out.ple_hist_src[t][r] = chain[back];
+            else out.ple_hist_src[t][r] = -(back - (clen - 1));  // negative -> h0[9 + s]
+        }
+    }
+    // Simulate DFS stack for GDN recurrence (max kTreeMaxGdnStack = 2)
+    int stk_node[kTreeMaxGdnStack];
+    for (int s = 0; s < kTreeMaxGdnStack; ++s) stk_node[s] = -1;
+    int cur = -1;
+    for (int t = 0; t < T; ++t) {
+        const int p = out.parent[t];
+        out.gdn_restore[t] = -1;
+        out.gdn_save[t] = -1;
+        if (p != cur) {
+            int found = -1;
+            for (int s = 0; s < kTreeMaxGdnStack; ++s)
+                if (stk_node[s] == p) { found = s; break; }
+            if (found < 0) return false;
+            out.gdn_restore[t] = (int8_t) found;
+        }
+        if (p >= 0) {
+            --rem_child[p];
+            if (rem_child[p] == 0) {
+                for (int s = 0; s < kTreeMaxGdnStack; ++s)
+                    if (stk_node[s] == p) stk_node[s] = -1;
+            }
+        }
+        cur = t;
+        if (child_cnt[t] >= 2) {
+            int free_s = -1;
+            for (int s = 0; s < kTreeMaxGdnStack; ++s)
+                if (stk_node[s] == -1) { free_s = s; break; }
+            if (free_s < 0) return false;
+            stk_node[free_s] = t;
+            out.gdn_save[t] = (int8_t) free_s;
+        }
+    }
+    return true;
+}
+
+/// Tree GDN conv + SiLU + L2 norm: bitwise single-token along every root-to-node branch.
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                      int qk_heads, float eps, int n_tok, const TreeVerifyMeta* meta, void* stream);
+/// Tree GDN recurrence + output norm using 32 KiB dynamic smem 2-slot DFS branch stack (0 extra VRAM).
+/// State in HBM2 is NOT written (verify half); bitwise single-token along every root-to-node branch.
+void gdn_step_norm_tree(const float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const TreeVerifyMeta* meta, void* stream, void* xq_out = nullptr);
+/// Tree QSA selection filter: removes non-ancestor cells >= p0 from sorted `sel[t]` and updates `steps[t].width`.
+void qsa_tree_filter_sel(int32_t* sel, int32_t* steps, int n_tok, int64_t cap, const TreeVerifyMeta* meta, void* stream);
+
+/// Tree GDN commit for all GDN layers in 2 launches: replays `path[0..*n_keep-1]` into conv history and recurrent state.
+void gdn_commit_tree_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
+                            const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
+                            int conv_channels, int h_k, int h_v, int n_layers, const int32_t* n_keep,
+                            const int32_t* path, void* stream);
+
+/// Compact accepted tree KV cells from temporary slots [pos0 + path[k]] into final slots [pos0 + k] for k = 1..*n_keep-1
+/// across all QSA layers in one launch (supports fp16, int8, q4, and k8v4 hybrid, including streamed host ring copy).
+struct QsaKvCompactLayer {
+    int kv_mode = 0;          ///< 0=fp16, 1=int8, 2=q4, 3=k8v4 hybrid
+    int n_kv_heads = 0;
+    int head_dim = 0;
+    int page_size = 0;
+    const int32_t* page_table = nullptr;
+    void* k_pool = nullptr;   ///< fp16: uint16_t*, int8/k8v4: int8_t*, q4: uint8_t*
+    void* v_pool = nullptr;   ///< fp16: uint16_t*, int8: int8_t*, q4/k8v4: uint8_t*
+    uint16_t* k_scale = nullptr;
+    uint16_t* v_scale = nullptr;
+    void* h_k_pool = nullptr;
+    void* h_v_pool = nullptr;
+    uint16_t* h_k_scale = nullptr;
+    uint16_t* h_v_scale = nullptr;
+};
+struct QsaKvCompactLayers {
+    static constexpr int kMax = 16;
+    QsaKvCompactLayer layer[kMax];
+    int n = 0;
+};
+void qsa_kv_compact_tree_layers(const QsaKvCompactLayers& layers, const int32_t* pos0_dev, const int32_t* n_keep,
+                                const int32_t* path, const int32_t* need_compact, void* stream);
+
+/// Compact rows of `src` by `path[0..*n_keep-1]` into `dst[0..*n_keep-1]` when `*need_compact != 0` (safe in-place when
+/// path[k] >= k, e.g. DFS topological order). Supports batched `n_layers` slices of stride `layer_stride` floats.
+void gather_rows_f32_path(const float* src, float* dst, int64_t row_floats, int64_t layer_stride, int n_layers,
+                          const int32_t* n_keep, const int32_t* path, const int32_t* need_compact, void* stream);
+
 }  // namespace strata::kernels

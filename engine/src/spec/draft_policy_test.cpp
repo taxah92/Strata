@@ -7,6 +7,7 @@
 //   4. match-length buckets learn separately (short matches failing does not stop long ones);
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/beam_tree.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -951,6 +952,80 @@ int main() {
         check(held.table_held() && held.calibrating() && !held.fixed(), "learn (b): a table without marks is still held back (the passive path is unchanged)");
         std::error_code ec;
         fs::remove_all(dir, ec);
+    }
+    {
+        // PR 6.2c EcoSpec: hit-rate-aware dynamic cost adjustment adapts immediately on r1 cold->warm and warm->cold
+        DraftPolicy p(8);
+        p.set_robust(true);
+        // Simulate cold r1 regime (60% hit rate, heavy CPU misses)
+        for (int i = 0; i < 16; ++i) {
+            p.observe_hit_rate(0.60, 400, 12.0);
+            p.observe(false, 2, 1, 0, 22.0);
+            p.observe(false, 4, 2, 0, 32.0);
+        }
+        const double cold_c4 = p.cost_ms(4);
+        // Now cache warms to 92% hit rate (much fewer misses)
+        for (int i = 0; i < 8; ++i) p.observe_hit_rate(0.92, 80, 2.4);
+        const double warm_c4 = p.cost_ms(4);
+        check(warm_c4 < cold_c4 - 1.5, "ecospec: warming hit rate immediately lowers predicted cost_ms(4)");
+        // Now domain shift cools hit rate back down to 62%
+        for (int i = 0; i < 8; ++i) p.observe_hit_rate(0.62, 380, 11.4);
+        const double cool_c4 = p.cost_ms(4);
+        check(cool_c4 > warm_c4 + 1.5, "ecospec: cooling hit rate immediately raises predicted cost_ms(4)");
+    }
+    {
+        // PR 6.2b Beam Tree pruning + TreeGainTracker realized-gain cooldown
+        using namespace strata::spec;
+        DraftPolicy p(8);
+        p.set_robust(true);
+        // Typical V100 warm r0 costs: small marginal per-token cost
+        const double ctab[8] = {15.0, 16.2, 17.5, 19.0, 20.6, 22.3, 24.1, 26.0};
+        p.set_fixed_costs(ctab, 8, 0);
+        TreeGainTracker tr;
+        tr.set_enabled(true);
+        tr.set_max_nodes(6);
+
+        // Case 1: Confident root (p1=0.95) -> pure linear chain wins, is_tree == false
+        int32_t main_toks[4] = {10, 20, 30, 40};
+        float main_probs[4] = {0.95f, 0.90f, 0.85f, 0.80f};
+        int32_t top4_ids[16] = {
+            10, 11, 12, 13,
+            20, 21, 22, 23,
+            30, 31, 32, 33,
+            40, 41, 42, 43
+        };
+        float top4_probs[16] = {
+            0.95f, 0.03f, 0.01f, 0.005f,
+            0.90f, 0.05f, 0.02f, 0.01f,
+            0.85f, 0.07f, 0.03f, 0.02f,
+            0.80f, 0.08f, 0.04f, 0.02f
+        };
+        BeamTreePlan plan1;
+        build_optimal_beam_tree(1, main_toks, main_probs, 4, top4_ids, top4_probs, nullptr, nullptr, 0, p, tr, 6, 5, plan1);
+        check(!plan1.is_tree && plan1.T >= 2, "beam_tree: confident main chain stays linear");
+
+        // Case 2: Uncertain root with strong top2/top3 -> connected tree selected with valid DFS & GDN stack <= 2
+        float u_main[4] = {0.42f, 0.78f, 0.72f, 0.60f};
+        float u_top4[16] = {
+            0.42f, 0.34f, 0.16f, 0.04f,
+            0.78f, 0.12f, 0.05f, 0.02f,
+            0.72f, 0.14f, 0.06f, 0.03f,
+            0.60f, 0.18f, 0.08f, 0.04f
+        };
+        BeamTreePlan plan2;
+        build_optimal_beam_tree(1, main_toks, u_main, 4, top4_ids, u_top4, nullptr, nullptr, 0, p, tr, 6, 5, plan2);
+        strata::kernels::TreeVerifyMeta meta{};
+        check(plan2.is_tree && plan2.T >= 4 && plan2.T <= 6 && plan2.extra_nodes >= 1,
+              "beam_tree: uncertain root with strong runners-up selects connected tree");
+        check(strata::kernels::build_tree_verify_meta(plan2.parent, plan2.T, meta),
+              "beam_tree: selected tree satisfies DFS pre-order and GDN stack <= 2");
+
+        // Case 3: Realized-gain cooldown triggers after >= 16 unprofitable tree windows and recovers after 24 linear ticks
+        int32_t main_only_path[2] = {0, 1};
+        for (int i = 0; i < 20; ++i) tr.observe_tree(plan2, main_only_path, 2, 23.0, 18.0);
+        check(!tr.tree_allowed(), "beam_tree: realized-gain cooldown disables unprofitable trees");
+        for (int i = 0; i < 24; ++i) tr.tick_linear();
+        check(tr.tree_allowed(), "beam_tree: cooldown recovers after 24 linear windows");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

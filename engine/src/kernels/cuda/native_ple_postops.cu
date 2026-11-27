@@ -209,6 +209,44 @@ __global__ void history_batch_snap_kernel(float* history, const float* normalize
     }
 }
 
+
+// PR 6.2b: Tree PLE dilated conv + history snapshot (bitwise identical to single-token PLE along each root-to-node path)
+__global__ void conv_residual_tree_kernel(const float* __restrict__ history, const float* __restrict__ normalized,
+                                          const uint16_t* __restrict__ weights, float* __restrict__ hidden,
+                                          const float* __restrict__ gated, int T, const int32_t* __restrict__ ple_tap) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(T) * D) return;
+    const int t = int(i / D), c = int(i % D);
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int src = (k < 3) ? ple_tap[t * 3 + k] : t;
+        const float x = src >= 0 ? normalized[size_t(src) * D + c] : history[size_t(c) * HISTORY + (9 + src)];
+        const float wk = __half2float(__ushort_as_half(weights[c * 4 + k]));
+        const float term = __fmul_rn(x, wk);
+        sum = k == 0 ? term : __fadd_rn(sum, term);
+    }
+    const float activation = sum / (1.0f + expf(-sum));
+    hidden[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], activation));
+}
+
+__global__ void history_tree_snap_kernel(const float* __restrict__ history, const float* __restrict__ normalized, int T,
+                                         const int32_t* __restrict__ ple_hist_src, float* __restrict__ snap) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float h0[HISTORY];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) h0[r] = history[size_t(c) * HISTORY + r];
+    for (int t = 0; t < T; ++t) {
+        float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) {
+            const int src = ple_hist_src[t * HISTORY + r];
+            out[r] = src >= 0 ? normalized[size_t(src) * D + c] : h0[HISTORY + src];
+        }
+    }
+}
+
 struct Span { const void* p; size_t bytes; size_t alignment; };
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
@@ -288,4 +326,24 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     history_batch_snap_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T, snap);
     launch_check();
 }
+
+void native_ple_postops_tree_snap(float* key, float* hidden, const float* value, const float* history,
+                                  const PleWeights& w, float* query_norm, float* gated, float* gate, int T,
+                                  const int32_t* ple_tap, const int32_t* ple_hist_src, float* snap, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate || !snap ||
+        !ple_tap || !ple_hist_src)
+        throw std::invalid_argument("native PLE postops tree: null input or empty batch");
+    auto st = static_cast<cudaStream_t>(stream);
+    const unsigned rows = unsigned(T) * H;
+    const unsigned blocks = unsigned((size_t(T) * D + 255) / 256);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(key, w.norm_key, key, N, NG_RMS_EPS);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(hidden, w.norm_query, query_norm, N, NG_RMS_EPS);
+    gate_kernel<<<rows, 512, 0, st>>>(key, query_norm, gate, 1.0f / std::sqrt(float(N)));
+    broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm, N, NG_RMS_EPS);
+    conv_residual_tree_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T, ple_tap);
+    history_tree_snap_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T, ple_hist_src, snap);
+    launch_check();
+}
+
 } // namespace strata::kernels

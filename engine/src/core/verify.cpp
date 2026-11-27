@@ -779,6 +779,12 @@ Verifier::~Verifier() {
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    if (commit_tree_exec_) cudaGraphExecDestroy(commit_tree_exec_);
+    for (int sl = 0; sl < 2; ++sl)
+        for (int t = 0; t <= strata::kernels::kTreeMaxNodes; ++t) {
+            if (tree_exec_[sl][t]) cudaGraphExecDestroy(tree_exec_[sl][t]);
+            if (tree_exec_nr_[sl][t]) cudaGraphExecDestroy(tree_exec_nr_[sl][t]);
+        }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -822,7 +828,7 @@ Verifier::~Verifier() {
     if (arena_) cudaFree(arena_);
     if (mk_counters_) cudaFree(mk_counters_);
     if (hcount_d_) cudaFree(hcount_d_);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_, h_tree_, h_tcommit_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_, h_mk_stall_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
@@ -1035,6 +1041,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
+              mapped(sizeof(strata::kernels::TreeVerifyMeta), (void**) &h_tree_, (void**) &m_tree_) &&
+              mapped((4 + 2 * T) * 4 + 16, (void**) &h_tcommit_, (void**) &m_tcommit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
               mapped((size_t) strata::kernels::kVerifyLongT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
@@ -1179,6 +1187,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
+        tree_dev_ = b.take<strata::kernels::TreeVerifyMeta>(1);
+        tcommit_ = b.take<int32_t>(4 + 2 * T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
@@ -1617,6 +1627,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // ---- the window's inputs, from mapped staging.  With branches the steps and positions (first read by the first
     // layer's mixer) cross PCIe on side 1 beside the embedding and the first hyper-connection read.
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
+    if (tree_rec_) copy_i32_from_mapped((int32_t*) tree_dev_, (const int32_t*) m_tree_,
+                                        (int64_t) (sizeof(strata::kernels::TreeVerifyMeta) / sizeof(int32_t)), cs);
     bool inputs_pending = false;
     cudaStream_t in_s = cs;
     if (br) {
@@ -1696,7 +1708,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_PLE_BATCH");
                 return !e || e[0] != '0';
             }();
-            const bool ple_batch_kv = ple_batch_env && dec_batch && n > 1 && ss.ple.w.key_bf16 != nullptr &&
+            const bool ple_has_key = ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr;
+            const bool ple_batch_kv = (ple_batch_env || tree_rec_) && dec_batch && n > 1 &&
+                                      (tree_rec_ ? ple_has_key : ss.ple.w.key_bf16 != nullptr) &&
                                       ss.ple.w.value_bf16 != nullptr && ple_native_bf16_enabled() &&
                                       ple_native_postops_enabled();
             // S25 (STRATA_PLE_BATCH=1): the key and value projections depend only on each row's n-gram embedding, so
@@ -1708,8 +1722,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool batched = !ple_batch_kv && ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16_enabled();
             if (ple_batch_kv) {
                 try {
-                    bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
-                                              xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
+                    if (ss.ple.w.key_bf16 != nullptr)
+                        bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.key_bf16,
+                                                  xn_ + (size_t) tb * HC * N, HC * N, N, HC * N, n, cs);
+                    else {
+                        native_quantize_q8_1(ple_ + (size_t) tb * N, xq_, (int) N, n, cs);
+                        native_mmvq(ss.ple.w.key_native_type, ss.ple.w.key_native_data, xq_,
+                                    xn_ + (size_t) tb * HC * N, (int) N, NG_HC_DIM, n, cs);
+                    }
                     bf16_gemv_fp32_mmvf_multi(ple_ + (size_t) tb * N, N, ss.ple.w.value_bf16,
                                               z_ + (size_t) tb * N, N, N, N, n, cs);
                 } catch (const std::exception& e) {
@@ -1740,7 +1760,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_DF_PLE");
                 return e != nullptr && std::atoi(e) != 0;
             }();
-            const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
+            const bool ple_post = ple_batch_kv && (ple_post_env || tree_rec_) && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -1754,8 +1774,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                              N, HC, cs);
                     else
                         for (int t = tb; t < te; ++t) gr_write(Rt(t), bo_ + t * N, inj2_ + t * HC, gs, Rt(t), cs);
-                    native_ple_postops_batch_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
-                                                  ss.ple.w, qn, gated, pgate, n, hist_snap_ + (size_t) tb * HS, cs);
+                    if (tree_rec_)
+                        native_ple_postops_tree_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
+                                                     ss.ple.w, qn, gated, pgate, n, &tree_dev_->ple_tap[0][0],
+                                                     &tree_dev_->ple_hist_src[0][0], hist_snap_ + (size_t) tb * HS, cs);
+                    else
+                        native_ple_postops_batch_snap(xn_ + (size_t) tb * HC * N, Rt(tb), z_ + (size_t) tb * N, ss.ple.hist,
+                                                      ss.ple.w, qn, gated, pgate, n, hist_snap_ + (size_t) tb * HS, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE (window): ") + e.what();
                     return false;
@@ -1952,14 +1977,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                       (int) HV, cs);
                 else
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
-                                  self_commit);
+                if (tree_rec_)
+                    gdn_conv_l2_tree(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tree_dev_, cs);
+                else
+                    gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                      self_commit);
                 stamp(l, 3, grp);
                 if (br) {   // gate, beta and z, before the recurrence reads them
                     join(0);
                     join(1);
                 } else {
-                if (!fuse_ab && !sidem)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
+                if ((!fuse_ab || tree_rec_) && !sidem)   // the gates: the HIP fused conv kernel (143-amdk) or the side mixer's branch, else here
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
@@ -2003,8 +2031,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
                     }
                 } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                if (tree_rec_)
+                    gdn_step_norm_tree(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                       (int) HV, te, tree_dev_, cs, g_qfuse() ? (void*) xq_ : nullptr);
+                else
+                    gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
                 // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
@@ -2143,12 +2175,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                               max_blocks_, s, scores_ + (size_t) tb * max_blocks_, ns, -1);
                         qsa_block_topk_long(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
                                             cap_, s, sel_ + (size_t) tb * cap_, ns, -1, topk_scratch_);
+                        if (tree_rec_) qsa_tree_filter_sel(sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, tree_dev_, ns);
                         return;
                     }
                     qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                      s, scores_ + (size_t) tb * max_blocks_, ns);
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
                                    sel_ + (size_t) tb * cap_, ns);
+                    if (tree_rec_) qsa_tree_filter_sel(sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, tree_dev_, ns);
                 };
                 // the attention's queries: the projection (mm on cs, which may read F4's interleaved copy; on a branch
                 // F4's kernel too, its copy written on cs before the fork - bitwise the same), the q/gate
@@ -3100,7 +3134,9 @@ void Verifier::refresh_ar() {
 
 bool Verifier::capture(int T, std::string& err) {
     const auto cap_t0 = std::chrono::steady_clock::now();
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
+    cudaGraphExec_t& exec_t = tree_active_
+        ? (ar_off_ ? tree_exec_nr_[sel_long_][T] : tree_exec_[sel_long_][T])
+        : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]);
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -3124,8 +3160,13 @@ bool Verifier::capture(int T, std::string& err) {
 #endif
     head_bitplane_used_ = false;
     std::string rerr;
+    tree_rec_ = tree_active_;
     const bool ok = record_window(T, cs_, rerr);
-    if (ok) (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T] = head_bitplane_used_;
+    tree_rec_ = false;
+    if (ok) {
+        if (tree_active_) (ar_off_ ? graph_head_bp_tree_nr_ : graph_head_bp_tree_)[sel_long_][T] = head_bitplane_used_;
+        else (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T] = head_bitplane_used_;
+    }
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) {
@@ -3418,7 +3459,7 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
+        const int32_t pos_t = (int32_t) (pos0 + (tree_active_ ? h_tree_->depth[t] : t));
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
@@ -3685,7 +3726,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // STRATA_SELECT_LONG: the select kernels this window's context pays off with (the same on every stage)
     sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
     if (!capture(T, err) || !capture_commit(err)) return false;
-    head_bitplane_used_ = (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T];
+    head_bitplane_used_ = tree_active_
+        ? (ar_off_ ? graph_head_bp_tree_nr_ : graph_head_bp_tree_)[sel_long_][T]
+        : (ar_off_ ? graph_head_bp_nr_ : graph_head_bp_)[sel_long_][T];
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
         const OnDevice on_next(next_->device_);
@@ -3700,12 +3743,25 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyLongT * PLE_N_HEADS];
     if (do_ple) {
-        int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
-        for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
-            prev[0] = prev[1];
-            prev[1] = tokens[t];
-            ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+        if (tree_active_) {
+            for (int t = 0; t < T; ++t) {
+                const int p1 = h_tree_->parent[t];
+                const int p2 = p1 >= 0 ? h_tree_->parent[p1] : -1;
+                int32_t prev[2];
+                if (p1 < 0) { prev[0] = ss.ple_prev[0]; prev[1] = ss.ple_prev[1]; }
+                else if (p2 < 0) { prev[0] = ss.ple_prev[1]; prev[1] = tokens[p1]; }
+                else { prev[0] = tokens[p2]; prev[1] = tokens[p1]; }
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+                ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+            }
+        } else {
+            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+            for (int t = 0; t < T; ++t) {
+                ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + t * PLE_N_HEADS);
+                prev[0] = prev[1];
+                prev[1] = tokens[t];
+                ss.ple.table->prefetch_rows(ple_rows + t * PLE_N_HEADS);
+            }
         }
     }
 #if defined(STRATA_VERIFY_HGL)
@@ -3713,7 +3769,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
-    bool& graph_launched = ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T];
+    bool& graph_launched = tree_active_
+        ? (ar_off_ ? launched_tree_nr_[sel_long_][T] : launched_tree_[sel_long_][T])
+        : (ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T]);
     if (!pre && ar_on() && !test_stall && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -3772,7 +3830,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                 }
             });
         }
-        launch_o.emplace(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_, device_, threaded_launch,
+        launch_o.emplace(tree_active_ ? (ar_off_ ? tree_exec_nr_[sel_long_][T] : tree_exec_[sel_long_][T])
+                                      : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]), cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
         if (probe_this) {
@@ -3784,7 +3843,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         }
 #else
         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
+        const cudaError_t le = cudaGraphLaunch(tree_active_ ? (ar_off_ ? tree_exec_nr_[sel_long_][T] : tree_exec_[sel_long_][T])
+                                                            : (ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T]), cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
@@ -4471,6 +4531,181 @@ bool Verifier::commit(int n_keep, std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+bool Verifier::tree_supported() const {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    return false;
+#else
+    if (g_ == nullptr || ss_ == nullptr || next_ != nullptr || lb_ != 0 || le_ != g_->n_layers) return false;
+    if (max_t_ < 3 || h_tree_ == nullptr || h_tcommit_ == nullptr) return false;
+    if (ss_->ple.ready() && ple_stage() &&
+        ((ss_->ple.w.key_bf16 == nullptr && ss_->ple.w.key_native_data == nullptr) ||
+         ss_->ple.w.value_bf16 == nullptr ||
+         !strata::kernels::ple_native_bf16_enabled() || !strata::kernels::ple_native_postops_enabled()))
+        return false;
+    return true;
+#endif
+}
+
+bool Verifier::run_tree(int T, const int32_t* tokens, const int32_t* parent, int64_t pos0, PoolMultiFn pool, void* user,
+                        int32_t* out, std::string& err) {
+    if (!tree_supported()) { err = "verify tree: not supported in this configuration"; return false; }
+    if (T < 2 || T > strata::kernels::kTreeMaxNodes || T > max_t_) { err = "verify tree: T out of range"; return false; }
+    if (!strata::kernels::build_tree_verify_meta(parent, T, *h_tree_)) {
+        err = "verify tree: invalid topology or GDN branch stack > 2";
+        return false;
+    }
+    struct Guard { bool& f; ~Guard() { f = false; } } guard{tree_active_};
+    tree_active_ = true;
+    return run(T, tokens, pos0, pool, user, out, err);
+}
+
+bool Verifier::capture_commit_tree(std::string& err) {
+    if (commit_tree_exec_ != nullptr) return true;
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ID = g.idx_key_dim, MT = max_t_;
+    const int64_t N = g.n_embd, HC = g.hc;
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        err = "verify: begin commit_tree capture failed";
+        return false;
+    }
+    bool ok = true;
+    try {
+        // tcommit_ layout: [0]=n_keep, [1]=last_node, [2]=pos0, [3]=need_compact, [4..4+MT-1]=path, [4+MT..4+2*MT-1]=pos0+k
+        copy_i32_from_mapped(tcommit_, m_tcommit_, 4 + 2 * MT, cs_);
+        const int32_t* d_nkeep = tcommit_ + 0;
+        const int32_t* d_last  = tcommit_ + 1;
+        const int32_t* d_pos0  = tcommit_ + 2;
+        const int32_t* d_ncmp  = tcommit_ + 3;
+        const int32_t* d_path  = tcommit_ + 4;
+        const int32_t* d_cpos  = tcommit_ + 4 + MT;
+
+        const int64_t n_gdn = g.n_gdn_layers();
+        if (n_gdn > 0) {
+            gdn_commit_tree_layers(
+                ss.gdn_state, (int64_t) gdn_floats,
+                (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                qkv_L_, MT * C, h_L_, MT * C, gate_L_, beta_L_, MT * HV,
+                (int) C, (int) g.ssm_k_heads, (int) HV, (int) n_gdn, d_nkeep, d_path, cs_);
+        }
+
+        // QSA layers: compact KV cells (when side branch taken), compact idx_raw_L_ and re-append indexer
+        QsaKvCompactLayers kvl{};
+        QsaIndexerLayers il{};
+        int nq = 0;
+        int64_t mc = -1;
+        for (int64_t l = 0, qi = 0; l < g.n_layers; ++l) {
+            if (!is_qsa_layer(g, l)) continue;
+            const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+            if (!wikn) { ok = false; break; }
+            const QsaState& st = ss.qsa_states[qi];
+            if (nq >= QsaKvCompactLayers::kMax || nq >= QsaIndexerLayers::kMax) { ok = false; err = "verify commit_tree: too many QSA layers"; break; }
+            mc = st.max_cells;
+            QsaKvCompactLayer& kl = kvl.layer[nq];
+            kl.n_kv_heads = (int) s.n_head_kv;
+            kl.head_dim = (int) s.head_dim;
+            kl.page_size = (int) s.page_size;
+            kl.page_table = st.page_table;
+            if (st.kv_hybrid) {
+                kl.kv_mode = 3;
+                kl.k_pool = st.k_q; kl.v_pool = st.v_q4; kl.k_scale = st.k_scale; kl.v_scale = nullptr;
+                if (st.host.present()) { kl.h_k_pool = st.host.k_q; kl.h_v_pool = st.host.v_q4; kl.h_k_scale = st.host.k_scale; }
+            } else if (st.kv_q4) {
+                kl.kv_mode = 2;
+                kl.k_pool = st.k_q4; kl.v_pool = st.v_q4;
+                if (st.host.present()) { kl.h_k_pool = st.host.k_q4; kl.h_v_pool = st.host.v_q4; }
+            } else if (st.kv_int8) {
+                kl.kv_mode = 1;
+                kl.k_pool = st.k_q; kl.v_pool = st.v_q; kl.k_scale = st.k_scale; kl.v_scale = st.v_scale;
+                if (st.host.present()) { kl.h_k_pool = st.host.k_q; kl.h_v_pool = st.host.v_q; kl.h_k_scale = st.host.k_scale; kl.h_v_scale = st.host.v_scale; }
+            } else {
+                kl.kv_mode = 0;
+                kl.k_pool = st.k_pool; kl.v_pool = st.v_pool;
+                if (st.host.present()) { kl.h_k_pool = st.host.k_pool; kl.h_v_pool = st.host.v_pool; }
+            }
+            il.gamma[nq] = (const float*) wikn->data;
+            il.tail_src[nq] = tail_snap_ + (size_t) qi * TS;
+            il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+            il.block_pos[nq] = st.idx_block_pos;
+            ++nq;
+            ++qi;
+        }
+        kvl.n = nq;
+        if (ok && nq > 0) {
+            qsa_kv_compact_tree_layers(kvl, d_pos0, d_nkeep, d_path, d_ncmp, cs_);
+            gather_rows_f32_path(idx_raw_L_, idx_raw_L_, ID, MT * ID, nq, d_nkeep, d_path, d_ncmp, cs_);
+            native_qsa_indexer_append_steps_layers(idx_raw_L_, MT * ID, d_cpos, 1, (int) MT, 0, EPS, il, nq, s, mc,
+                                                   rope_scaling(), cs_);
+        }
+        if (ok && ss.ple.ready() && ple_stage()) copy_indexed(ss.ple.hist, hist_snap_, HS, d_last, HS, cs_);
+        // Compact R_[path[k]] -> R_[k] for MtpDrafter linear catch-up when a side branch was accepted
+        if (ok) gather_rows_f32_path(R_, R_, HC * N, HC * N * MT, 1, d_nkeep, d_path, d_ncmp, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify commit_tree: ") + e.what();
+        ok = false;
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) {
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+    if (ce != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        err = std::string("verify: commit_tree capture: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    const bool made = instantiate_evicting(commit_tree_exec_, graph, {}, "verify: commit_tree instantiate: ", err, 0);
+    cudaGraphDestroy(graph);
+    return made;
+}
+
+bool Verifier::commit_tree(const int32_t* path, int n_keep, std::string& err) {
+    const OnDevice on_device(device_);
+    if (!path || n_keep < 1 || n_keep > last_t_ || path[0] != 0) {
+        err = "verify commit_tree: invalid path";
+        return false;
+    }
+    if (!capture_commit_tree(err)) return false;
+    const Clock::time_point t0 = Clock::now();
+    int32_t need_cmp = 0;
+    for (int k = 0; k < n_keep; ++k) {
+        if (path[k] < 0 || path[k] >= last_t_) { err = "verify commit_tree: path node out of range"; return false; }
+        if (path[k] != k) need_cmp = 1;
+    }
+    h_tcommit_[0] = n_keep;
+    h_tcommit_[1] = path[n_keep - 1];
+    h_tcommit_[2] = (int32_t) last_pos0_;
+    h_tcommit_[3] = need_cmp;
+    for (int k = 0; k < max_t_; ++k) h_tcommit_[4 + k] = k < n_keep ? path[k] : 0;
+    for (int k = 0; k < max_t_; ++k) h_tcommit_[4 + max_t_ + k] = k < n_keep ? (int32_t) (last_pos0_ + k) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const cudaError_t le = cudaGraphLaunch(commit_tree_exec_, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: commit_tree launch: ") + cudaGetErrorString(le); return false; }
+    if (!g_commit_async || next_ != nullptr) {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: commit_tree: ") + cudaGetErrorString(se); return false; }
+    } else {
+        const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+        if (re != cudaSuccess) { err = std::string("verify: commit_tree event: ") + cudaGetErrorString(re); return false; }
+        (void) cudaStreamQuery(cs_);
+        commit_pending_ = true;
+    }
+    if (ple_stage())
+        for (int k = 0; k < n_keep; ++k) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[path[k]];
+        }
+    ms_commit += ms_since(t0);
+    return true;
 }
 
 bool Verifier::commit_deferred() const {

@@ -141,6 +141,7 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/program/reply_branch.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/beam_tree.hpp"
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
@@ -16518,12 +16519,14 @@ int main(int argc, char** argv) {
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            mtp.set_cost_policy(&policy, &chain_rows, S_mtp);
+        }
         policy.set_sizes(lookup_size_mask(o));
         // a layer split's hand-off buffers hold kVerifyNarrowT rows: its windows stay at that
         if (n_stages > 1) policy.set_sizes(policy.sizes() & ((2u << strata::kernels::kVerifyNarrowT) - 1u));
@@ -21944,7 +21947,17 @@ int main(int argc, char** argv) {
             // client was sent.  Research switch, on by default; STRATA_SERVE_STOP_SKIP=0 turns it off (serve_stop_bound.hpp)
             static const bool stop_skip = strata::core::serve_stop_skip_on(std::getenv("STRATA_SERVE_STOP_SKIP"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
-            int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+            int64_t t2_rej[8] = {}, t2_hit[8] = {}, t3_hit[8] = {}, t4_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
+            strata::spec::TreeGainTracker tree_tracker;
+            int last_n_drafts = 0;
+            int32_t alt_drafts[4] = {};
+            float alt_probs[4] = {};
+            int alt_n = 0;
+            static const int tree_alt_steps = [] {
+                const char* v = std::getenv("STRATA_MTP_TREE_ALT");
+                if (v == nullptr || v[0] == '\0') return 0;
+                return std::clamp(std::atoi(v), 0, 2);
+            }();
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
             strata::spec::PromptLookupSource lookup_src(sfx);
@@ -23006,6 +23019,30 @@ int main(int argc, char** argv) {
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                bool use_tree_win = false;
+                strata::spec::BeamTreePlan bplan;
+                if (use_mtp && !req_df2 && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 &&
+                    !win_forced && !gated_proposal && !mtp.prob() && req_sp.greedy && hist_n == 0 &&
+                    req_logprobs < 0 && fol == nullptr && ver.tree_supported() && tree_tracker.tree_allowed() &&
+                    last_n_drafts >= 1 && mtp.top4_ids_host() != nullptr && mtp.top4_ids_host()[0] >= 0) {
+                    const int max_tree = std::min<int>({tree_tracker.max_nodes(), S, ver.max_t(),
+                                                        (int) std::min<int64_t>(strata::kernels::kTreeMaxNodes, o.max_context - p)});
+                    const int lin_cap = std::min<int>({S_mtp, last_n_drafts + 1, max_tree});
+                    if (max_tree >= 3 && lin_cap >= 2) {
+                        strata::spec::build_optimal_beam_tree(
+                            x, drafts.data(), dprob.data(), last_n_drafts,
+                            mtp.top4_ids_host(), mtp.top4_probs_host(),
+                            alt_n > 0 ? alt_drafts : nullptr, alt_n > 0 ? alt_probs : nullptr, alt_n,
+                            policy, tree_tracker, max_tree, lin_cap, bplan);
+                        if (bplan.is_tree && bplan.T >= 3 && p + bplan.T <= o.max_context) {
+                            use_tree_win = true;
+                            T = bplan.T;
+                            for (int i = 0; i < T; ++i) window[(size_t) i] = bplan.tokens[i];
+                        } else {
+                            tree_tracker.tick_linear();
+                        }
+                    }
+                }
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
@@ -23188,7 +23225,12 @@ int main(int argc, char** argv) {
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                const int64_t eco_h0 = drive.d.cache_hits, eco_m0 = drive.d.multi_entries;
+                const double eco_cpu0 = drive.d.ms_run;
+                const bool ver_ok = use_tree_win
+                    ? ver.run_tree(T, window.data(), bplan.parent, p, decode_pool_fn, win_pool_user, outv.data(), err)
+                    : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
+                if (!ver_ok || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -23227,8 +23269,40 @@ int main(int argc, char** argv) {
                         if (!merged) valid = valid && i + 1 < T && window[(size_t) i + 1] == outv[(size_t) i];
                     }
                 }
+                int32_t tree_path[strata::kernels::kTreeMaxNodes] = {};
+                int tree_main_acc = 0;
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (use_tree_win) {
+                    int nkeep = 1;
+                    tree_path[0] = 0;
+                    int cur = 0;
+                    while (nkeep < strata::kernels::kTreeMaxNodes) {
+                        const int32_t pred = outv[(size_t) cur];
+                        int next_u = -1;
+                        for (int u = cur + 1; u < T; ++u) {
+                            if (bplan.parent[u] == cur && bplan.tokens[u] == pred) { next_u = u; break; }
+                        }
+                        if (next_u < 0) break;
+                        tree_path[nkeep++] = next_u;
+                        cur = next_u;
+                    }
+                    for (int k = 1; k < nkeep; ++k) {
+                        if (bplan.sibling_rank[tree_path[k]] == 0) ++tree_main_acc;
+                        else break;
+                    }
+                    int32_t p_win[strata::kernels::kTreeMaxNodes], p_out[strata::kernels::kTreeMaxNodes];
+                    for (int k = 0; k < nkeep; ++k) {
+                        p_win[k] = window[(size_t) tree_path[k]];
+                        p_out[k] = outv[(size_t) tree_path[k]];
+                    }
+                    for (int k = 0; k < nkeep; ++k) {
+                        window[(size_t) k] = p_win[k];
+                        outv[(size_t) k] = p_out[k];
+                    }
+                    a = nkeep - 1;
+                } else {
+                    while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                }
                 if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are the accepted tokens)
                     std::vector<int32_t> fol_tg((size_t) a + 1, -1);
                     for (int i = 0; i <= a; ++i) {
@@ -23255,6 +23329,8 @@ int main(int argc, char** argv) {
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
+                    else if (mtp.top4_id(a, 2) == outv[(size_t) a]) ++t3_hit[a];
+                    else if (mtp.top4_id(a, 3) == outv[(size_t) a]) ++t4_hit[a];
                 }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -23262,11 +23338,22 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_iv(rounds)) == 0)
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                const bool commit_ok = use_tree_win ? ver.commit_tree(tree_path, a + 1, err) : ver.commit(a + 1, err);
+                if (!commit_ok) {
                     exit_if_gpu_fatal(err);
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
+                }
+                if (use_tree_win) {
+                    bool tree_need_sync_R = false;
+                    for (int k = 0; k <= a; ++k) if (tree_path[k] != k) { tree_need_sync_R = true; break; }
+                    if (tree_need_sync_R && !ver.wait_commit(err)) {
+                        exit_if_gpu_fatal(err);
+                        if (adapt_thr.joinable()) adapt_thr.join();
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -23341,9 +23428,20 @@ int main(int argc, char** argv) {
                 }
 #endif
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !draft_on || eos || produced_n >= cap_now() ||
-                                     (req_df2 ? ((!merged && defer_df2(a)) || draft_df2(a)) : mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
-                                                                               nullptr, gated_proposal ? &generation : nullptr));
+                alt_n = 0;
+                const int draft_T = use_tree_win ? (a + 1) : T;
+                bool drafted = !draft_on || eos || produced_n >= cap_now() ||
+                               (req_df2 ? ((!merged && defer_df2(a)) || draft_df2(a)) : mtp.draft_long(draft_T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                                                         &last_n_drafts, gated_proposal ? &generation : nullptr));
+                if (drafted && draft_on && !req_df2 && use_mtp && !eos && produced_n < cap_now() &&
+                    tree_alt_steps > 0 && tree_tracker.tree_allowed() && last_n_drafts >= 1 &&
+                    mtp.top4_ids_host() != nullptr && mtp.top4_ids_host()[0] >= 0 &&
+                    p + a + 2 < o.max_context) {
+                    const float p1 = mtp.top4_probs_host()[0], p2 = mtp.top4_probs_host()[1];
+                    const int32_t t2 = mtp.top4_ids_host()[1];
+                    if (t2 >= 0 && p1 < 0.72f && p2 >= 0.22f)
+                        drafted = mtp.draft_alt_branch(t2, p + a + 1, tree_alt_steps, alt_drafts, alt_probs, &alt_n, err);
+                }
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -23407,13 +23505,27 @@ int main(int argc, char** argv) {
                     std::fprintf(df2_trace, "\n");
                     tr_k = 0;
                 }
-                if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                {
+                    const int64_t eco_dh = drive.d.cache_hits - eco_h0;
+                    const int64_t eco_dm = drive.d.multi_entries - eco_m0;
+                    if (eco_dh + eco_dm > 0)
+                        policy.observe_hit_rate((double) eco_dh / (double) (eco_dh + eco_dm), eco_dm,
+                                                drive.d.ms_run - eco_cpu0);
+                }
+                const double round_ms_now = std::chrono::duration<double, std::milli>(Clock::now() - round0).count();
+                if (use_tree_win) {
+                    tree_tracker.observe_tree(bplan, tree_path, a + 1, round_ms_now, policy.cost_ms(bplan.main_chain_len));
+                    if (spec_cost && use_mtp && timed_round) policy.observe_probs(dwin_s.data(), bplan.main_chain_len - 1, tree_main_acc);
+                } else if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) {
+                    policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                }
                 if (dc_learning || dc_calib) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
-                if (timed_round && !eos && chain_n == 0 && ((sfx_pad > 0 && from_sfx) || win_forced))   // a window run for its size's sake: its time only
-                    policy.observe_forced(T, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                if (use_tree_win) {
+                    if (timed_round && !eos) policy.observe_forced(T, round_ms_now);
+                } else if (timed_round && !eos && chain_n == 0 && ((sfx_pad > 0 && from_sfx) || win_forced))   // a window run for its size's sake: its time only
+                    policy.observe_forced(T, round_ms_now);
                 else if (timed_round && !eos && chain_n == 0)
-                    policy.observe(from_sfx, T, a, sfx_match,
-                                   std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                    policy.observe(from_sfx, T, a, sfx_match, round_ms_now);
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
@@ -24120,11 +24232,15 @@ int main(int argc, char** argv) {
                              (long long) dp_ok[0], (long long) dp_tested[0], (long long) dp_ok[1], (long long) dp_tested[1],
                              (long long) dp_ok[2], (long long) dp_tested[2], (long long) dp_ok[3], (long long) dp_tested[3],
                              (long long) dp_ok[4], (long long) dp_tested[4]);
+            tree_tracker.report();
             if (strata::core::MtpDrafter::top2_env())
-                std::fprintf(stderr, "strata serve: mtp top2: rejected/runner-up by depth %lld/%lld %lld/%lld %lld/%lld %lld/%lld "
-                                     "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
-                             (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
-                             (long long) t2_hit[3], (long long) dec_windows);
+                std::fprintf(stderr, "strata serve: mtp top2: rejected/top2+3+4 by depth %lld/%lld+%lld+%lld %lld/%lld+%lld+%lld "
+                                     "%lld/%lld+%lld+%lld %lld/%lld+%lld+%lld of %lld windows\n",
+                             (long long) t2_rej[0], (long long) t2_hit[0], (long long) t3_hit[0], (long long) t4_hit[0],
+                             (long long) t2_rej[1], (long long) t2_hit[1], (long long) t3_hit[1], (long long) t4_hit[1],
+                             (long long) t2_rej[2], (long long) t2_hit[2], (long long) t3_hit[2], (long long) t4_hit[2],
+                             (long long) t2_rej[3], (long long) t2_hit[3], (long long) t3_hit[3], (long long) t4_hit[3],
+                             (long long) dec_windows);
             for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
@@ -25050,12 +25166,14 @@ int main(int argc, char** argv) {
             }
         }
         policy.set_robust(spec_cost);
-        if (spec_cost && use_mtp)
+        if (spec_cost && use_mtp) {
             mtp.set_chain_rule([&](int idx, float pj) {
                 const bool k = policy.keep_draft(chain_st, idx, pj, S_mtp);
                 chain_rows = chain_st.best_rows;
                 return k;
             });
+            mtp.set_cost_policy(&policy, &chain_rows, S_mtp);
+        }
         policy.set_sizes(lookup_size_mask(o));
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
