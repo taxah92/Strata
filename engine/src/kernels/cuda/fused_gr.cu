@@ -4075,13 +4075,13 @@ __global__ void __launch_bounds__(THREADS, 2) gr_down_q8_v70_tc_kernel(GrMulti m
         float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         for (int b = b_start; b < b_end; ++b) {
             const uint8_t* blk = w_row_tl + b * Q8B;
-            const float dw0 = q8_half(q8_ld16(w_row_r0 + b * Q8B));
-            const float dw1 = q8_half(q8_ld16(w_row_r1 + b * Q8B));
+            const float dw0 = q8_half(q8_smem_ld16(w_row_r0 + b * Q8B));
+            const float dw1 = q8_half(q8_smem_ld16(w_row_r1 + b * Q8B));
             float d[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
             for (int s = 0; s < 4; ++s) {
                 const int k_off = 16 * q_k + 4 * s;
-                const uint32_t w4 = q8_ld16(blk + 2 + k_off) | (q8_ld16(blk + 4 + k_off) << 16);
+                const uint32_t w4 = q8_smem_ld16(blk + 2 + k_off) | (q8_smem_ld16(blk + 4 + k_off) << 16);
                 const uint2 a_op = gr_i8h_cvt4(w4);
                 const uint2 b_op = (tl < T) ? *reinterpret_cast<const uint2*>(&xs_h[tl][b * 32 + k_off]) : make_uint2(0u, 0u);
                 gr_mma_m8n8k4(d, a_op, b_op);
@@ -4238,18 +4238,18 @@ __global__ void __launch_bounds__(THREADS, 2) gr_up_q8_v70_tc_kernel(GrMulti m, 
     for (int b = b_start; b < b_end; ++b) {
         const uint8_t* blk0 = w_row_tl0 + b * Q8B;
         const uint8_t* blk1 = w_row_tl1 + b * Q8B;
-        const float dw00 = q8_half(q8_ld16(w_row_r00 + b * Q8B));
-        const float dw01 = q8_half(q8_ld16(w_row_r01 + b * Q8B));
-        const float dw10 = q8_half(q8_ld16(w_row_r10 + b * Q8B));
-        const float dw11 = q8_half(q8_ld16(w_row_r11 + b * Q8B));
+        const float dw00 = q8_half(q8_smem_ld16(w_row_r00 + b * Q8B));
+        const float dw01 = q8_half(q8_smem_ld16(w_row_r01 + b * Q8B));
+        const float dw10 = q8_half(q8_smem_ld16(w_row_r10 + b * Q8B));
+        const float dw11 = q8_half(q8_smem_ld16(w_row_r11 + b * Q8B));
         float d0_mma[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         float d1_mma[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
         for (int s = 0; s < 2; ++s) {
             const int k_off = 8 * q + 4 * s;
             const uint2 b_op = (tl < T) ? *reinterpret_cast<const uint2*>(&lo_h[tl][b * 32 + k_off]) : make_uint2(0u, 0u);
-            const uint32_t w4_0 = q8_ld16(blk0 + 2 + k_off) | (q8_ld16(blk0 + 4 + k_off) << 16);
-            const uint32_t w4_1 = q8_ld16(blk1 + 2 + k_off) | (q8_ld16(blk1 + 4 + k_off) << 16);
+            const uint32_t w4_0 = q8_smem_ld16(blk0 + 2 + k_off) | (q8_smem_ld16(blk0 + 4 + k_off) << 16);
+            const uint32_t w4_1 = q8_smem_ld16(blk1 + 2 + k_off) | (q8_smem_ld16(blk1 + 4 + k_off) << 16);
             gr_mma_m8n8k4(d0_mma, gr_i8h_cvt4(w4_0), b_op);
             gr_mma_m8n8k4(d1_mma, gr_i8h_cvt4(w4_1), b_op);
         }
